@@ -47,6 +47,7 @@ async fn main() {
         config.map.1 as f32,
         config.seed,
         config.tick_hz,
+        config.tick_deadline_ms,
         config.max_bots,
     );
     let room_handle = tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()));
@@ -56,7 +57,7 @@ async fn main() {
         room_tx.clone(),
         shutdown_tx.subscribe(),
     ));
-    let control_handle = tokio::spawn(control::run(shutdown_tx.clone()));
+    let control_handle = tokio::spawn(control::run(shutdown_tx.clone(), room_tx.clone()));
 
     tokio::select! {
         res = tokio::signal::ctrl_c() => {

@@ -26,6 +26,13 @@ pub const MAX_SHELL_RANGE: f32 = 300.0;
 pub const SPLASH_RADIUS: f32 = 15.0;
 pub const MAX_SPLASH_DAMAGE: u32 = 25;
 
+// --- Sensors (§5.3) --------------------------------------------------------
+
+/// Radius within which an active radar pings register a contact.
+pub const ACTIVE_RADAR_RANGE: f32 = 350.0;
+/// Half-width of the uniform position noise applied to active-radar contacts (units).
+pub const ACTIVE_RADAR_NOISE: f32 = 2.0;
+
 // --- World ----------------------------------------------------------------
 
 /// HP cost when a ship slams into a wall.

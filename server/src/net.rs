@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::protocol::{self, error_code, BotMsg, ServerMsg};
-use crate::room::{BotRegistration, RoomEvent};
+use crate::room::{BotRegistration, PendingCommand, RoomEvent};
 
 /// After this many protocol violations, the bot connection is closed.
 const MAX_VIOLATIONS: u32 = 5;
@@ -198,10 +198,31 @@ async fn handle_bot(
                                     break;
                                 }
                             }
-                            Ok(BotMsg::Command { tick, .. }) => {
-                                // Phase 4.3 wires command handling. For 4.1 we acknowledge
-                                // syntactic validity and drop the value.
-                                debug!(%peer, bot_id = %bot_id, tick, "command received (not yet handled)");
+                            Ok(BotMsg::Command {
+                                tick,
+                                throttle,
+                                rudder,
+                                fire,
+                                sensor_mode,
+                            }) => {
+                                let command = PendingCommand {
+                                    tick,
+                                    throttle,
+                                    rudder,
+                                    sensor_mode,
+                                    fire,
+                                };
+                                if room_tx
+                                    .send(RoomEvent::BotCommand {
+                                        bot_id: bot_id.clone(),
+                                        command,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    debug!(%peer, "room channel closed; ending bot loop");
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 violations += 1;

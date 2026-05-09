@@ -16,8 +16,8 @@ Conventions:
 | 1 | Server skeleton | **complete** |
 | 2 | Wire protocol | **complete** |
 | 3 | World and physics | **complete** |
-| 4 | Single-bot loop | in progress (4.1 done) |
-| 5 | Sensors | pending |
+| 4 | Single-bot loop | **complete** |
+| 5 | Sensors | in progress (5.1 done) |
 | 6 | Combat | pending |
 | 7 | Spectator | pending |
 | 8 | Replay | pending |
@@ -79,21 +79,21 @@ Conventions:
 
 ---
 
-## Phase 4 — Single-bot loop
+## Phase 4 — Single-bot loop  *(complete)*
 
 ### 4.1 Lobby state and handshake  *(done)*
 - **Deliverable:** Room state machine (`Lobby` / `Running` / `Ended`); `hello` → `welcome` exchange assigning a `bot_id` and `ship_id`; `ready` flag tracked per bot.
 - **Acceptance:** A Python script connects, sends `hello`, receives `welcome` with assigned IDs, sends `ready`, receives no further messages until game start.
 
-### 4.2 Operator `room start` command
+### 4.2 Operator `room start` command  *(done)*
 - **Deliverable:** Stdin command `room start <name>` transitions the room to `Running` if all connected bots are ready; emits `game_start` with starting positions per §5.6.
 - **Acceptance:** With one bot connected and ready, typing `room start main` causes the bot to receive `game_start`.
 
-### 4.3 Tick → command exchange
+### 4.3 Tick → command exchange  *(done)*
 - **Deliverable:** Each tick, the room sends every bot a `tick` message (self-state only for now, `contacts: []`); collects `command` replies until deadline; applies `throttle`/`rudder` sorted by `bot_id`.
 - **Acceptance:** A scripted Python bot driving in a circle moves visibly in server logs (position changes per tick).
 
-### 4.4 Late-command handling
+### 4.4 Late-command handling  *(done)*
 - **Deliverable:** Commands arriving after deadline are dropped with an `error` reply; previous throttle/rudder/sensor_mode persist; missing commands do not disconnect the bot.
 - **Acceptance:** Unit/integration test: bot deliberately delays one tick, server keeps it alive and reuses prior controls.
 
@@ -101,7 +101,7 @@ Conventions:
 
 ## Phase 5 — Sensors
 
-### 5.1 Active radar
+### 5.1 Active radar  *(done)*
 - **Deliverable:** `src/sim/sensors.rs` with a function computing visible contacts within 350 units when `sensor_mode == "active"`; per-tick contact IDs (not ship IDs); position with seeded ±2 unit noise drawn from the room RNG.
 - **Acceptance:** Unit test with two ships at 200 units apart sees one contact each when both active.
 
