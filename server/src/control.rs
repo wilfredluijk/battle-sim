@@ -1,7 +1,9 @@
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-pub async fn run(shutdown_tx: broadcast::Sender<()>) {
+use crate::room::RoomEvent;
+
+pub async fn run(shutdown_tx: broadcast::Sender<()>, room_tx: mpsc::Sender<RoomEvent>) {
     let (line_tx, mut line_rx) = mpsc::channel::<String>(64);
 
     // Stdin reads block on Windows, so push them through a dedicated thread.
@@ -42,11 +44,25 @@ pub async fn run(shutdown_tx: broadcast::Sender<()>) {
                 break;
             }
             "help" | "?" => {
-                println!("commands: quit | room create|list|start|abort|kick ... | seed <value>");
+                println!("commands:");
+                println!("  quit | exit             shutdown the server");
+                println!(
+                    "  room start <name>       transition the named room from lobby to running"
+                );
+                println!("  room list               (not yet implemented)");
+                println!("  room abort <name>       (not yet implemented)");
+                println!("  room kick <name> <bot>  (not yet implemented)");
+                println!("  seed <value>            (not yet implemented)");
             }
-            "room" => {
-                info!(args = ?rest, "control: room command (not implemented yet)");
-            }
+            "room" => match rest.as_slice() {
+                ["start", name] => {
+                    handle_room_start(&room_tx, name).await;
+                }
+                ["list"] | ["abort", _] | ["kick", _, _] => {
+                    info!(args = ?rest, "control: room command (not implemented yet)");
+                }
+                _ => warn!("usage: room start <name>"),
+            },
             "seed" => {
                 info!(args = ?rest, "control: seed command (not implemented yet)");
             }
@@ -57,4 +73,24 @@ pub async fn run(shutdown_tx: broadcast::Sender<()>) {
     }
 
     info!("control: stdin closed");
+}
+
+async fn handle_room_start(room_tx: &mpsc::Sender<RoomEvent>, name: &str) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if room_tx
+        .send(RoomEvent::OperatorStart {
+            room: name.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        warn!(room = name, "control: room channel closed; cannot start");
+        return;
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => println!("room `{name}` started"),
+        Ok(Err(e)) => println!("room `{name}` start refused: {}", e.as_str()),
+        Err(_) => warn!(room = name, "control: room dropped start reply"),
+    }
 }

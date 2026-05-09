@@ -16,7 +16,7 @@ Conventions:
 | 1 | Server skeleton | **complete** |
 | 2 | Wire protocol | **complete** |
 | 3 | World and physics | **complete** |
-| 4 | Single-bot loop | in progress (4.1 done) |
+| 4 | Single-bot loop | in progress (4.1, 4.2 done) |
 | 5 | Sensors | pending |
 | 6 | Combat | pending |
 | 7 | Spectator | pending |
@@ -85,7 +85,7 @@ Conventions:
 - **Deliverable:** Room state machine (`Lobby` / `Running` / `Ended`); `hello` → `welcome` exchange assigning a `bot_id` and `ship_id`; `ready` flag tracked per bot.
 - **Acceptance:** A Python script connects, sends `hello`, receives `welcome` with assigned IDs, sends `ready`, receives no further messages until game start.
 
-### 4.2 Operator `room start` command
+### 4.2 Operator `room start` command  *(done)*
 - **Deliverable:** Stdin command `room start <name>` transitions the room to `Running` if all connected bots are ready; emits `game_start` with starting positions per §5.6.
 - **Acceptance:** With one bot connected and ready, typing `room start main` causes the bot to receive `game_start`.
 

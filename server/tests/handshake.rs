@@ -12,12 +12,20 @@ use tokio_tungstenite::tungstenite::Message;
 use naval_server::{
     config::Config,
     net,
-    room::{run_room, Room, ROOM_EVENT_BUFFER},
+    room::{run_room, Room, RoomEvent, ROOM_EVENT_BUFFER},
 };
+use tokio::sync::oneshot;
 
-/// Spin a server + room pair on a free port. Returns the port and a shutdown sender that
-/// terminates both tasks when fired.
-async fn start_server() -> (u16, broadcast::Sender<()>) {
+struct ServerHandle {
+    port: u16,
+    shutdown: broadcast::Sender<()>,
+    room_tx: mpsc::Sender<RoomEvent>,
+}
+
+/// Spin a server + room pair on a free port. Returns the port, a shutdown sender that
+/// terminates both tasks when fired, and a handle to the room's event channel so tests
+/// can simulate operator commands.
+async fn start_server() -> ServerHandle {
     let probe = TcpListener::bind("127.0.0.1:0").await.expect("probe bind");
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
@@ -38,10 +46,14 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
         config.max_bots,
     );
     tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe()));
-    tokio::spawn(net::run(config, room_tx, shutdown_rx_net));
+    tokio::spawn(net::run(config, room_tx.clone(), shutdown_rx_net));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
-    (port, shutdown_tx)
+    ServerHandle {
+        port,
+        shutdown: shutdown_tx,
+        room_tx,
+    }
 }
 
 async fn recv_text<S>(ws: &mut S) -> String
@@ -64,7 +76,11 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hello_yields_welcome_and_ready_is_silent() {
-    let (port, shutdown) = start_server().await;
+    let ServerHandle {
+        port,
+        shutdown,
+        room_tx: _,
+    } = start_server().await;
     let url = format!("ws://127.0.0.1:{port}/bot");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -107,7 +123,11 @@ async fn hello_yields_welcome_and_ready_is_silent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_bots_get_distinct_ids() {
-    let (port, shutdown) = start_server().await;
+    let ServerHandle {
+        port,
+        shutdown,
+        room_tx: _,
+    } = start_server().await;
     let url = format!("ws://127.0.0.1:{port}/bot");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&url)
@@ -142,7 +162,11 @@ async fn two_bots_get_distinct_ids() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_hello_first_frame_is_rejected() {
-    let (port, shutdown) = start_server().await;
+    let ServerHandle {
+        port,
+        shutdown,
+        room_tx: _,
+    } = start_server().await;
     let url = format!("ws://127.0.0.1:{port}/bot");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -159,5 +183,85 @@ async fn non_hello_first_frame_is_rejected() {
     assert_eq!(parsed["code"], "invalid_message");
 
     let _ = ws.close(None).await;
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_start_delivers_game_start_to_ready_bot() {
+    let ServerHandle {
+        port,
+        shutdown,
+        room_tx,
+    } = start_server().await;
+    let url = format!("ws://127.0.0.1:{port}/bot");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    ws.send(Message::Text(
+        r#"{"type":"hello","name":"only_bot","version":"1.0"}"#.into(),
+    ))
+    .await
+    .expect("send hello");
+
+    // Drain `welcome`.
+    let welcome: serde_json::Value =
+        serde_json::from_str(&recv_text(&mut ws).await).expect("welcome");
+    assert_eq!(welcome["type"], "welcome");
+
+    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
+        .await
+        .expect("send ready");
+
+    // Give the room a moment to record the ready flag.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Simulate the operator typing `room start main`.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    room_tx
+        .send(RoomEvent::OperatorStart {
+            room: "main".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send start");
+    reply_rx
+        .await
+        .expect("oneshot")
+        .expect("start should succeed");
+
+    // Bot should receive `game_start`.
+    let game_start: serde_json::Value =
+        serde_json::from_str(&recv_text(&mut ws).await).expect("game_start");
+    assert_eq!(game_start["type"], "game_start", "frame: {game_start}");
+    assert_eq!(game_start["tick"], 0);
+    assert!(game_start["starting_position"].is_array());
+    let pos = &game_start["starting_position"];
+    assert!(pos[0].is_number() && pos[1].is_number());
+    assert!(game_start["starting_heading_deg"].is_number());
+
+    let _ = ws.close(None).await;
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_start_refused_when_no_bots_ready() {
+    let ServerHandle {
+        port: _,
+        shutdown,
+        room_tx,
+    } = start_server().await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    room_tx
+        .send(RoomEvent::OperatorStart {
+            room: "main".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send start");
+    let result = reply_rx.await.expect("oneshot");
+    assert!(result.is_err(), "start with no bots should fail");
+
     let _ = shutdown.send(());
 }
