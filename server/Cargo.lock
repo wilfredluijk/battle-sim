@@ -478,6 +478,7 @@ dependencies = [
  "clap",
  "futures-util",
  "glam",
+ "httparse",
  "rand",
  "rand_pcg",
  "serde",

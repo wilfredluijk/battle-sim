@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use naval_server::{
     config::Config,
     net,
-    room::{run_room, Room, RoomEvent, ROOM_EVENT_BUFFER},
+    room::{run_room, Room, RoomEvent, SpectatorFrame, ROOM_EVENT_BUFFER},
 };
 
 struct ServerHandle {
@@ -49,7 +49,8 @@ async fn start_server_with(tick_hz: u32, tick_deadline_ms: u64) -> ServerHandle 
         config.max_bots,
     );
     tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe()));
-    tokio::spawn(net::run(config, room_tx.clone(), shutdown_rx_net));
+    let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
+    tokio::spawn(net::run(config, room_tx.clone(), spec_tx, shutdown_rx_net));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     ServerHandle {

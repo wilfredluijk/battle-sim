@@ -182,6 +182,8 @@ pub struct SpectatorShip {
     pub heading_deg: f32,
     pub hp: u32,
     pub alive: bool,
+    /// Last commanded sensor mode. Used by the renderer to draw an active-radar ring.
+    pub sensor_mode: SensorMode,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -334,6 +336,7 @@ mod tests {
                 heading_deg: 92.3,
                 hp: 78,
                 alive: true,
+                sensor_mode: SensorMode::Active,
             }],
             shells: vec![SpectatorShell {
                 id_index: 22,

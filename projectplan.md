@@ -19,7 +19,7 @@ Conventions:
 | 4 | Single-bot loop | **complete** |
 | 5 | Sensors | **complete** |
 | 6 | Combat | **complete** |
-| 7 | Spectator | pending |
+| 7 | Spectator | **complete** |
 | 8 | Replay | pending |
 | 9 | Python SDK | pending |
 | 10 | Examples and onboarding | pending |
@@ -135,21 +135,21 @@ Conventions:
 
 ---
 
-## Phase 7 — Spectator
+## Phase 7 — Spectator  *(complete)*
 
-### 7.1 Static file serving
+### 7.1 Static file serving  *(done)*
 - **Deliverable:** Server serves files from `spectator/` at `/`. Stub `spectator/index.html` says "hello".
 - **Acceptance:** `curl http://localhost:7878/` returns the stub HTML.
 
-### 7.2 Spectator world broadcast
+### 7.2 Spectator world broadcast  *(done)*
 - **Deliverable:** Each tick, the room sends the `world` message from §4.2 to every `/spectate` connection; full ground truth.
 - **Acceptance:** `wscat -c ws://localhost:7878/spectate` prints a JSON `world` message every tick during a running match.
 
-### 7.3 Canvas renderer
+### 7.3 Canvas renderer  *(done)*
 - **Deliverable:** `spectator/index.html` + `render.js` + `style.css`: canvas with map bounds, triangle ships colored per player, name + HP bar, shell dots, splash rings, sidebar with tick/players/events.
 - **Acceptance:** Open the URL during a live match; see ships moving, shells flying, splashes on hit.
 
-### 7.4 Active-radar visualization
+### 7.4 Active-radar visualization  *(done)*
 - **Deliverable:** Renderer draws a faint translucent 350-unit circle around any ship whose last command had `sensor_mode == "active"`. Add `sensor_mode` to the spectator `world` payload if not already present.
 - **Acceptance:** Switching a bot from passive to active shows/hides the ring in the browser.
 

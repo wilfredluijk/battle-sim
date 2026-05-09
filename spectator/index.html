@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Naval Battle — Spectator</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <canvas id="board" width="800" height="800" aria-label="naval battle map"></canvas>
+      <aside id="sidebar">
+        <header>
+          <h1>Naval Battle</h1>
+          <div id="status" class="status status-disconnected">connecting…</div>
+        </header>
+        <section>
+          <h2>Tick</h2>
+          <div id="tick" class="tick">—</div>
+        </section>
+        <section>
+          <h2>Players</h2>
+          <ul id="players" class="players"></ul>
+        </section>
+        <section>
+          <h2>Recent events</h2>
+          <ul id="events" class="events"></ul>
+        </section>
+      </aside>
+    </main>
+    <script src="/render.js"></script>
+  </body>
+</html>

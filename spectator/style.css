@@ -1,0 +1,166 @@
+:root {
+  color-scheme: dark;
+  --bg: #0a0e1a;
+  --panel: #131a2a;
+  --panel-border: #1f2a40;
+  --ink: #e7ecf5;
+  --ink-muted: #8b95ad;
+  --accent: #6cb1ff;
+  --good: #58d68d;
+  --bad: #ef6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  padding: 16px;
+  height: 100vh;
+}
+
+#board {
+  width: 100%;
+  height: 100%;
+  background: #050810;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  display: block;
+  /* The renderer owns the pixel coordinate system; let the canvas fill its grid cell. */
+  aspect-ratio: 1 / 1;
+  max-height: 100%;
+}
+
+#sidebar {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#sidebar header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+h2 {
+  margin: 0 0 6px 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.status {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+}
+.status-connected {
+  background: rgba(88, 214, 141, 0.12);
+  color: var(--good);
+  border-color: rgba(88, 214, 141, 0.4);
+}
+.status-disconnected {
+  background: rgba(239, 107, 107, 0.12);
+  color: var(--bad);
+  border-color: rgba(239, 107, 107, 0.4);
+}
+
+.tick {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.players,
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.players li {
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 13px;
+}
+.players li.dead {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+.player-color {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+.player-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.player-hp-wrap {
+  width: 80px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.player-hp-fill {
+  height: 100%;
+  background: var(--good);
+  transition: width 0.15s linear, background-color 0.15s linear;
+}
+.player-meta {
+  font-size: 11px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.events li {
+  font-size: 12px;
+  color: var(--ink-muted);
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  font-variant-numeric: tabular-nums;
+}
+.events li:last-child {
+  border-bottom: none;
+}

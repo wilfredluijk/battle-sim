@@ -9,7 +9,11 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
-use naval_server::{config::Config, net, room::ROOM_EVENT_BUFFER};
+use naval_server::{
+    config::Config,
+    net,
+    room::{SpectatorFrame, ROOM_EVENT_BUFFER},
+};
 
 async fn start_server() -> (u16, broadcast::Sender<()>) {
     // Find a free port by binding to :0, then drop and let the server re-bind.
@@ -24,7 +28,8 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
     // No room is wired up — these tests only exercise pre-handshake validation, which
     // never reaches the room. A leaked sender keeps the channel open.
     let (room_tx, _room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
-    tokio::spawn(net::run(config, room_tx, shutdown_rx));
+    let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
+    tokio::spawn(net::run(config, room_tx, spec_tx, shutdown_rx));
 
     // Give the listener a moment to bind on the freed port.
     tokio::time::sleep(Duration::from_millis(150)).await;

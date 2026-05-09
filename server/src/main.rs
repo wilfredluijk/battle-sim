@@ -1,13 +1,18 @@
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use naval_server::{
     config::Config,
     control, net,
-    room::{self, Room, ROOM_EVENT_BUFFER},
+    room::{self, Room, SpectatorFrame, ROOM_EVENT_BUFFER},
 };
+
+/// Slack in spectator-frame buffer. At 10 Hz this is 6.4s — enough for a slow client to
+/// briefly stall without dropping frames; lagged clients log a `Lagged` warning rather
+/// than disconnect.
+const SPECTATOR_BROADCAST_BUFFER: usize = 64;
 
 const BANNER: &str = r#"
 ========================================
@@ -40,8 +45,9 @@ async fn main() {
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(8);
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
+    let (spec_tx, _) = broadcast::channel::<SpectatorFrame>(SPECTATOR_BROADCAST_BUFFER);
 
-    let main_room = Room::new(
+    let mut main_room = Room::new(
         "main".into(),
         config.map.0 as f32,
         config.map.1 as f32,
@@ -50,11 +56,13 @@ async fn main() {
         config.tick_deadline_ms,
         config.max_bots,
     );
+    main_room.set_spectator_broadcast(spec_tx.clone());
     let room_handle = tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()));
 
     let net_handle = tokio::spawn(net::run(
         config.clone(),
         room_tx.clone(),
+        spec_tx.clone(),
         shutdown_tx.subscribe(),
     ));
     let control_handle = tokio::spawn(control::run(shutdown_tx.clone(), room_tx.clone()));

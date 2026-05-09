@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::Vec2;
@@ -18,12 +19,18 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
-    MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, TickEvent,
+    MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, SpectatorEvent, SpectatorMsg,
+    SpectatorShell, SpectatorShip, TickEvent,
 };
 use crate::sim::combat::{self, CombatEvent, FireError};
 use crate::sim::constants::{ACTIVE_RADAR_RANGE, PASSIVE_HEAR_NEARBY_RANGE};
 use crate::sim::sensors::{self, Contact as SimContact, ContactKind as SimContactKind};
 use crate::sim::{physics, BotId, Ship, ShipId, World};
+
+/// A pre-serialized spectator frame, broadcast once per tick to every `/spectate`
+/// connection. Wrapped in `Arc` so subscribers share the underlying allocation rather
+/// than copying the JSON.
+pub type SpectatorFrame = Arc<String>;
 
 /// Channel buffer for outbound messages to a single bot. Sized for a few ticks of slack —
 /// the bot consumes one message per tick under normal operation.
@@ -172,6 +179,10 @@ pub struct Room {
     /// only applies when at least two ships started; a 1-bot sandbox/test room would
     /// otherwise terminate on its first tick.
     starting_bot_count: u32,
+    /// Optional broadcast sender for spectator `world` frames. `None` in unit tests; the
+    /// runtime in `main.rs` always wires a real channel. Send failures (no subscribers)
+    /// are ignored — the simulation never blocks on the spectator UI.
+    spectator_tx: Option<broadcast::Sender<SpectatorFrame>>,
 }
 
 impl Room {
@@ -197,7 +208,14 @@ impl Room {
             tick_send_time: None,
             previous_active_pingers: BTreeSet::new(),
             starting_bot_count: 0,
+            spectator_tx: None,
         }
+    }
+
+    /// Wire a spectator broadcast channel. Subsequent `step_tick` calls will publish a
+    /// `world` frame to every subscriber. Call this once at construction time.
+    pub fn set_spectator_broadcast(&mut self, tx: broadcast::Sender<SpectatorFrame>) {
+        self.spectator_tx = Some(tx);
     }
 
     /// Number of bots currently registered (regardless of `ready` state).
@@ -226,6 +244,8 @@ impl Room {
     pub fn step_tick(&mut self) {
         if self.state != RoomState::Running {
             self.world.tick = self.world.tick.saturating_add(1);
+            // Spectators still see the lobby/ended state — full ground truth, no events.
+            self.broadcast_spectator_world(&[]);
             return;
         }
 
@@ -267,6 +287,10 @@ impl Room {
 
         // 4. Bump the tick counter so the outbound frames carry the new tick number.
         self.world.tick = self.world.tick.saturating_add(1);
+
+        // Spectator broadcast: full ground truth + every combat event. Done before the
+        // end-of-match check so the deciding tick (with its death events) is visible.
+        self.broadcast_spectator_world(&combat_events);
 
         // 5. End-of-match check. Broadcasting `game_over` and returning early means dead
         //    and surviving bots all hear about the outcome via the same message; no final
@@ -375,6 +399,87 @@ impl Room {
             return Some(winner);
         }
         None
+    }
+
+    /// Build a `SpectatorMsg::World` from the current world state and push it onto the
+    /// spectator broadcast channel. No-op when no channel is wired (unit tests). Send
+    /// failures (no subscribers) are intentionally swallowed — the simulation never
+    /// stalls because nobody is watching.
+    fn broadcast_spectator_world(&self, events: &[CombatEvent]) {
+        let Some(tx) = self.spectator_tx.as_ref() else {
+            return;
+        };
+        if tx.receiver_count() == 0 {
+            // Nothing to do; skip the JSON serialization cost when nobody's watching.
+            return;
+        }
+
+        // Ships in BotId order via the bot registry, so the wire payload is stable across
+        // identical runs. Falling back to `world.ships` would also be deterministic
+        // (BTreeMap on ShipId), but going through `bots` keeps `bot_name` in lock-step.
+        let ships: Vec<SpectatorShip> = self
+            .bots
+            .values()
+            .filter_map(|entry| {
+                let ship = self.world.ships.get(&entry.ship_id)?;
+                Some(SpectatorShip {
+                    id: ship.id.clone(),
+                    bot_name: entry.name.clone(),
+                    pos: [ship.pos.x, ship.pos.y],
+                    heading_deg: ship.heading_deg,
+                    hp: ship.hp,
+                    alive: ship.alive,
+                    sensor_mode: entry.sensor_mode,
+                })
+            })
+            .collect();
+
+        let shells: Vec<SpectatorShell> = self
+            .world
+            .shells
+            .iter()
+            .map(|s| SpectatorShell {
+                id_index: s.id_index,
+                pos: [s.pos.x, s.pos.y],
+                vel: [s.vel.x, s.vel.y],
+                ttl_ticks: s.ttl_ticks,
+            })
+            .collect();
+
+        let events: Vec<SpectatorEvent> = events
+            .iter()
+            .map(|e| match e {
+                CombatEvent::Hit {
+                    ship_id, amount, ..
+                } => SpectatorEvent::Hit {
+                    ship_id: ship_id.clone(),
+                    amount: *amount,
+                },
+                CombatEvent::Splash { pos } => SpectatorEvent::ShellSplash {
+                    pos: [pos.x, pos.y],
+                },
+                CombatEvent::Death { ship_id } => SpectatorEvent::Death {
+                    ship_id: ship_id.clone(),
+                },
+            })
+            .collect();
+
+        let msg = SpectatorMsg::World {
+            tick: self.world.tick,
+            ships,
+            shells,
+            events,
+        };
+        let json = match serde_json::to_string(&msg) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(room = %self.name, error = %e, "failed to serialize spectator world");
+                return;
+            }
+        };
+        // SendError only fires when there are no active receivers; we already guarded
+        // above, but a race is possible. Either way, swallowing it is correct.
+        let _ = tx.send(Arc::new(json));
     }
 
     /// Send `game_over` to every registered bot — alive or dead. The dead bots' channels
@@ -1677,6 +1782,46 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Phase 7.2 acceptance: when a spectator broadcast channel is wired, every
+    /// `step_tick` publishes a JSON `world` frame with the current ground-truth state,
+    /// including each ship's last-commanded `sensor_mode` (Phase 7.4).
+    #[test]
+    fn spectator_broadcast_emits_world_frames_each_tick() {
+        let mut room = test_room();
+        let (spec_tx, mut spec_rx) = broadcast::channel::<SpectatorFrame>(8);
+        room.set_spectator_broadcast(spec_tx);
+
+        let mut r = connect(&mut room, "alice").expect("registration");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+
+        // Drain anything published during start_match (none — start runs outside step_tick).
+        while spec_rx.try_recv().is_ok() {}
+
+        // Active sensor command so the world payload reports `sensor_mode: "active"`.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.step_tick();
+
+        let frame = spec_rx.try_recv().expect("spectator frame published");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&frame).expect("frame is valid JSON");
+        assert_eq!(parsed["type"], "world");
+        assert_eq!(parsed["tick"], 1);
+        let ships = parsed["ships"].as_array().expect("ships array");
+        assert_eq!(ships.len(), 1);
+        assert_eq!(ships[0]["id"], r.ship_id);
+        assert_eq!(ships[0]["bot_name"], "alice");
+        assert_eq!(ships[0]["alive"], true);
+        assert_eq!(ships[0]["sensor_mode"], "active");
     }
 
     #[test]

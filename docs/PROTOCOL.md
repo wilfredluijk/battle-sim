@@ -185,7 +185,8 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
       "pos": [203.4, 511.7],
       "heading_deg": 92.3,
       "hp": 78,
-      "alive": true
+      "alive": true,
+      "sensor_mode": "active"
     }
   ],
   "shells": [
@@ -205,6 +206,8 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
 ```
 
 `shells[].id_index` is a stable-per-shell index used by renderers to track trails across ticks.
+
+`ships[].sensor_mode` is the bot's most recently commanded mode (`"active"` or `"passive"`); the renderer uses it to draw the active-radar ring.
 
 ---
 
