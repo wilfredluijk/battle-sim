@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use crate::protocol::{MapInfo, ServerMsg, ShipSpecs};
+use crate::protocol::{FireCommand, MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs};
 use crate::sim::{physics, BotId, Ship, ShipId, World};
 
 /// Channel buffer for outbound messages to a single bot. Sized for a few ticks of slack —
@@ -39,7 +39,7 @@ pub enum RoomState {
 
 /// Per-bot state tracked by the room.
 #[derive(Debug)]
-#[allow(dead_code)] // `name`/`peer`/`outbound` are read once tick→command lands (Phase 4.3).
+#[allow(dead_code)] // `name`/`peer` are read by Phase 7 (spectator) / Phase 11 (kick).
 struct BotEntry {
     bot_id: BotId,
     ship_id: ShipId,
@@ -47,6 +47,24 @@ struct BotEntry {
     peer: SocketAddr,
     outbound: mpsc::Sender<ServerMsg>,
     ready: bool,
+    /// Latest queued command from this bot. Drained at the top of each tick and applied
+    /// in `BotId` order. `None` means the previous tick's controls persist (per §4.1.3).
+    pending_command: Option<PendingCommand>,
+    /// Last commanded sensor mode. Persists across ticks until the bot changes it.
+    sensor_mode: SensorMode,
+}
+
+/// A command waiting to be applied at the next tick. Lifted from `BotMsg::Command` —
+/// keeping a separate type lets the room own its data without dragging the protocol
+/// enum into long-lived state.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingCommand {
+    pub tick: u64,
+    pub throttle: f32,
+    pub rudder: f32,
+    pub sensor_mode: SensorMode,
+    #[allow(dead_code)] // Wired in Phase 6 (combat).
+    pub fire: Option<FireCommand>,
 }
 
 /// What the room hands back to a connection task after a successful `BotConnect`.
@@ -107,6 +125,10 @@ pub enum RoomEvent {
     BotReady {
         bot_id: BotId,
     },
+    BotCommand {
+        bot_id: BotId,
+        command: PendingCommand,
+    },
     BotDisconnect {
         bot_id: BotId,
     },
@@ -125,6 +147,7 @@ pub struct Room {
     pub state: RoomState,
     pub rng: Pcg64,
     pub tick_hz: u32,
+    pub tick_deadline_ms: u64,
     pub max_bots: u32,
     bots: BTreeMap<BotId, BotEntry>,
     next_index: u32,
@@ -137,6 +160,7 @@ impl Room {
         height: f32,
         seed: u64,
         tick_hz: u32,
+        tick_deadline_ms: u64,
         max_bots: u32,
     ) -> Self {
         Self {
@@ -145,6 +169,7 @@ impl Room {
             state: RoomState::Lobby,
             rng: Pcg64::seed_from_u64(seed),
             tick_hz,
+            tick_deadline_ms,
             max_bots,
             bots: BTreeMap::new(),
             next_index: 1,
@@ -163,11 +188,69 @@ impl Room {
 
     /// Advance the simulation by one fixed timestep and bump the tick counter.
     /// Only steps physics in `Running` state; in `Lobby` / `Ended` the world is frozen.
+    /// Returns the per-bot `tick` frames the caller should deliver. The Vec is empty
+    /// outside `Running`.
+    ///
+    /// Order, per the determinism contract in `CLAUDE.md`:
+    /// 1. Apply queued commands in `BotId` order.
+    /// 2. Step physics.
+    /// 3. Build outbound `tick` frames for each bot (`BotId` order).
     pub fn step_tick(&mut self) {
-        if self.state == RoomState::Running {
-            physics::step_world(&mut self.world);
+        if self.state != RoomState::Running {
+            self.world.tick = self.world.tick.saturating_add(1);
+            return;
         }
+
+        let bot_ids: Vec<BotId> = self.bots.keys().cloned().collect();
+
+        for bot_id in &bot_ids {
+            let Some(entry) = self.bots.get_mut(bot_id) else {
+                continue;
+            };
+            let Some(cmd) = entry.pending_command.take() else {
+                continue;
+            };
+            entry.sensor_mode = cmd.sensor_mode;
+            if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
+                ship.throttle = cmd.throttle.clamp(-1.0, 1.0);
+                ship.rudder = cmd.rudder.clamp(-1.0, 1.0);
+            }
+        }
+
+        physics::step_world(&mut self.world);
         self.world.tick = self.world.tick.saturating_add(1);
+
+        for bot_id in &bot_ids {
+            let Some(entry) = self.bots.get(bot_id) else {
+                continue;
+            };
+            let Some(ship) = self.world.ships.get(&entry.ship_id) else {
+                continue;
+            };
+            let tick_msg = ServerMsg::Tick {
+                tick: self.world.tick,
+                deadline_ms: self.tick_deadline_ms,
+                self_state: SelfState {
+                    pos: [ship.pos.x, ship.pos.y],
+                    heading_deg: ship.heading_deg,
+                    speed: ship.speed,
+                    hp: ship.hp,
+                    ammo: ship.ammo,
+                    rudder: ship.rudder,
+                    throttle: ship.throttle,
+                },
+                contacts: Vec::new(),
+                events: Vec::new(),
+            };
+            if let Err(e) = entry.outbound.try_send(tick_msg) {
+                debug!(
+                    room = %self.name,
+                    bot = %bot_id,
+                    error = %e,
+                    "tick frame dropped (slow bot or closed channel)"
+                );
+            }
+        }
     }
 
     /// Apply a single `RoomEvent`. The connection task waits on `oneshot` replies; other
@@ -191,6 +274,15 @@ impl Room {
                     }
                 } else {
                     warn!(room = %self.name, bot = %bot_id, "ready from unknown bot, ignored");
+                }
+            }
+            RoomEvent::BotCommand { bot_id, command } => {
+                if let Some(entry) = self.bots.get_mut(&bot_id) {
+                    // Most-recent-wins. Phase 4.4 will add late-command rejection; for now
+                    // any command queued before the next tick gets applied.
+                    entry.pending_command = Some(command);
+                } else {
+                    warn!(room = %self.name, bot = %bot_id, "command from unknown bot, ignored");
                 }
             }
             RoomEvent::BotDisconnect { bot_id } => {
@@ -237,8 +329,13 @@ impl Room {
             let pos = center + offset;
             let heading_deg = compass_deg_facing(pos, center);
 
-            let entry = self.bots.get(bot_id).expect("snapshot still in map");
-            if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
+            let ship_id = {
+                let entry = self.bots.get_mut(bot_id).expect("snapshot still in map");
+                // Drop any commands queued before the match started.
+                entry.pending_command = None;
+                entry.ship_id.clone()
+            };
+            if let Some(ship) = self.world.ships.get_mut(&ship_id) {
                 ship.pos = pos;
                 ship.heading_deg = heading_deg;
                 ship.speed = 0.0;
@@ -246,6 +343,7 @@ impl Room {
                 ship.rudder = 0.0;
             }
 
+            let entry = self.bots.get(bot_id).expect("snapshot still in map");
             let game_start = ServerMsg::GameStart {
                 tick: 0,
                 starting_position: [pos.x, pos.y],
@@ -313,6 +411,8 @@ impl Room {
                 peer,
                 outbound: out_tx,
                 ready: false,
+                pending_command: None,
+                sensor_mode: SensorMode::Passive,
             },
         );
 
@@ -387,7 +487,7 @@ mod tests {
     }
 
     fn test_room() -> Room {
-        Room::new("test".into(), 1000.0, 1000.0, 42, 10, 4)
+        Room::new("test".into(), 1000.0, 1000.0, 42, 10, 80, 4)
     }
 
     fn connect(room: &mut Room, name: &str) -> Result<BotRegistration, JoinError> {
@@ -504,7 +604,7 @@ mod tests {
 
     #[test]
     fn rejects_join_when_full() {
-        let mut room = Room::new("test".into(), 1000.0, 1000.0, 42, 10, 2);
+        let mut room = Room::new("test".into(), 1000.0, 1000.0, 42, 10, 80, 2);
         connect(&mut room, "a").expect("first");
         connect(&mut room, "b").expect("second");
         let err = connect(&mut room, "c").expect_err("third should refuse");
@@ -643,6 +743,149 @@ mod tests {
         let pos1 = room.world.ships.get(&r.ship_id).unwrap().pos;
         assert!(pos0 != pos1, "ship should have moved in Running state");
         assert!(room.world.tick > 0, "tick advances in Running");
+    }
+
+    fn cmd(tick: u64, throttle: f32, rudder: f32) -> PendingCommand {
+        PendingCommand {
+            tick,
+            throttle,
+            rudder,
+            sensor_mode: SensorMode::Passive,
+            fire: None,
+        }
+    }
+
+    #[test]
+    fn step_tick_in_running_emits_tick_frames_with_self_state() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv().expect("welcome");
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv().expect("game_start");
+
+        room.step_tick();
+        let msg = r.outbound.try_recv().expect("first tick frame");
+        match msg {
+            ServerMsg::Tick {
+                tick,
+                deadline_ms,
+                self_state,
+                contacts,
+                events,
+            } => {
+                assert_eq!(tick, 1, "first tick after game_start");
+                assert_eq!(deadline_ms, 80);
+                assert!(contacts.is_empty(), "Phase 4.3 has empty contacts");
+                assert!(events.is_empty(), "Phase 4.3 has empty events");
+                let ship = room.world.ships.get(&r.ship_id).unwrap();
+                assert!((self_state.pos[0] - ship.pos.x).abs() < 1e-4);
+                assert!((self_state.pos[1] - ship.pos.y).abs() < 1e-4);
+                assert_eq!(self_state.hp, ship.hp);
+                assert_eq!(self_state.ammo, ship.ammo);
+            }
+            other => panic!("expected Tick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_applies_throttle_and_rudder_on_next_tick() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(0, 1.0, 0.5),
+        });
+        room.step_tick();
+
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert!((ship.throttle - 1.0).abs() < 1e-6);
+        assert!((ship.rudder - 0.5).abs() < 1e-6);
+        // Speed should have started accelerating: ACCELERATION * DT = 0.15 (one step toward 6.0).
+        assert!(ship.speed > 0.0, "ship should have begun moving forward");
+    }
+
+    #[test]
+    fn command_clamps_out_of_range_values() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(0, 5.0, -7.0),
+        });
+        room.step_tick();
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert!((ship.throttle - 1.0).abs() < 1e-6);
+        assert!((ship.rudder + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_command_persists_previous_throttle_rudder() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(0, 0.7, 0.2),
+        });
+        room.step_tick();
+        let throttle_after_first = room.world.ships.get(&r.ship_id).unwrap().throttle;
+        let rudder_after_first = room.world.ships.get(&r.ship_id).unwrap().rudder;
+
+        // No new command this tick → ship.throttle / .rudder must stay put.
+        room.step_tick();
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert!((ship.throttle - throttle_after_first).abs() < 1e-6);
+        assert!((ship.rudder - rudder_after_first).abs() < 1e-6);
+    }
+
+    #[test]
+    fn command_outside_running_is_ignored_by_step() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        // Queue a command while still in Lobby.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(0, 1.0, 0.0),
+        });
+        room.step_tick();
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert_eq!(
+            ship.throttle, 0.0,
+            "Lobby step_tick must not apply commands"
+        );
+        // And the pending command is cleared once `start_match` runs.
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+        room.step_tick();
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert_eq!(ship.throttle, 0.0, "stale Lobby command should not apply");
     }
 
     #[test]

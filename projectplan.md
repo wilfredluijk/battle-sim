@@ -16,7 +16,7 @@ Conventions:
 | 1 | Server skeleton | **complete** |
 | 2 | Wire protocol | **complete** |
 | 3 | World and physics | **complete** |
-| 4 | Single-bot loop | in progress (4.1, 4.2 done) |
+| 4 | Single-bot loop | in progress (4.1, 4.2, 4.3 done) |
 | 5 | Sensors | pending |
 | 6 | Combat | pending |
 | 7 | Spectator | pending |
@@ -89,7 +89,7 @@ Conventions:
 - **Deliverable:** Stdin command `room start <name>` transitions the room to `Running` if all connected bots are ready; emits `game_start` with starting positions per §5.6.
 - **Acceptance:** With one bot connected and ready, typing `room start main` causes the bot to receive `game_start`.
 
-### 4.3 Tick → command exchange
+### 4.3 Tick → command exchange  *(done)*
 - **Deliverable:** Each tick, the room sends every bot a `tick` message (self-state only for now, `contacts: []`); collects `command` replies until deadline; applies `throttle`/`rudder` sorted by `bot_id`.
 - **Acceptance:** A scripted Python bot driving in a circle moves visibly in server logs (position changes per tick).
 

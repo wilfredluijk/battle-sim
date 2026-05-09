@@ -47,6 +47,7 @@ async fn main() {
         config.map.1 as f32,
         config.seed,
         config.tick_hz,
+        config.tick_deadline_ms,
         config.max_bots,
     );
     let room_handle = tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()));

@@ -43,6 +43,7 @@ async fn start_server() -> ServerHandle {
         config.map.1 as f32,
         config.seed,
         config.tick_hz,
+        config.tick_deadline_ms,
         config.max_bots,
     );
     tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe()));
