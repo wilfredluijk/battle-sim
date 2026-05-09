@@ -33,6 +33,16 @@ pub const ACTIVE_RADAR_RANGE: f32 = 350.0;
 /// Half-width of the uniform position noise applied to active-radar contacts (units).
 pub const ACTIVE_RADAR_NOISE: f32 = 2.0;
 
+/// Range at which a passive listener can hear a ship that is currently pinging.
+pub const PASSIVE_HEAR_ACTIVE_RANGE: f32 = 500.0;
+/// Range at which a passive listener can hear *any* ship (engine noise).
+pub const PASSIVE_HEAR_NEARBY_RANGE: f32 = 150.0;
+/// Half-width of the uniform bearing noise applied to passive contacts (degrees).
+pub const PASSIVE_BEARING_NOISE_DEG: f32 = 5.0;
+/// Placeholder distance used to project a bearing-only contact onto a `pos` so the wire
+/// frame keeps a consistent shape. Bots get `range = None` so this isn't a real estimate.
+pub const PASSIVE_CONTACT_PLACEHOLDER_DISTANCE: f32 = 100.0;
+
 // --- World ----------------------------------------------------------------
 
 /// HP cost when a ship slams into a wall.

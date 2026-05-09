@@ -17,7 +17,7 @@ Conventions:
 | 2 | Wire protocol | **complete** |
 | 3 | World and physics | **complete** |
 | 4 | Single-bot loop | **complete** |
-| 5 | Sensors | in progress (5.1 done) |
+| 5 | Sensors | **complete** |
 | 6 | Combat | pending |
 | 7 | Spectator | pending |
 | 8 | Replay | pending |
@@ -99,17 +99,17 @@ Conventions:
 
 ---
 
-## Phase 5 — Sensors
+## Phase 5 — Sensors  *(complete)*
 
 ### 5.1 Active radar  *(done)*
 - **Deliverable:** `src/sim/sensors.rs` with a function computing visible contacts within 350 units when `sensor_mode == "active"`; per-tick contact IDs (not ship IDs); position with seeded ±2 unit noise drawn from the room RNG.
 - **Acceptance:** Unit test with two ships at 200 units apart sees one contact each when both active.
 
-### 5.2 Passive listening
+### 5.2 Passive listening  *(done)*
 - **Deliverable:** Passive mode logic: detect actives within 500 units, anyone within 150 units; bearing-only with seeded ±5° noise.
 - **Acceptance:** Unit test: silent ship at 400 units is invisible to passive listener; same ship while pinging is visible.
 
-### 5.3 Wire sensors into tick payload
+### 5.3 Wire sensors into tick payload  *(done)*
 - **Deliverable:** Replace the empty `contacts: []` from 4.3 with the filtered output for each bot's chosen sensor mode; record per-bot sensor mode for the next tick's "who pinged last tick" logic.
 - **Acceptance:** Two-bot smoke test: one active, one passive — passive bot sees the active one only at expected ranges.
 

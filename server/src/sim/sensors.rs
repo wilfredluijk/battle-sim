@@ -7,11 +7,16 @@
 //! room translates these into `protocol::Contact` (assigning the per-tick `id` strings)
 //! before they cross the wire — keeps `sim/` free of protocol imports per CLAUDE.md.
 
+use std::collections::BTreeSet;
+
 use glam::Vec2;
 use rand::Rng;
 use rand_pcg::Pcg64;
 
-use super::constants::{ACTIVE_RADAR_NOISE, ACTIVE_RADAR_RANGE};
+use super::constants::{
+    ACTIVE_RADAR_NOISE, ACTIVE_RADAR_RANGE, PASSIVE_BEARING_NOISE_DEG,
+    PASSIVE_CONTACT_PLACEHOLDER_DISTANCE, PASSIVE_HEAR_ACTIVE_RANGE, PASSIVE_HEAR_NEARBY_RANGE,
+};
 use super::world::{ShipId, World};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +69,50 @@ pub fn active_contacts(
             bearing_deg: compass_deg(to),
             range: Some(dist),
             confidence: 1.0,
+        });
+    }
+    out
+}
+
+/// Passive listening from `viewer_id` at `viewer_pos`. Detects:
+/// - Any ship in `active_pingers` within `PASSIVE_HEAR_ACTIVE_RANGE` (loud sweep), and
+/// - Any ship at all within `PASSIVE_HEAR_NEARBY_RANGE` (engine noise close-by).
+///
+/// Returned contacts are bearing-only: `range = None`, and `pos` is a placeholder
+/// projection out to `PASSIVE_CONTACT_PLACEHOLDER_DISTANCE` along the noisy bearing so
+/// the wire frame stays consistent. One RNG draw per detected ship (the bearing noise).
+pub fn passive_contacts(
+    viewer_id: &ShipId,
+    viewer_pos: Vec2,
+    world: &World,
+    active_pingers: &BTreeSet<ShipId>,
+    rng: &mut Pcg64,
+) -> Vec<Contact> {
+    let mut out = Vec::new();
+    for (id, ship) in &world.ships {
+        if id == viewer_id || !ship.alive {
+            continue;
+        }
+        let to = ship.pos - viewer_pos;
+        let dist = to.length();
+        let pinging = active_pingers.contains(id);
+        let detected =
+            dist <= PASSIVE_HEAR_NEARBY_RANGE || (pinging && dist <= PASSIVE_HEAR_ACTIVE_RANGE);
+        if !detected {
+            continue;
+        }
+        let true_bearing = compass_deg(to);
+        let noise: f32 = rng.gen_range(-PASSIVE_BEARING_NOISE_DEG..=PASSIVE_BEARING_NOISE_DEG);
+        let bearing = (true_bearing + noise).rem_euclid(360.0);
+        let radians = bearing.to_radians();
+        let placeholder = viewer_pos
+            + Vec2::new(radians.sin(), -radians.cos()) * PASSIVE_CONTACT_PLACEHOLDER_DISTANCE;
+        out.push(Contact {
+            kind: ContactKind::Ship,
+            pos: placeholder,
+            bearing_deg: bearing,
+            range: None,
+            confidence: if pinging { 0.85 } else { 0.5 },
         });
     }
     out
@@ -191,5 +240,127 @@ mod tests {
         // Sorted: 0° (north), 90° (east).
         assert!((contacts[0].bearing_deg - 0.0).abs() < 1e-3);
         assert!((contacts[1].bearing_deg - 90.0).abs() < 1e-3);
+    }
+
+    // ----- Passive listening (Phase 5.2) ----------------------------------
+
+    #[test]
+    fn silent_ship_at_400_units_invisible_to_passive_listener() {
+        // Acceptance check from projectplan §5.2: silent ship at 400 units invisible;
+        // same ship pinging is visible.
+        let mut world = World::new(2000.0, 2000.0);
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        world.insert_ship(ship("s_2", 900.0, 500.0)); // 400 units east
+        let mut rng = Pcg64::seed_from_u64(11);
+
+        // Silent: not in pingers set → invisible (400 > 150 nearby threshold).
+        let silent = BTreeSet::<ShipId>::new();
+        let contacts = passive_contacts(
+            &"s_1".into(),
+            Vec2::new(500.0, 500.0),
+            &world,
+            &silent,
+            &mut rng,
+        );
+        assert!(
+            contacts.is_empty(),
+            "silent ship at 400u should be invisible: {contacts:?}"
+        );
+
+        // Pinging: included in pingers → visible (400 < 500 active threshold).
+        let mut pingers = BTreeSet::<ShipId>::new();
+        pingers.insert("s_2".into());
+        let contacts = passive_contacts(
+            &"s_1".into(),
+            Vec2::new(500.0, 500.0),
+            &world,
+            &pingers,
+            &mut rng,
+        );
+        assert_eq!(contacts.len(), 1, "pinging ship at 400u should be heard");
+        assert!(contacts[0].range.is_none(), "passive must be bearing-only");
+    }
+
+    #[test]
+    fn nearby_silent_ship_within_150_is_audible() {
+        let mut world = World::new(1000.0, 1000.0);
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        world.insert_ship(ship("s_2", 600.0, 500.0)); // 100 units east, silent
+        let mut rng = Pcg64::seed_from_u64(11);
+
+        let silent = BTreeSet::<ShipId>::new();
+        let contacts = passive_contacts(
+            &"s_1".into(),
+            Vec2::new(500.0, 500.0),
+            &world,
+            &silent,
+            &mut rng,
+        );
+        assert_eq!(contacts.len(), 1, "ship at 100u (< 150) should be heard");
+    }
+
+    #[test]
+    fn pinging_ship_beyond_500_is_inaudible() {
+        let mut world = World::new(2000.0, 2000.0);
+        world.insert_ship(ship("s_1", 100.0, 100.0));
+        world.insert_ship(ship("s_2", 800.0, 100.0)); // 700 units east, pinging
+        let mut pingers = BTreeSet::<ShipId>::new();
+        pingers.insert("s_2".into());
+        let mut rng = Pcg64::seed_from_u64(11);
+
+        let contacts = passive_contacts(
+            &"s_1".into(),
+            Vec2::new(100.0, 100.0),
+            &world,
+            &pingers,
+            &mut rng,
+        );
+        assert!(
+            contacts.is_empty(),
+            "pinger beyond 500u should be silent: {contacts:?}"
+        );
+    }
+
+    #[test]
+    fn passive_bearing_noise_is_bounded_by_five_degrees() {
+        let mut world = World::new(1000.0, 1000.0);
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        world.insert_ship(ship("s_2", 600.0, 500.0)); // east, true bearing 90°
+        let silent = BTreeSet::<ShipId>::new();
+        let mut rng = Pcg64::seed_from_u64(7);
+
+        for _ in 0..500 {
+            let contacts = passive_contacts(
+                &"s_1".into(),
+                Vec2::new(500.0, 500.0),
+                &world,
+                &silent,
+                &mut rng,
+            );
+            assert_eq!(contacts.len(), 1);
+            let bearing = contacts[0].bearing_deg;
+            // True bearing is 90; noise within ±5°. Wrapping isn't a concern for 90±5.
+            let dev = (bearing - 90.0).abs();
+            assert!(
+                dev <= PASSIVE_BEARING_NOISE_DEG + 1e-4,
+                "bearing {bearing} > 5° off from 90"
+            );
+        }
+    }
+
+    #[test]
+    fn passive_contacts_are_deterministic_under_same_seed() {
+        let mut world = World::new(1000.0, 1000.0);
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        world.insert_ship(ship("s_2", 600.0, 500.0));
+        world.insert_ship(ship("s_3", 510.0, 600.0));
+        let pingers = BTreeSet::<ShipId>::new();
+
+        let mut rng_a = Pcg64::seed_from_u64(99);
+        let mut rng_b = Pcg64::seed_from_u64(99);
+        let viewer = Vec2::new(500.0, 500.0);
+        let a = passive_contacts(&"s_1".into(), viewer, &world, &pingers, &mut rng_a);
+        let b = passive_contacts(&"s_1".into(), viewer, &world, &pingers, &mut rng_b);
+        assert_eq!(a, b);
     }
 }

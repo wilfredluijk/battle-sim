@@ -5,7 +5,7 @@
 //! to bots via per-connection mpsc senders. Bot lifecycle (Phase 4.1) lives here; per-tick
 //! command exchange lands in Phase 4.3.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -17,8 +17,10 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::protocol::{
-    self, error_code, FireCommand, MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs,
+    self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
+    MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs,
 };
+use crate::sim::sensors::{self, Contact as SimContact, ContactKind as SimContactKind};
 use crate::sim::{physics, BotId, Ship, ShipId, World};
 
 /// Channel buffer for outbound messages to a single bot. Sized for a few ticks of slack —
@@ -157,6 +159,10 @@ pub struct Room {
     /// arriving more than `tick_deadline_ms` after this are rejected as `late_command`.
     /// `None` until the room sends its first `tick` frame after entering `Running`.
     tick_send_time: Option<Instant>,
+    /// Set of `ShipId`s that were in `Active` sensor mode during the previous tick. The
+    /// current tick's passive listeners use this snapshot — sensor mode changes
+    /// propagate with one tick of delay (§5.3 "who pinged last tick" logic).
+    previous_active_pingers: BTreeSet<ShipId>,
 }
 
 impl Room {
@@ -180,6 +186,7 @@ impl Room {
             bots: BTreeMap::new(),
             next_index: 1,
             tick_send_time: None,
+            previous_active_pingers: BTreeSet::new(),
         }
     }
 
@@ -195,13 +202,13 @@ impl Room {
 
     /// Advance the simulation by one fixed timestep and bump the tick counter.
     /// Only steps physics in `Running` state; in `Lobby` / `Ended` the world is frozen.
-    /// Returns the per-bot `tick` frames the caller should deliver. The Vec is empty
-    /// outside `Running`.
     ///
     /// Order, per the determinism contract in `CLAUDE.md`:
     /// 1. Apply queued commands in `BotId` order.
     /// 2. Step physics.
-    /// 3. Build outbound `tick` frames for each bot (`BotId` order).
+    /// 3. Compute per-bot sensor contacts in `BotId` order (RNG draws are stable).
+    /// 4. Build outbound `tick` frames for each bot.
+    /// 5. Snapshot the now-current `Active` pingers for use by next tick's passives.
     pub fn step_tick(&mut self) {
         if self.state != RoomState::Running {
             self.world.tick = self.world.tick.saturating_add(1);
@@ -228,12 +235,38 @@ impl Room {
         self.world.tick = self.world.tick.saturating_add(1);
 
         for bot_id in &bot_ids {
-            let Some(entry) = self.bots.get(bot_id) else {
-                continue;
+            // Look up the bot + ship without holding any borrow on self past the call
+            // site — we'll need `&mut self.rng` and `&self.world` together.
+            let (ship_id, sensor_mode, viewer_pos) = {
+                let Some(entry) = self.bots.get(bot_id) else {
+                    continue;
+                };
+                let Some(ship) = self.world.ships.get(&entry.ship_id) else {
+                    continue;
+                };
+                (entry.ship_id.clone(), entry.sensor_mode, ship.pos)
             };
-            let Some(ship) = self.world.ships.get(&entry.ship_id) else {
-                continue;
+
+            let sim_contacts = match sensor_mode {
+                SensorMode::Active => {
+                    sensors::active_contacts(&ship_id, viewer_pos, &self.world, &mut self.rng)
+                }
+                SensorMode::Passive => sensors::passive_contacts(
+                    &ship_id,
+                    viewer_pos,
+                    &self.world,
+                    &self.previous_active_pingers,
+                    &mut self.rng,
+                ),
             };
+            let contacts = sim_contacts
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| translate_contact(i, c))
+                .collect();
+
+            let entry = self.bots.get(bot_id).expect("bot still present");
+            let ship = self.world.ships.get(&ship_id).expect("ship still present");
             let tick_msg = ServerMsg::Tick {
                 tick: self.world.tick,
                 deadline_ms: self.tick_deadline_ms,
@@ -246,7 +279,7 @@ impl Room {
                     rudder: ship.rudder,
                     throttle: ship.throttle,
                 },
-                contacts: Vec::new(),
+                contacts,
                 events: Vec::new(),
             };
             if let Err(e) = entry.outbound.try_send(tick_msg) {
@@ -258,6 +291,14 @@ impl Room {
                 );
             }
         }
+
+        // Snapshot who pinged this tick so next tick's passive listeners can hear them.
+        self.previous_active_pingers = self
+            .bots
+            .values()
+            .filter(|b| b.sensor_mode == SensorMode::Active)
+            .map(|b| b.ship_id.clone())
+            .collect();
 
         // Record the deadline reference *after* the broadcast so the bot's allotted
         // window starts when it could actually have received the frame.
@@ -413,8 +454,9 @@ impl Room {
 
         self.world.tick = 0;
         self.state = RoomState::Running;
-        // Cleared on entry; the first `step_tick` will populate it after broadcasting.
+        // Cleared on entry; the first `step_tick` will populate them after broadcasting.
         self.tick_send_time = None;
+        self.previous_active_pingers.clear();
         info!(room = %self.name, bots = self.bots.len(), "match started");
         Ok(())
     }
@@ -489,6 +531,23 @@ impl Room {
             ship_id,
             outbound: out_rx,
         })
+    }
+}
+
+/// Translate a sim-internal `Contact` to its on-the-wire `protocol::Contact`, assigning
+/// a per-tick contact id of `c_<index>`.
+fn translate_contact(index: usize, c: SimContact) -> ProtocolContact {
+    ProtocolContact {
+        id: format!("c_{index}"),
+        kind: match c.kind {
+            SimContactKind::Ship => ProtocolContactKind::Ship,
+            SimContactKind::Shell => ProtocolContactKind::Shell,
+            SimContactKind::Unknown => ProtocolContactKind::Unknown,
+        },
+        pos: [c.pos.x, c.pos.y],
+        bearing_deg: c.bearing_deg,
+        range: c.range,
+        confidence: c.confidence,
     }
 }
 
@@ -1024,6 +1083,182 @@ mod tests {
         room.step_tick();
         let ship = room.world.ships.get(&r.ship_id).unwrap();
         assert_eq!(ship.throttle, 0.0, "stale Lobby command should not apply");
+    }
+
+    fn cmd_with_mode(throttle: f32, rudder: f32, mode: SensorMode) -> PendingCommand {
+        PendingCommand {
+            tick: 0,
+            throttle,
+            rudder,
+            sensor_mode: mode,
+            fire: None,
+        }
+    }
+
+    /// Run the standard "two bots, ready, started" prelude and return their
+    /// `BotRegistration`s. Welcome and `game_start` frames are drained.
+    fn started_two_bot_room() -> (Room, BotRegistration, BotRegistration) {
+        let mut room = test_room();
+        let mut r1 = connect(&mut room, "a").expect("a");
+        let mut r2 = connect(&mut room, "b").expect("b");
+        let _ = r1.outbound.try_recv();
+        let _ = r2.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r1.bot_id.clone(),
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r2.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r1.outbound.try_recv();
+        let _ = r2.outbound.try_recv();
+        (room, r1, r2)
+    }
+
+    fn next_tick_contacts(reg: &mut BotRegistration) -> Vec<ProtocolContact> {
+        match reg.outbound.try_recv().expect("tick frame") {
+            ServerMsg::Tick { contacts, .. } => contacts,
+            other => panic!("expected Tick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_bot_gets_ranged_contact_for_in_range_ship() {
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+
+        // Reposition: 100u apart so the active radar (350u) sees s_2 and the passive
+        // listener also hears s_1 via the 150u nearby rule.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(600.0, 500.0);
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+
+        let active_contacts = next_tick_contacts(&mut r1);
+        assert_eq!(active_contacts.len(), 1, "active sees one ship");
+        let c = &active_contacts[0];
+        assert_eq!(c.id, "c_0");
+        assert_eq!(c.kind, ProtocolContactKind::Ship);
+        let r = c.range.expect("active range");
+        assert!((r - 100.0).abs() < 1.0, "range was {r}");
+
+        let passive_contacts = next_tick_contacts(&mut r2);
+        assert_eq!(
+            passive_contacts.len(),
+            1,
+            "100u within 150u nearby threshold"
+        );
+        assert!(
+            passive_contacts[0].range.is_none(),
+            "passive must not report range"
+        );
+    }
+
+    #[test]
+    fn passive_hears_pinger_with_one_tick_delay_at_300_units() {
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+
+        // 300u apart: out of nearby (150) but within active-listening (500) and active
+        // radar (350) ranges.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(400.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(700.0, 500.0);
+
+        // Tick 1: r1 commands Active, r2 commands Passive. previous_active_pingers is
+        // empty (cleared at start_match), so the passive listener should NOT yet hear.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+
+        let active_contacts = next_tick_contacts(&mut r1);
+        assert_eq!(active_contacts.len(), 1, "active sees s_2 at 300u");
+
+        let passive_contacts = next_tick_contacts(&mut r2);
+        assert!(
+            passive_contacts.is_empty(),
+            "passive must not yet hear (one-tick delay): {passive_contacts:?}"
+        );
+
+        // Tick 2: send the same commands. Now previous_active_pingers contains s_1, so
+        // the passive listener picks it up.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+
+        let _ = next_tick_contacts(&mut r1);
+        let passive_contacts = next_tick_contacts(&mut r2);
+        assert_eq!(
+            passive_contacts.len(),
+            1,
+            "passive should now hear the pinger"
+        );
+        assert!(passive_contacts[0].range.is_none());
+        // Bearing from r2 (east of s_1) toward s_1 is west (~270°), within ±5°.
+        let b = passive_contacts[0].bearing_deg;
+        let dev = (b - 270.0).abs().min((b - 270.0 + 360.0).abs());
+        assert!(dev < 5.0 + 1e-3, "bearing {b} too far from 270°");
+    }
+
+    #[test]
+    fn passive_does_not_hear_silent_distant_ship() {
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+
+        // 300u apart, both passive — nobody pings, so the 500u "hear actives" rule
+        // doesn't fire and 300u > 150u nearby threshold.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(400.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(700.0, 500.0);
+
+        for _ in 0..3 {
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r1.bot_id.clone(),
+                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            });
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r2.bot_id.clone(),
+                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            });
+            room.step_tick();
+            assert!(next_tick_contacts(&mut r1).is_empty());
+            assert!(next_tick_contacts(&mut r2).is_empty());
+        }
+    }
+
+    #[test]
+    fn active_bot_does_not_see_target_beyond_350_units() {
+        let (mut room, mut r1, r2) = started_two_bot_room();
+        // 400u apart > active radar range (350).
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(300.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(700.0, 500.0);
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+
+        assert!(next_tick_contacts(&mut r1).is_empty(), "400u > 350u radar");
     }
 
     #[test]
