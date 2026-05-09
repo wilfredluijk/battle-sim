@@ -23,13 +23,18 @@ struct ServerHandle {
 }
 
 async fn start_server() -> ServerHandle {
+    start_server_with(50, 80).await
+}
+
+async fn start_server_with(tick_hz: u32, tick_deadline_ms: u64) -> ServerHandle {
     let probe = TcpListener::bind("127.0.0.1:0").await.expect("probe bind");
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
 
     let mut config = Config::parse_from(["test"]);
     config.port = port;
-    config.tick_hz = 50;
+    config.tick_hz = tick_hz;
+    config.tick_deadline_ms = tick_deadline_ms;
 
     let (shutdown_tx, shutdown_rx_net) = broadcast::channel::<()>(4);
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
@@ -152,6 +157,82 @@ async fn full_throttle_command_moves_the_ship_each_tick() {
         moved_at_least_once,
         "ship should have moved between ticks under full throttle (start={start_pos:?}, last={last_pos:?})"
     );
+
+    let _ = ws.close(None).await;
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_command_yields_error_and_keeps_bot_alive() {
+    // Slow tick (5Hz = 200ms) + tight deadline (10ms) so a tiny sleep makes us late.
+    let ServerHandle {
+        port,
+        shutdown,
+        room_tx,
+    } = start_server_with(5, 10).await;
+    let url = format!("ws://127.0.0.1:{port}/bot");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    ws.send(Message::Text(
+        r#"{"type":"hello","name":"slow","version":"1.0"}"#.into(),
+    ))
+    .await
+    .expect("send hello");
+    let _ = recv_typed(&mut ws, "welcome").await;
+    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
+        .await
+        .expect("send ready");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    room_tx
+        .send(RoomEvent::OperatorStart {
+            room: "main".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send start");
+    reply_rx.await.expect("oneshot").expect("start ok");
+    let _ = recv_typed(&mut ws, "game_start").await;
+
+    let first = recv_typed(&mut ws, "tick").await;
+    let tick = first["tick"].as_u64().unwrap();
+
+    // Sleep well past the 10ms deadline before responding.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let cmd = format!(
+        r#"{{"type":"command","tick":{tick},"throttle":1.0,"rudder":1.0,"sensor_mode":"active"}}"#
+    );
+    ws.send(Message::Text(cmd))
+        .await
+        .expect("send late command");
+
+    // Expect a `late_command` error frame on this stream.
+    let mut got_late = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        let res = tokio::time::timeout(Duration::from_millis(400), ws.next()).await;
+        let Ok(Some(Ok(Message::Text(text)))) = res else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("frame");
+        if v["type"] == "error" && v["code"] == "late_command" {
+            got_late = true;
+            break;
+        }
+    }
+    assert!(got_late, "expected a late_command error frame");
+
+    // Bot is still alive: subsequent ticks still come, and the previous-tick controls
+    // (defaulted to 0 from game_start) persist — the late command did NOT take effect.
+    let next = recv_typed(&mut ws, "tick").await;
+    let throttle = next["self"]["throttle"].as_f64().unwrap() as f32;
+    let rudder = next["self"]["rudder"].as_f64().unwrap() as f32;
+    assert_eq!(throttle, 0.0, "late command must not have applied throttle");
+    assert_eq!(rudder, 0.0, "late command must not have applied rudder");
 
     let _ = ws.close(None).await;
     let _ = shutdown.send(());

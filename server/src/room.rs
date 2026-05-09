@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glam::Vec2;
 use rand::SeedableRng;
@@ -16,7 +16,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use crate::protocol::{FireCommand, MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs};
+use crate::protocol::{
+    self, error_code, FireCommand, MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs,
+};
 use crate::sim::{physics, BotId, Ship, ShipId, World};
 
 /// Channel buffer for outbound messages to a single bot. Sized for a few ticks of slack —
@@ -151,6 +153,10 @@ pub struct Room {
     pub max_bots: u32,
     bots: BTreeMap<BotId, BotEntry>,
     next_index: u32,
+    /// Wall-clock time at which the most recent `tick` frame was broadcast. Commands
+    /// arriving more than `tick_deadline_ms` after this are rejected as `late_command`.
+    /// `None` until the room sends its first `tick` frame after entering `Running`.
+    tick_send_time: Option<Instant>,
 }
 
 impl Room {
@@ -173,6 +179,7 @@ impl Room {
             max_bots,
             bots: BTreeMap::new(),
             next_index: 1,
+            tick_send_time: None,
         }
     }
 
@@ -251,6 +258,10 @@ impl Room {
                 );
             }
         }
+
+        // Record the deadline reference *after* the broadcast so the bot's allotted
+        // window starts when it could actually have received the frame.
+        self.tick_send_time = Some(Instant::now());
     }
 
     /// Apply a single `RoomEvent`. The connection task waits on `oneshot` replies; other
@@ -277,13 +288,7 @@ impl Room {
                 }
             }
             RoomEvent::BotCommand { bot_id, command } => {
-                if let Some(entry) = self.bots.get_mut(&bot_id) {
-                    // Most-recent-wins. Phase 4.4 will add late-command rejection; for now
-                    // any command queued before the next tick gets applied.
-                    entry.pending_command = Some(command);
-                } else {
-                    warn!(room = %self.name, bot = %bot_id, "command from unknown bot, ignored");
-                }
+                self.handle_bot_command(bot_id, command);
             }
             RoomEvent::BotDisconnect { bot_id } => {
                 if let Some(entry) = self.bots.remove(&bot_id) {
@@ -299,6 +304,57 @@ impl Room {
                 let _ = reply.send(result);
             }
         }
+    }
+
+    /// Queue a command for the next tick or reject it as `late_command` per §1.3 of the
+    /// protocol. Late commands leave `pending_command` untouched so the previous tick's
+    /// throttle / rudder / sensor_mode persist. Out-of-running-state commands are dropped
+    /// silently — the ship has nothing to drive yet.
+    fn handle_bot_command(&mut self, bot_id: BotId, command: PendingCommand) {
+        let now = Instant::now();
+        let state = self.state;
+        let deadline_ms = self.tick_deadline_ms;
+        let send_time = self.tick_send_time;
+
+        let Some(entry) = self.bots.get_mut(&bot_id) else {
+            warn!(room = %self.name, bot = %bot_id, "command from unknown bot, ignored");
+            return;
+        };
+
+        if state == RoomState::Running {
+            if let Some(t) = send_time {
+                let elapsed = now.duration_since(t);
+                if elapsed.as_millis() > u128::from(deadline_ms) {
+                    let err = protocol::error_msg(
+                        error_code::LATE_COMMAND,
+                        format!(
+                            "command for tick {} arrived {}ms after frame (deadline {}ms)",
+                            command.tick,
+                            elapsed.as_millis(),
+                            deadline_ms,
+                        ),
+                    );
+                    if let Err(e) = entry.outbound.try_send(err) {
+                        debug!(
+                            room = %self.name,
+                            bot = %bot_id,
+                            error = %e,
+                            "couldn't push late_command error",
+                        );
+                    }
+                    debug!(
+                        room = %self.name,
+                        bot = %bot_id,
+                        elapsed_ms = elapsed.as_millis(),
+                        deadline_ms,
+                        "rejected late command",
+                    );
+                    return;
+                }
+            }
+        }
+
+        entry.pending_command = Some(command);
     }
 
     /// Operator-triggered transition `Lobby` → `Running`. Places ships on the §5.6 ring
@@ -357,6 +413,8 @@ impl Room {
 
         self.world.tick = 0;
         self.state = RoomState::Running;
+        // Cleared on entry; the first `step_tick` will populate it after broadcasting.
+        self.tick_send_time = None;
         info!(room = %self.name, bots = self.bots.len(), "match started");
         Ok(())
     }
@@ -859,6 +917,86 @@ mod tests {
         let ship = room.world.ships.get(&r.ship_id).unwrap();
         assert!((ship.throttle - throttle_after_first).abs() < 1e-6);
         assert!((ship.rudder - rudder_after_first).abs() < 1e-6);
+    }
+
+    #[test]
+    fn late_command_rejected_with_error_and_does_not_overwrite_controls() {
+        let mut room = Room::new("test".into(), 1000.0, 1000.0, 42, 10, 5, 4);
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+
+        // Apply a real command first so the ship has non-zero controls.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(0, 0.5, 0.3),
+        });
+        room.step_tick();
+        let _ = r.outbound.try_recv(); // drop tick frame
+        let throttle_before = room.world.ships.get(&r.ship_id).unwrap().throttle;
+        let rudder_before = room.world.ships.get(&r.ship_id).unwrap().rudder;
+        assert!((throttle_before - 0.5).abs() < 1e-6);
+
+        // Force the deadline to expire. tick_deadline_ms = 5; sleep 30ms.
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Send a late command. It must not change ship state and must produce an error.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(1, -1.0, -1.0),
+        });
+
+        let err = r.outbound.try_recv().expect("late_command error queued");
+        match err {
+            ServerMsg::Error { code, .. } => {
+                assert_eq!(code, error_code::LATE_COMMAND);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // Step a tick. Since pending_command is still None, the previous controls persist.
+        room.step_tick();
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert!(
+            (ship.throttle - throttle_before).abs() < 1e-6,
+            "throttle changed: was {throttle_before}, now {}",
+            ship.throttle
+        );
+        assert!(
+            (ship.rudder - rudder_before).abs() < 1e-6,
+            "rudder changed: was {rudder_before}, now {}",
+            ship.rudder
+        );
+    }
+
+    #[test]
+    fn command_within_deadline_applies_normally() {
+        // tick_deadline_ms = 200 (generous); the command sent immediately after step_tick
+        // should be applied on the next step.
+        let mut room = Room::new("test".into(), 1000.0, 1000.0, 42, 10, 200, 4);
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+
+        room.step_tick();
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(1, 0.4, 0.0),
+        });
+        // No error queued.
+        assert!(r.outbound.try_recv().is_err(), "should be no error frame");
+        room.step_tick();
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert!((ship.throttle - 0.4).abs() < 1e-6);
     }
 
     #[test]

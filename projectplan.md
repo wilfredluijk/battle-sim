@@ -16,7 +16,7 @@ Conventions:
 | 1 | Server skeleton | **complete** |
 | 2 | Wire protocol | **complete** |
 | 3 | World and physics | **complete** |
-| 4 | Single-bot loop | in progress (4.1, 4.2, 4.3 done) |
+| 4 | Single-bot loop | **complete** |
 | 5 | Sensors | pending |
 | 6 | Combat | pending |
 | 7 | Spectator | pending |
@@ -79,7 +79,7 @@ Conventions:
 
 ---
 
-## Phase 4 — Single-bot loop
+## Phase 4 — Single-bot loop  *(complete)*
 
 ### 4.1 Lobby state and handshake  *(done)*
 - **Deliverable:** Room state machine (`Lobby` / `Running` / `Ended`); `hello` → `welcome` exchange assigning a `bot_id` and `ship_id`; `ready` flag tracked per bot.
@@ -93,7 +93,7 @@ Conventions:
 - **Deliverable:** Each tick, the room sends every bot a `tick` message (self-state only for now, `contacts: []`); collects `command` replies until deadline; applies `throttle`/`rudder` sorted by `bot_id`.
 - **Acceptance:** A scripted Python bot driving in a circle moves visibly in server logs (position changes per tick).
 
-### 4.4 Late-command handling
+### 4.4 Late-command handling  *(done)*
 - **Deliverable:** Commands arriving after deadline are dropped with an `error` reply; previous throttle/rudder/sensor_mode persist; missing commands do not disconnect the bot.
 - **Acceptance:** Unit/integration test: bot deliberately delays one tick, server keeps it alive and reuses prior controls.
 
