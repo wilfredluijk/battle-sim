@@ -7,4 +7,4 @@ pub mod constants;
 pub mod physics;
 pub mod world;
 
-pub use world::{BotId, Ship, ShipId, Shell, World};
+pub use world::{BotId, Shell, Ship, ShipId, World};

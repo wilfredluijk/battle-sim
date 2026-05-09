@@ -6,10 +6,10 @@ use std::time::Duration;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
-use naval_server::{config::Config, net};
+use naval_server::{config::Config, net, room::ROOM_EVENT_BUFFER};
 
 async fn start_server() -> (u16, broadcast::Sender<()>) {
     // Find a free port by binding to :0, then drop and let the server re-bind.
@@ -21,7 +21,10 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
     config.port = port;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(4);
-    tokio::spawn(net::run(config, shutdown_rx));
+    // No room is wired up — these tests only exercise pre-handshake validation, which
+    // never reaches the room. A leaked sender keeps the channel open.
+    let (room_tx, _room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
+    tokio::spawn(net::run(config, room_tx, shutdown_rx));
 
     // Give the listener a moment to bind on the freed port.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -46,7 +49,9 @@ async fn empty_object_yields_typed_error_and_does_not_crash() {
     assert!(parsed["message"].is_string(), "missing message in {text}");
 
     // Server is still alive: send a second bad frame, expect another error reply.
-    ws.send(Message::Text("not json".into())).await.expect("send 2");
+    ws.send(Message::Text("not json".into()))
+        .await
+        .expect("send 2");
     let text2 = recv_text(&mut ws).await;
     let parsed2: serde_json::Value = serde_json::from_str(&text2).unwrap();
     assert_eq!(parsed2["type"], "error");
@@ -66,7 +71,7 @@ async fn five_violations_disconnects_with_close() {
 
     for i in 0..10 {
         if ws
-            .send(Message::Text(format!(r#"{{"bad":{i}}}"#).into()))
+            .send(Message::Text(format!(r#"{{"bad":{i}}}"#)))
             .await
             .is_err()
         {
