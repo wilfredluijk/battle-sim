@@ -5,6 +5,7 @@
 
 pub mod constants;
 pub mod physics;
+pub mod sensors;
 pub mod world;
 
 pub use world::{BotId, Shell, Ship, ShipId, World};

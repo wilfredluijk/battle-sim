@@ -17,7 +17,7 @@ Conventions:
 | 2 | Wire protocol | **complete** |
 | 3 | World and physics | **complete** |
 | 4 | Single-bot loop | **complete** |
-| 5 | Sensors | pending |
+| 5 | Sensors | in progress (5.1 done) |
 | 6 | Combat | pending |
 | 7 | Spectator | pending |
 | 8 | Replay | pending |
@@ -101,7 +101,7 @@ Conventions:
 
 ## Phase 5 — Sensors
 
-### 5.1 Active radar
+### 5.1 Active radar  *(done)*
 - **Deliverable:** `src/sim/sensors.rs` with a function computing visible contacts within 350 units when `sensor_mode == "active"`; per-tick contact IDs (not ship IDs); position with seeded ±2 unit noise drawn from the room RNG.
 - **Acceptance:** Unit test with two ships at 200 units apart sees one contact each when both active.
 
