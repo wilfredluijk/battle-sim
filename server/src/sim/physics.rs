@@ -5,8 +5,7 @@
 use glam::Vec2;
 
 use super::constants::{
-    ACCELERATION, DT, MAX_FORWARD_SPEED, MAX_REVERSE_SPEED, TURN_RATE_DEG_PER_S,
-    WALL_BUMP_DAMAGE,
+    ACCELERATION, DT, MAX_FORWARD_SPEED, MAX_REVERSE_SPEED, TURN_RATE_DEG_PER_S, WALL_BUMP_DAMAGE,
 };
 use super::world::{Ship, World};
 
@@ -179,7 +178,11 @@ mod tests {
         s.throttle = 1.0;
         let hp0 = s.hp;
         step_ship(&mut s, W, H);
-        assert!((s.pos.x - W).abs() < 1e-4, "expected clamp to wall, x = {}", s.pos.x);
+        assert!(
+            (s.pos.x - W).abs() < 1e-4,
+            "expected clamp to wall, x = {}",
+            s.pos.x
+        );
         assert_eq!(s.speed, 0.0, "wall hit should stop the ship");
         assert!(s.hp < hp0, "wall hit should deal damage");
         assert_eq!(s.hp, hp0 - constants::WALL_BUMP_DAMAGE);

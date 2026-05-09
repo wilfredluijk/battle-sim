@@ -1,11 +1,12 @@
 use clap::Parser;
+use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use naval_server::{
     config::Config,
     control, net,
-    room::{self, Room},
+    room::{self, Room, ROOM_EVENT_BUFFER},
 };
 
 const BANNER: &str = r#"
@@ -38,20 +39,23 @@ async fn main() {
     );
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(8);
+    let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
 
     let main_room = Room::new(
         "main".into(),
         config.map.0 as f32,
         config.map.1 as f32,
         config.seed,
-    );
-    let room_handle = tokio::spawn(room::run_room(
-        main_room,
         config.tick_hz,
+        config.max_bots,
+    );
+    let room_handle = tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()));
+
+    let net_handle = tokio::spawn(net::run(
+        config.clone(),
+        room_tx.clone(),
         shutdown_tx.subscribe(),
     ));
-
-    let net_handle = tokio::spawn(net::run(config.clone(), shutdown_tx.subscribe()));
     let control_handle = tokio::spawn(control::run(shutdown_tx.clone()));
 
     tokio::select! {
@@ -70,6 +74,7 @@ async fn main() {
     }
 
     let _ = shutdown_tx.send(());
+    drop(room_tx);
 
     if let Err(e) = net_handle.await {
         tracing::error!(error = %e, "net task panicked");

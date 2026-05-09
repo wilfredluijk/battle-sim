@@ -9,53 +9,71 @@ Conventions:
 
 ---
 
-## Phase 1 — Server skeleton
+## Status
 
-### 1.1 Initialize Rust workspace and binary
+| Phase | Title | Status |
+|---|---|---|
+| 1 | Server skeleton | **complete** |
+| 2 | Wire protocol | **complete** |
+| 3 | World and physics | **complete** |
+| 4 | Single-bot loop | in progress (4.1 done) |
+| 5 | Sensors | pending |
+| 6 | Combat | pending |
+| 7 | Spectator | pending |
+| 8 | Replay | pending |
+| 9 | Python SDK | pending |
+| 10 | Examples and onboarding | pending |
+| 11 | Polish | pending |
+
+---
+
+## Phase 1 — Server skeleton  *(complete)*
+
+### 1.1 Initialize Rust workspace and binary  *(done)*
 - **Deliverable:** `server/Cargo.toml` with deps (`tokio`, `tokio-tungstenite`, `serde`, `serde_json`, `glam`, `rand`, `rand_pcg`, `clap`, `tracing`, `tracing-subscriber`); empty `src/main.rs` that prints a banner and exits.
 - **Acceptance:** `cargo build` succeeds; `cargo run` prints the banner.
 
-### 1.2 CLI argument parsing
+### 1.2 CLI argument parsing  *(done)*
 - **Deliverable:** `clap`-based parser for the flags in §3.3 (`--port`, `--tick-hz`, `--tick-deadline-ms`, `--map`, `--max-bots`, `--seed`, `--replay-dir`); a `Config` struct passed into runtime.
 - **Acceptance:** `cargo run -- --help` shows all flags; bad input produces a clear error.
 
-### 1.3 WebSocket accept loop
+### 1.3 WebSocket accept loop  *(done)*
 - **Deliverable:** `src/net.rs` accepting connections on `/bot` and `/spectate`; each connection becomes a tokio task that reads frames and logs them via `tracing`.
 - **Acceptance:** `wscat -c ws://localhost:7878/bot` connects; sent JSON appears in server logs.
 
-### 1.4 Stdin control plane
+### 1.4 Stdin control plane  *(done)*
 - **Deliverable:** `src/control.rs` reading stdin line-by-line; recognizes a `quit` command and triggers graceful shutdown. Stub the rest of §3.3 commands as "not implemented" log lines.
 - **Acceptance:** Typing `quit` in the terminal cleanly stops the server.
 
 ---
 
-## Phase 2 — Wire protocol
+## Phase 2 — Wire protocol  *(complete)*
 
-### 2.1 Protocol types
+### 2.1 Protocol types  *(done)*
 - **Deliverable:** `src/protocol.rs` with serde-tagged enums for every Bot↔Server message in §4.1 and the spectator `world` message in §4.2. Internally-tagged on `"type"`.
 - **Acceptance:** `cargo test` round-trips each variant through `serde_json` to_string → from_str.
 
-### 2.2 Protocol validation at the boundary
+### 2.2 Protocol validation at the boundary  *(done)*
 - **Deliverable:** `net.rs` parses incoming frames into `BotMsg`; malformed frames return an `error` message to the client and increment a per-connection violation counter (disconnect after N).
 - **Acceptance:** Sending `{}` over `/bot` yields a typed error reply, not a server panic.
 
-### 2.3 PROTOCOL.md
+### 2.3 PROTOCOL.md  *(done)*
 - **Deliverable:** `docs/PROTOCOL.md` mirroring §4 of the design doc with examples lifted from `protocol.rs`. Add a "Changelog" section header (empty for now).
 - **Acceptance:** Field names in `protocol.rs` and `PROTOCOL.md` match exactly (eyeball + grep).
 
 ---
 
-## Phase 3 — World and physics
+## Phase 3 — World and physics  *(complete)*
 
-### 3.1 World data structures
+### 3.1 World data structures  *(done)*
 - **Deliverable:** `src/sim/world.rs` with `World`, `Ship`, `Shell` structs using `glam::Vec2` (`f32`); constants module for the values in §5.2.
 - **Acceptance:** A unit test constructs a world with two ships at known positions and reads back state.
 
-### 3.2 Physics integration
+### 3.2 Physics integration  *(done)*
 - **Deliverable:** `src/sim/physics.rs` implementing throttle/rudder integration with the constants in §5.2; wall collision (stop + small bump damage).
 - **Acceptance:** Unit tests: ship at full throttle reaches max speed; full rudder turn rate matches spec at top speed; wall hit clamps position and applies damage.
 
-### 3.3 Tick loop scaffolding
+### 3.3 Tick loop scaffolding  *(done)*
 - **Deliverable:** `src/room.rs` Room struct and `step_tick()` method calling physics; main runtime spawns one room called `main` on startup that ticks at `--tick-hz` with no bots.
 - **Acceptance:** Server logs `tick=N` lines at the configured rate; tick numbers are monotonic.
 
@@ -63,7 +81,7 @@ Conventions:
 
 ## Phase 4 — Single-bot loop
 
-### 4.1 Lobby state and handshake
+### 4.1 Lobby state and handshake  *(done)*
 - **Deliverable:** Room state machine (`Lobby` / `Running` / `Ended`); `hello` → `welcome` exchange assigning a `bot_id` and `ship_id`; `ready` flag tracked per bot.
 - **Acceptance:** A Python script connects, sends `hello`, receives `welcome` with assigned IDs, sends `ready`, receives no further messages until game start.
 

@@ -267,7 +267,10 @@ mod tests {
         roundtrip(&ServerMsg::Welcome {
             bot_id: "b_3".into(),
             ship_id: "s_3".into(),
-            map: MapInfo { width: 1000, height: 1000 },
+            map: MapInfo {
+                width: 1000,
+                height: 1000,
+            },
             tick_hz: 10,
             ship_specs: ShipSpecs::DEFAULT,
         });
@@ -298,7 +301,9 @@ mod tests {
             }],
             events: vec![
                 TickEvent::Hit { amount: 12 },
-                TickEvent::ShellSplash { pos: [220.0, 505.0] },
+                TickEvent::ShellSplash {
+                    pos: [220.0, 505.0],
+                },
             ],
         });
         roundtrip(&ServerMsg::GameOver {
@@ -311,7 +316,10 @@ mod tests {
             final_tick: 3000,
             replay_id: "match_draw".into(),
         });
-        roundtrip(&error_msg(error_code::LATE_COMMAND, "command for tick 142 arrived after deadline"));
+        roundtrip(&error_msg(
+            error_code::LATE_COMMAND,
+            "command for tick 142 arrived after deadline",
+        ));
     }
 
     #[test]
@@ -333,9 +341,16 @@ mod tests {
                 ttl_ticks: 18,
             }],
             events: vec![
-                SpectatorEvent::Hit { ship_id: "s_1".into(), amount: 12 },
-                SpectatorEvent::ShellSplash { pos: [220.0, 505.0] },
-                SpectatorEvent::Death { ship_id: "s_2".into() },
+                SpectatorEvent::Hit {
+                    ship_id: "s_1".into(),
+                    amount: 12,
+                },
+                SpectatorEvent::ShellSplash {
+                    pos: [220.0, 505.0],
+                },
+                SpectatorEvent::Death {
+                    ship_id: "s_2".into(),
+                },
             ],
         });
     }
@@ -353,11 +368,23 @@ mod tests {
         }"#;
         let parsed: BotMsg = serde_json::from_str(json).expect("parse");
         match parsed {
-            BotMsg::Command { tick, throttle, rudder, fire, sensor_mode } => {
+            BotMsg::Command {
+                tick,
+                throttle,
+                rudder,
+                fire,
+                sensor_mode,
+            } => {
                 assert_eq!(tick, 142);
                 assert!((throttle - 0.8).abs() < 1e-6);
                 assert!((rudder - -0.3).abs() < 1e-6);
-                assert_eq!(fire, Some(FireCommand { bearing_deg: 47.5, range: 300.0 }));
+                assert_eq!(
+                    fire,
+                    Some(FireCommand {
+                        bearing_deg: 47.5,
+                        range: 300.0
+                    })
+                );
                 assert_eq!(sensor_mode, SensorMode::Active);
             }
             other => panic!("expected Command, got {other:?}"),

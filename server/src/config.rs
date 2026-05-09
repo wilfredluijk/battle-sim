@@ -37,9 +37,7 @@ fn parse_map_size(s: &str) -> Result<(u32, u32), String> {
     let (w, h) = s
         .split_once('x')
         .ok_or_else(|| format!("expected WIDTHxHEIGHT, got `{s}`"))?;
-    let width: u32 = w
-        .parse()
-        .map_err(|e| format!("invalid width `{w}`: {e}"))?;
+    let width: u32 = w.parse().map_err(|e| format!("invalid width `{w}`: {e}"))?;
     let height: u32 = h
         .parse()
         .map_err(|e| format!("invalid height `{h}`: {e}"))?;
