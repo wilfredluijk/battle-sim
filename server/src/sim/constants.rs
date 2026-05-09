@@ -1,0 +1,32 @@
+//! Simulation constants. Source of truth: `system-design.md` §5.2 (ship) and §5.4 (weapons).
+//!
+//! Values must stay in sync with `protocol::ShipSpecs::DEFAULT`. A future test should
+//! cross-check the two; for now they are duplicated by inspection.
+
+/// Fixed simulation timestep. The wall clock is only used to *pace* the tick loop, never to
+/// drive physics — see `CLAUDE.md` "Determinism in the simulation".
+pub const DT: f32 = 0.1;
+
+// --- Ship (§5.2) -----------------------------------------------------------
+
+pub const MAX_FORWARD_SPEED: f32 = 6.0;
+pub const MAX_REVERSE_SPEED: f32 = 2.0;
+pub const ACCELERATION: f32 = 1.5;
+/// Yaw rate at full rudder and full forward speed. Scales linearly with `|speed| / max_forward`.
+pub const TURN_RATE_DEG_PER_S: f32 = 15.0;
+pub const HULL_HP: u32 = 100;
+pub const MAX_AMMO: u32 = 20;
+pub const GUN_COOLDOWN_TICKS: u32 = 15;
+pub const HIT_RADIUS: f32 = 8.0;
+
+// --- Weapons (§5.4) --------------------------------------------------------
+
+pub const SHELL_SPEED: f32 = 50.0;
+pub const MAX_SHELL_RANGE: f32 = 300.0;
+pub const SPLASH_RADIUS: f32 = 15.0;
+pub const MAX_SPLASH_DAMAGE: u32 = 25;
+
+// --- World ----------------------------------------------------------------
+
+/// HP cost when a ship slams into a wall.
+pub const WALL_BUMP_DAMAGE: u32 = 2;
