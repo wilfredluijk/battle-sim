@@ -213,6 +213,7 @@ pub mod error_code {
     pub const TOO_MANY_VIOLATIONS: &str = "too_many_violations";
     pub const LATE_COMMAND: &str = "late_command";
     pub const COOLDOWN_ACTIVE: &str = "cooldown_active";
+    pub const NO_AMMO: &str = "no_ammo";
 }
 
 /// Build a `ServerMsg::Error`.

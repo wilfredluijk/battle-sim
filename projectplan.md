@@ -18,7 +18,7 @@ Conventions:
 | 3 | World and physics | **complete** |
 | 4 | Single-bot loop | **complete** |
 | 5 | Sensors | **complete** |
-| 6 | Combat | pending |
+| 6 | Combat | **complete** |
 | 7 | Spectator | pending |
 | 8 | Replay | pending |
 | 9 | Python SDK | pending |
@@ -115,21 +115,21 @@ Conventions:
 
 ---
 
-## Phase 6 — Combat
+## Phase 6 — Combat  *(complete)*
 
-### 6.1 Firing and shells
+### 6.1 Firing and shells  *(done)*
 - **Deliverable:** `src/sim/combat.rs` handling `fire` commands: spawn a `Shell` with bearing + requested range; enforce gun cooldown server-side; update ammo.
 - **Acceptance:** Unit test: bot fires at bearing 90, range 200 — a shell exists in world state with correct velocity and TTL of 40 ticks.
 
-### 6.2 Shell flight and splash damage
+### 6.2 Shell flight and splash damage  *(done)*
 - **Deliverable:** Per-tick shell integration; on TTL expiry, apply linear-falloff damage within 15 units (25 dmg → 0 dmg); friendly fire on.
 - **Acceptance:** Unit test: shell expires next to a stationary ship and lands the expected damage; a ship hit by its own shell takes damage.
 
-### 6.3 Death and win condition
+### 6.3 Death and win condition  *(done)*
 - **Deliverable:** Ships at HP ≤ 0 are removed; affected bots get `game_over`; room transitions to `Ended` when ≤1 alive; 3000-tick timeout with HP-then-ammo tiebreaker.
 - **Acceptance:** Two scripted bots fight to completion; the loser receives `game_over`, the winner receives `game_over` with itself as winner.
 
-### 6.4 Hit/splash events surfaced to bots
+### 6.4 Hit/splash events surfaced to bots  *(done)*
 - **Deliverable:** Populate the `events` array in the `tick` payload with `hit` and `shell_splash` events the bot can perceive (own hits always; splashes within sensor range).
 - **Acceptance:** Bot taking damage logs the `hit` event from its tick payload.
 

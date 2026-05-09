@@ -18,8 +18,10 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
-    MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs,
+    MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, TickEvent,
 };
+use crate::sim::combat::{self, CombatEvent, FireError};
+use crate::sim::constants::{ACTIVE_RADAR_RANGE, PASSIVE_HEAR_NEARBY_RANGE};
 use crate::sim::sensors::{self, Contact as SimContact, ContactKind as SimContactKind};
 use crate::sim::{physics, BotId, Ship, ShipId, World};
 
@@ -33,6 +35,10 @@ pub const ROOM_EVENT_BUFFER: usize = 256;
 /// Radius of the §5.6 starting circle. Bots are placed evenly around the map center,
 /// all facing inward.
 const STARTING_RING_RADIUS: f32 = 400.0;
+
+/// Hard match timeout per §5.5. After this many ticks the room ends regardless of how
+/// many ships are alive; the highest-HP survivor (tie-break: highest remaining ammo) wins.
+const MATCH_TIMEOUT_TICKS: u64 = 3000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomState {
@@ -67,7 +73,6 @@ pub struct PendingCommand {
     pub throttle: f32,
     pub rudder: f32,
     pub sensor_mode: SensorMode,
-    #[allow(dead_code)] // Wired in Phase 6 (combat).
     pub fire: Option<FireCommand>,
 }
 
@@ -163,6 +168,10 @@ pub struct Room {
     /// current tick's passive listeners use this snapshot — sensor mode changes
     /// propagate with one tick of delay (§5.3 "who pinged last tick" logic).
     previous_active_pingers: BTreeSet<ShipId>,
+    /// Number of bots present at `game_start`. The "≤1 alive ⇒ match over" rule from §5.5
+    /// only applies when at least two ships started; a 1-bot sandbox/test room would
+    /// otherwise terminate on its first tick.
+    starting_bot_count: u32,
 }
 
 impl Room {
@@ -187,6 +196,7 @@ impl Room {
             next_index: 1,
             tick_send_time: None,
             previous_active_pingers: BTreeSet::new(),
+            starting_bot_count: 0,
         }
     }
 
@@ -204,11 +214,15 @@ impl Room {
     /// Only steps physics in `Running` state; in `Lobby` / `Ended` the world is frozen.
     ///
     /// Order, per the determinism contract in `CLAUDE.md`:
-    /// 1. Apply queued commands in `BotId` order.
-    /// 2. Step physics.
-    /// 3. Compute per-bot sensor contacts in `BotId` order (RNG draws are stable).
-    /// 4. Build outbound `tick` frames for each bot.
-    /// 5. Snapshot the now-current `Active` pingers for use by next tick's passives.
+    /// 1. Apply queued commands (throttle/rudder/sensor_mode + fire) in `BotId` order.
+    /// 2. Step physics (movement + cooldown decrement).
+    /// 3. Step shells (flight + splash damage + death flips).
+    /// 4. Bump tick counter.
+    /// 5. Check the §5.5 end conditions; if the match is over, broadcast `game_over`
+    ///    and return — no `tick` frame this tick.
+    /// 6. Compute per-bot sensor contacts and build/send `tick` frames including
+    ///    sensor-filtered combat events.
+    /// 7. Snapshot the now-current `Active` pingers for use by next tick's passives.
     pub fn step_tick(&mut self) {
         if self.state != RoomState::Running {
             self.world.tick = self.world.tick.saturating_add(1);
@@ -217,23 +231,53 @@ impl Room {
 
         let bot_ids: Vec<BotId> = self.bots.keys().cloned().collect();
 
+        // 1. Drain pending commands and apply them in BotId order. Fire processed after
+        //    throttle/rudder so a successful shot is reflected in this tick's cooldown.
         for bot_id in &bot_ids {
-            let Some(entry) = self.bots.get_mut(bot_id) else {
-                continue;
+            let cmd = match self.bots.get_mut(bot_id) {
+                Some(entry) => entry.pending_command.take(),
+                None => continue,
             };
-            let Some(cmd) = entry.pending_command.take() else {
-                continue;
+            let Some(cmd) = cmd else { continue };
+
+            let ship_id = {
+                let entry = self.bots.get_mut(bot_id).expect("present");
+                entry.sensor_mode = cmd.sensor_mode;
+                entry.ship_id.clone()
             };
-            entry.sensor_mode = cmd.sensor_mode;
-            if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
+            if let Some(ship) = self.world.ships.get_mut(&ship_id) {
                 ship.throttle = cmd.throttle.clamp(-1.0, 1.0);
                 ship.rudder = cmd.rudder.clamp(-1.0, 1.0);
             }
+            if let Some(fire_cmd) = cmd.fire {
+                if let Err(err) = combat::fire(
+                    &mut self.world,
+                    &ship_id,
+                    fire_cmd.bearing_deg,
+                    fire_cmd.range,
+                ) {
+                    self.send_fire_error(bot_id, err);
+                }
+            }
         }
 
+        // 2 + 3. Movement, then shell flight & splashes.
         physics::step_world(&mut self.world);
+        let combat_events = combat::step_shells(&mut self.world);
+
+        // 4. Bump the tick counter so the outbound frames carry the new tick number.
         self.world.tick = self.world.tick.saturating_add(1);
 
+        // 5. End-of-match check. Broadcasting `game_over` and returning early means dead
+        //    and surviving bots all hear about the outcome via the same message; no final
+        //    `tick` frame is sent for the deciding tick.
+        if let Some(winner) = self.match_outcome() {
+            self.state = RoomState::Ended;
+            self.broadcast_game_over(winner);
+            return;
+        }
+
+        // 6. Per-bot sensor view + filtered combat events.
         for bot_id in &bot_ids {
             // Look up the bot + ship without holding any borrow on self past the call
             // site — we'll need `&mut self.rng` and `&self.world` together.
@@ -264,6 +308,7 @@ impl Room {
                 .enumerate()
                 .map(|(i, c)| translate_contact(i, c))
                 .collect();
+            let events = filter_events_for_bot(&ship_id, viewer_pos, sensor_mode, &combat_events);
 
             let entry = self.bots.get(bot_id).expect("bot still present");
             let ship = self.world.ships.get(&ship_id).expect("ship still present");
@@ -280,7 +325,7 @@ impl Room {
                     throttle: ship.throttle,
                 },
                 contacts,
-                events: Vec::new(),
+                events,
             };
             if let Err(e) = entry.outbound.try_send(tick_msg) {
                 debug!(
@@ -292,7 +337,7 @@ impl Room {
             }
         }
 
-        // Snapshot who pinged this tick so next tick's passive listeners can hear them.
+        // 7. Snapshot who pinged this tick so next tick's passive listeners can hear them.
         self.previous_active_pingers = self
             .bots
             .values()
@@ -303,6 +348,88 @@ impl Room {
         // Record the deadline reference *after* the broadcast so the bot's allotted
         // window starts when it could actually have received the frame.
         self.tick_send_time = Some(Instant::now());
+    }
+
+    /// Returns `Some(winner)` if the match should end this tick, where `winner` is the
+    /// `BotId` of the winning bot (or `None` for a draw). Returns `None` if the match
+    /// continues.
+    ///
+    /// End conditions per §5.5:
+    /// - At most one ship alive → that ship's bot wins (or draw if none alive).
+    /// - `world.tick >= MATCH_TIMEOUT_TICKS` → highest HP wins; tiebreak by highest
+    ///   remaining ammo (== lowest used).
+    fn match_outcome(&self) -> Option<Option<BotId>> {
+        let alive: Vec<&Ship> = self.world.ships.values().filter(|s| s.alive).collect();
+        // The "last ship standing" rule only fires when at least two bots actually
+        // started; otherwise a 1-bot sandbox would end on tick 1.
+        if self.starting_bot_count >= 2 && alive.len() <= 1 {
+            return Some(alive.first().map(|s| s.bot_id.clone()));
+        }
+        if self.world.tick >= MATCH_TIMEOUT_TICKS {
+            // BTreeMap iteration is BotId-stable, so `max_by_key` deterministically
+            // resolves further ties by BotId order (later wins).
+            let winner = alive
+                .iter()
+                .max_by_key(|s| (s.hp, s.ammo))
+                .map(|s| s.bot_id.clone());
+            return Some(winner);
+        }
+        None
+    }
+
+    /// Send `game_over` to every registered bot — alive or dead. The dead bots' channels
+    /// have been kept open precisely so they can receive this message.
+    fn broadcast_game_over(&self, winner: Option<BotId>) {
+        let final_tick = self.world.tick;
+        // Replay IDs are properly assigned in Phase 8; for now use a tick-stamped name so
+        // the field is non-empty and unique within a session.
+        let replay_id = format!("match_{}_{}", self.name, final_tick);
+        info!(
+            room = %self.name,
+            final_tick,
+            winner = ?winner,
+            "match ended"
+        );
+        for entry in self.bots.values() {
+            let msg = ServerMsg::GameOver {
+                winner: winner.clone(),
+                final_tick,
+                replay_id: replay_id.clone(),
+            };
+            if let Err(e) = entry.outbound.try_send(msg) {
+                debug!(
+                    room = %self.name,
+                    bot = %entry.bot_id,
+                    error = %e,
+                    "game_over not delivered"
+                );
+            }
+        }
+    }
+
+    /// Translate a `FireError` into a protocol error and queue it on the bot's outbound
+    /// channel. `ShipDead` and `UnknownShip` are silent — the bot already received (or
+    /// is about to receive) `game_over`; spamming an error message would be noise.
+    fn send_fire_error(&self, bot_id: &BotId, err: FireError) {
+        let (code, msg): (&str, String) = match err {
+            FireError::CooldownActive => (
+                error_code::COOLDOWN_ACTIVE,
+                format!("gun is on cooldown for tick {}", self.world.tick),
+            ),
+            FireError::NoAmmo => (error_code::NO_AMMO, "ship is out of ammo".to_string()),
+            FireError::ShipDead | FireError::UnknownShip => return,
+        };
+        let Some(entry) = self.bots.get(bot_id) else {
+            return;
+        };
+        if let Err(e) = entry.outbound.try_send(protocol::error_msg(code, msg)) {
+            debug!(
+                room = %self.name,
+                bot = %bot_id,
+                error = %e,
+                "fire error not delivered"
+            );
+        }
     }
 
     /// Apply a single `RoomEvent`. The connection task waits on `oneshot` replies; other
@@ -457,6 +584,7 @@ impl Room {
         // Cleared on entry; the first `step_tick` will populate them after broadcasting.
         self.tick_send_time = None;
         self.previous_active_pingers.clear();
+        self.starting_bot_count = self.bots.len() as u32;
         info!(room = %self.name, bots = self.bots.len(), "match started");
         Ok(())
     }
@@ -534,6 +662,43 @@ impl Room {
     }
 }
 
+/// Pick the combat events this bot should perceive this tick:
+/// - `Hit` events on the bot's own ship are always reported.
+/// - `Splash` events are reported when the splash centre falls within the bot's current
+///   sensor range (active radar 350u, passive engine-noise threshold 150u).
+/// - `Death` events are not surfaced to bots — the dead bot learns via `game_over`,
+///   survivors learn by losing the contact (and ultimately via `game_over`).
+fn filter_events_for_bot(
+    own_ship: &ShipId,
+    viewer_pos: Vec2,
+    sensor_mode: SensorMode,
+    events: &[CombatEvent],
+) -> Vec<TickEvent> {
+    let splash_range = match sensor_mode {
+        SensorMode::Active => ACTIVE_RADAR_RANGE,
+        SensorMode::Passive => PASSIVE_HEAR_NEARBY_RANGE,
+    };
+    let mut out = Vec::new();
+    for event in events {
+        match event {
+            CombatEvent::Hit {
+                ship_id, amount, ..
+            } if ship_id == own_ship => {
+                out.push(TickEvent::Hit { amount: *amount });
+            }
+            CombatEvent::Splash { pos } => {
+                if pos.distance(viewer_pos) <= splash_range {
+                    out.push(TickEvent::ShellSplash {
+                        pos: [pos.x, pos.y],
+                    });
+                }
+            }
+            CombatEvent::Hit { .. } | CombatEvent::Death { .. } => {}
+        }
+    }
+    out
+}
+
 /// Translate a sim-internal `Contact` to its on-the-wire `protocol::Contact`, assigning
 /// a per-tick contact id of `c_<index>`.
 fn translate_contact(index: usize, c: SimContact) -> ProtocolContact {
@@ -597,6 +762,7 @@ pub async fn run_room(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::constants;
     use std::net::Ipv4Addr;
 
     fn test_peer() -> SocketAddr {
@@ -1259,6 +1425,381 @@ mod tests {
         room.step_tick();
 
         assert!(next_tick_contacts(&mut r1).is_empty(), "400u > 350u radar");
+    }
+
+    // ----- Phase 6 (combat) ------------------------------------------------
+
+    fn cmd_fire(throttle: f32, fire: FireCommand, mode: SensorMode) -> PendingCommand {
+        PendingCommand {
+            tick: 0,
+            throttle,
+            rudder: 0.0,
+            sensor_mode: mode,
+            fire: Some(fire),
+        }
+    }
+
+    /// Drain every queued `ServerMsg` from a bot's outbound channel. Useful when a test
+    /// only cares about the *most recent* message kind (e.g. game_over after a hail of
+    /// ticks).
+    fn drain(reg: &mut BotRegistration) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        while let Ok(m) = reg.outbound.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    fn last_of<F>(msgs: &[ServerMsg], f: F) -> Option<&ServerMsg>
+    where
+        F: Fn(&ServerMsg) -> bool,
+    {
+        msgs.iter().rev().find(|m| f(m))
+    }
+
+    #[test]
+    fn fire_command_spawns_shell_in_world() {
+        let (mut room, r1, _r2) = started_two_bot_room();
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 90.0,
+                    range: 200.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        room.step_tick();
+        assert_eq!(room.world.shells.len(), 1, "shell should have spawned");
+        // Cooldown decremented one tick by physics::step_world after fire.
+        let firer = room.world.ships.get(&r1.ship_id).unwrap();
+        assert_eq!(firer.gun_cooldown, constants::GUN_COOLDOWN_TICKS - 1);
+        assert_eq!(firer.ammo, constants::MAX_AMMO - 1);
+    }
+
+    #[test]
+    fn fire_during_cooldown_yields_cooldown_active_error() {
+        let (mut room, mut r1, _r2) = started_two_bot_room();
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 0.0,
+                    range: 100.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        room.step_tick();
+        let _ = drain(&mut r1); // tick frame for the first shot
+
+        // Try to fire again while still on cooldown.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 0.0,
+                    range: 100.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        room.step_tick();
+        let msgs = drain(&mut r1);
+        let err = msgs.iter().find(
+            |m| matches!(m, ServerMsg::Error { code, .. } if code == error_code::COOLDOWN_ACTIVE),
+        );
+        assert!(err.is_some(), "cooldown_active error missing: {msgs:?}");
+        // Still only one shell in world.
+        assert_eq!(room.world.shells.len(), 1);
+    }
+
+    #[test]
+    fn match_ends_with_winner_when_only_one_ship_alive() {
+        // Acceptance check from projectplan §6.3.
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+        // Position close enough that the splash kills one ship outright.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(700.0, 500.0);
+        // Pre-damage s_2 to 1 HP so a single splash finishes it.
+        room.world.ships.get_mut(&r2.ship_id).unwrap().hp = 1;
+
+        // r1 fires a 200-unit shot east, range 200 → splash 25 dmg lands on s_2.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 90.0,
+                    range: 200.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        // Both bots park on idle commands while the shell flies. Drain outbound queues
+        // each step so the per-bot channel (32 deep) doesn't overflow before game_over.
+        let mut m1: Vec<ServerMsg> = Vec::new();
+        let mut m2: Vec<ServerMsg> = Vec::new();
+        for _ in 0..40 {
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r2.bot_id.clone(),
+                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            });
+            room.step_tick();
+            m1.extend(drain(&mut r1));
+            m2.extend(drain(&mut r2));
+            if room.state == RoomState::Ended {
+                break;
+            }
+        }
+        assert_eq!(room.state, RoomState::Ended, "match should have ended");
+        let g1 = last_of(&m1, |m| matches!(m, ServerMsg::GameOver { .. }))
+            .expect("r1 should receive game_over");
+        let g2 = last_of(&m2, |m| matches!(m, ServerMsg::GameOver { .. }))
+            .expect("r2 should receive game_over");
+        for msg in [g1, g2] {
+            match msg {
+                ServerMsg::GameOver { winner, .. } => {
+                    assert_eq!(
+                        winner.as_deref(),
+                        Some(r1.bot_id.as_str()),
+                        "winner should be r1 (only survivor)"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_picks_highest_hp_winner() {
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+        // Both alive, no shots fired. Force tick past timeout, then step to trigger end.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().hp = 80;
+        room.world.ships.get_mut(&r2.ship_id).unwrap().hp = 50;
+        room.world.tick = MATCH_TIMEOUT_TICKS - 1;
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+        assert_eq!(room.state, RoomState::Ended);
+        let msgs = drain(&mut r1);
+        let g = last_of(&msgs, |m| matches!(m, ServerMsg::GameOver { .. })).unwrap();
+        match g {
+            ServerMsg::GameOver { winner, .. } => {
+                assert_eq!(winner.as_deref(), Some(r1.bot_id.as_str()));
+            }
+            _ => unreachable!(),
+        }
+        let _ = drain(&mut r2);
+    }
+
+    #[test]
+    fn timeout_tiebreaks_by_remaining_ammo() {
+        let (mut room, mut r1, _r2) = started_two_bot_room();
+        // Equal HP; r1 has more ammo → r1 wins on tie-break.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().hp = 40;
+        room.world.ships.get_mut(&r1.ship_id).unwrap().ammo = 12;
+        room.world.ships.get_mut("s_2").unwrap().hp = 40;
+        room.world.ships.get_mut("s_2").unwrap().ammo = 5;
+        room.world.tick = MATCH_TIMEOUT_TICKS - 1;
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: "b_2".to_string(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+        let msgs = drain(&mut r1);
+        let g = last_of(&msgs, |m| matches!(m, ServerMsg::GameOver { .. })).unwrap();
+        match g {
+            ServerMsg::GameOver { winner, .. } => {
+                assert_eq!(winner.as_deref(), Some(r1.bot_id.as_str()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn draw_when_no_ships_alive() {
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+        // Kill both ships in the same tick: pre-damage to 1, fire a shot from each that
+        // lands centred on the other's position with friendly fire on.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(400.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        // Start them at the brink so any nonzero hit kills them.
+        room.world.ships.get_mut(&r1.ship_id).unwrap().hp = 1;
+        room.world.ships.get_mut(&r2.ship_id).unwrap().hp = 1;
+        // Spawn a shell at each ship's position with TTL=1 so it explodes next tick.
+        room.world.shells.push(crate::sim::world::Shell {
+            id_index: 0,
+            source_ship: r2.ship_id.clone(),
+            pos: Vec2::new(400.0, 500.0),
+            vel: Vec2::ZERO,
+            ttl_ticks: 1,
+        });
+        room.world.shells.push(crate::sim::world::Shell {
+            id_index: 1,
+            source_ship: r1.ship_id.clone(),
+            pos: Vec2::new(500.0, 500.0),
+            vel: Vec2::ZERO,
+            ttl_ticks: 1,
+        });
+        room.world.next_shell_index = 2;
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+        });
+        room.step_tick();
+        assert_eq!(room.state, RoomState::Ended);
+        for reg in [&mut r1, &mut r2] {
+            let msgs = drain(reg);
+            let g = last_of(&msgs, |m| matches!(m, ServerMsg::GameOver { .. })).unwrap();
+            match g {
+                ServerMsg::GameOver { winner, .. } => {
+                    assert!(winner.is_none(), "should be a draw, got {winner:?}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn hit_event_appears_in_victims_tick_payload() {
+        // Acceptance check from projectplan §6.4.
+        let (mut room, _r1, mut r2) = started_two_bot_room();
+        room.world.ships.get_mut("s_1").unwrap().pos = Vec2::new(500.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(700.0, 500.0);
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: "b_1".to_string(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 90.0,
+                    range: 200.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        // Run the shell out, with r2 idling.
+        let mut hit_event_seen = false;
+        for _ in 0..45 {
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r2.bot_id.clone(),
+                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            });
+            room.step_tick();
+            // Pull off the latest tick frame and check.
+            while let Ok(msg) = r2.outbound.try_recv() {
+                if let ServerMsg::Tick { events, .. } = msg {
+                    if events.iter().any(|e| matches!(e, TickEvent::Hit { .. })) {
+                        hit_event_seen = true;
+                    }
+                }
+            }
+            if hit_event_seen {
+                break;
+            }
+        }
+        assert!(hit_event_seen, "victim never received a Hit event");
+    }
+
+    #[test]
+    fn splash_event_visible_to_active_radar_within_350_units() {
+        let (mut room, _r1, mut r2) = started_two_bot_room();
+        // Place a far-away splash relative to r2 (active mode at the time).
+        room.world.ships.get_mut("s_1").unwrap().pos = Vec2::new(100.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        // r1 fires a tiny-range shot east → shell explodes ~5u east of itself, ~395u
+        // from r2 — outside r2's 350u active radar. Should NOT be reported.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: "b_1".to_string(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 90.0,
+                    range: 5.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.step_tick();
+        let msgs = drain(&mut r2);
+        let tick = msgs
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ServerMsg::Tick { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .expect("r2 should receive a tick frame");
+        assert!(
+            tick.iter()
+                .all(|e| !matches!(e, TickEvent::ShellSplash { .. })),
+            "distant splash leaked into r2's events: {tick:?}"
+        );
+
+        // Now place r2 within 350u of the splash and re-fire: should be visible.
+        room.world.ships.get_mut("s_1").unwrap().pos = Vec2::new(400.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        // Wait out cooldown.
+        for _ in 0..constants::GUN_COOLDOWN_TICKS as usize {
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r2.bot_id.clone(),
+                command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            });
+            room.step_tick();
+            let _ = drain(&mut r2);
+        }
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: "b_1".to_string(),
+            command: cmd_fire(
+                0.0,
+                FireCommand {
+                    bearing_deg: 90.0,
+                    range: 5.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+        });
+        room.step_tick();
+        let msgs = drain(&mut r2);
+        let tick = msgs
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ServerMsg::Tick { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .expect("r2 should receive a tick frame");
+        assert!(
+            tick.iter()
+                .any(|e| matches!(e, TickEvent::ShellSplash { .. })),
+            "near splash should be reported: {tick:?}"
+        );
     }
 
     #[test]

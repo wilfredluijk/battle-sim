@@ -3,6 +3,7 @@
 //! This module must NOT import from `net.rs` or `protocol.rs` — the room translates between
 //! simulation types and protocol types.
 
+pub mod combat;
 pub mod constants;
 pub mod physics;
 pub mod sensors;

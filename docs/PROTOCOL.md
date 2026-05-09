@@ -220,6 +220,7 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `too_many_violations` | Last warning before the connection is closed. |
 | `late_command` | Command arrived after the per-tick deadline. |
 | `cooldown_active` | `fire` was issued while the gun was still cooling down. |
+| `no_ammo` | `fire` was issued but the ship has no ammo left. |
 
 After 5 protocol violations on a single bot connection, the server sends `too_many_violations` and closes with WebSocket close code `Policy (1008)`.
 
