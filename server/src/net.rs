@@ -1,21 +1,25 @@
+use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::protocol::{self, error_code, BotMsg, ServerMsg};
+use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
 use crate::room::{BotRegistration, PendingCommand, RoomEvent, SpectatorFrame};
 
 /// After this many protocol violations, the bot connection is closed.
@@ -24,6 +28,57 @@ const MAX_VIOLATIONS: u32 = 5;
 /// Cap on the number of bytes we will buffer while reading the HTTP request head. Real
 /// requests fit comfortably inside 2 KiB; anything larger is almost certainly hostile.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
+
+/// Cap on a single WebSocket message/frame. Bot JSON commands are well under 1 KiB; 16 KiB
+/// is generous slack without exposing the server to multi-megabyte parse DoS.
+const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// Tracker for live TCP connections per peer IP. Wrapped in `Arc<Mutex<..>>` so the
+/// accept loop and per-connection cleanup share a view.
+type IpConnTable = Arc<Mutex<HashMap<IpAddr, u32>>>;
+
+/// RAII guard that decrements the per-IP counter on drop. Acquired right after accept;
+/// dropped when the connection task ends. Skips bookkeeping when the cap is disabled.
+struct IpConnGuard {
+    table: Option<IpConnTable>,
+    ip: IpAddr,
+}
+
+impl IpConnGuard {
+    fn try_acquire(table: &IpConnTable, ip: IpAddr, cap: u32) -> Option<Self> {
+        if cap == 0 {
+            return Some(Self { table: None, ip });
+        }
+        let mut guard = table.lock().expect("ip table mutex poisoned");
+        let entry = guard.entry(ip).or_insert(0);
+        if *entry >= cap {
+            return None;
+        }
+        *entry += 1;
+        Some(Self {
+            table: Some(table.clone()),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpConnGuard {
+    fn drop(&mut self) {
+        let Some(table) = self.table.as_ref() else {
+            return;
+        };
+        let mut guard = match table.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(entry) = guard.get_mut(&self.ip) {
+            *entry = entry.saturating_sub(1);
+            if *entry == 0 {
+                guard.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Static spectator assets, embedded at compile time so the server has no runtime path
 /// dependency on the `spectator/` directory.
@@ -57,8 +112,16 @@ pub async fn run(
     };
     info!(
         %addr,
+        max_conn_per_ip = config.max_connections_per_ip,
+        handshake_timeout_secs = config.handshake_timeout_secs,
+        tournament = config.tournament,
         "listener bound (HTTP /, WS /bot, WS /spectate)"
     );
+
+    let ip_conns: IpConnTable = Arc::new(Mutex::new(HashMap::new()));
+    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs.max(1));
+    let per_ip_cap = config.max_connections_per_ip;
+    let tournament = config.tournament;
 
     loop {
         tokio::select! {
@@ -69,10 +132,27 @@ pub async fn run(
             res = listener.accept() => {
                 match res {
                     Ok((stream, peer)) => {
+                        let guard = match IpConnGuard::try_acquire(&ip_conns, peer.ip(), per_ip_cap) {
+                            Some(g) => g,
+                            None => {
+                                warn!(%peer, cap = per_ip_cap, "refusing connection: per-IP cap reached");
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let conn_shutdown = shutdown_rx.resubscribe();
                         let room_tx = room_tx.clone();
                         let spec_tx = spec_tx.clone();
-                        tokio::spawn(handle_connection(stream, peer, room_tx, spec_tx, conn_shutdown));
+                        tokio::spawn(handle_connection(
+                            stream,
+                            peer,
+                            room_tx,
+                            spec_tx,
+                            conn_shutdown,
+                            handshake_timeout,
+                            tournament,
+                            guard,
+                        ));
                     }
                     Err(e) => {
                         warn!(error = %e, "accept failed");
@@ -85,17 +165,33 @@ pub async fn run(
 
 /// Read the HTTP request head, then dispatch: WS upgrade → `/bot` or `/spectate`,
 /// plain HTTP GET → static file response.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     room_tx: mpsc::Sender<RoomEvent>,
     spec_tx: broadcast::Sender<SpectatorFrame>,
     shutdown_rx: broadcast::Receiver<()>,
+    handshake_timeout: Duration,
+    tournament: bool,
+    _ip_guard: IpConnGuard,
 ) {
-    let head_bytes = match read_http_head(&mut stream).await {
-        Ok(b) => b,
-        Err(e) => {
+    let head_bytes = match timeout(handshake_timeout, read_http_head(&mut stream)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
             debug!(%peer, error = %e, "failed reading HTTP head");
+            return;
+        }
+        Err(_) => {
+            warn!(%peer, "HTTP head read timed out");
+            let _ = write_http_response(
+                &mut stream,
+                408,
+                "Request Timeout",
+                "text/plain; charset=utf-8",
+                b"timeout",
+            )
+            .await;
             return;
         }
     };
@@ -117,28 +213,64 @@ async fn handle_connection(
     };
 
     if parsed.is_websocket_upgrade {
-        let prefixed = PrefixedStream::new(head_bytes, stream);
-        let ws = match tokio_tungstenite::accept_async(prefixed).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                warn!(%peer, error = %e, "websocket handshake failed");
-                return;
-            }
-        };
-
         let endpoint = match parsed.path.as_str() {
             "/bot" => Endpoint::Bot,
             "/spectate" => Endpoint::Spectator,
             other => {
                 warn!(%peer, path = other, "unknown websocket path; closing");
-                close_with_reason(ws, CloseCode::Policy, format!("unknown path `{other}`")).await;
+                let _ = write_http_response(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "text/plain; charset=utf-8",
+                    b"unknown websocket path",
+                )
+                .await;
+                return;
+            }
+        };
+
+        // In tournament mode, `/spectate` is loopback-only. Refuse the upgrade before we
+        // burn cycles on a handshake the spec view would just leak ground truth through.
+        if tournament && endpoint == Endpoint::Spectator && !peer.ip().is_loopback() {
+            warn!(%peer, "refusing /spectate: tournament mode allows loopback only");
+            let _ = write_http_response(
+                &mut stream,
+                403,
+                "Forbidden",
+                "text/plain; charset=utf-8",
+                b"spectator endpoint disabled in tournament mode",
+            )
+            .await;
+            return;
+        }
+
+        let prefixed = PrefixedStream::new(head_bytes, stream);
+        let ws_config = WebSocketConfig {
+            max_message_size: Some(MAX_WS_MESSAGE_BYTES),
+            max_frame_size: Some(MAX_WS_MESSAGE_BYTES),
+            ..Default::default()
+        };
+        let ws = match timeout(
+            handshake_timeout,
+            tokio_tungstenite::accept_async_with_config(prefixed, Some(ws_config)),
+        )
+        .await
+        {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) => {
+                warn!(%peer, error = %e, "websocket handshake failed");
+                return;
+            }
+            Err(_) => {
+                warn!(%peer, "websocket handshake timed out");
                 return;
             }
         };
 
         info!(%peer, ?endpoint, "websocket connected");
         match endpoint {
-            Endpoint::Bot => handle_bot(peer, ws, room_tx, shutdown_rx).await,
+            Endpoint::Bot => handle_bot(peer, ws, room_tx, shutdown_rx, handshake_timeout).await,
             Endpoint::Spectator => handle_spectator(peer, ws, spec_tx, shutdown_rx).await,
         }
         info!(%peer, ?endpoint, "connection ended");
@@ -180,24 +312,55 @@ async fn handle_bot(
     ws: Ws,
     room_tx: mpsc::Sender<RoomEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    hello_timeout: Duration,
 ) {
     let (mut sink, mut stream) = ws.split();
     let mut violations: u32 = 0;
 
     // Phase 1: wait for `hello`. Reject other typed messages and malformed frames as
-    // protocol violations; disconnect after MAX_VIOLATIONS.
-    let (name, version) = match wait_for_hello(
+    // protocol violations; disconnect after MAX_VIOLATIONS. A bot that connects but never
+    // sends `hello` is dropped after `hello_timeout`.
+    let hello_fut = wait_for_hello(
         peer,
         &mut sink,
         &mut stream,
         &mut shutdown_rx,
         &mut violations,
-    )
-    .await
-    {
-        Some(hello) => hello,
-        None => return,
+    );
+    let (name, version) = match timeout(hello_timeout, hello_fut).await {
+        Ok(Some(hello)) => hello,
+        Ok(None) => return,
+        Err(_) => {
+            warn!(%peer, "bot did not send `hello` within timeout; dropping");
+            send_error(
+                &mut sink,
+                error_code::HANDSHAKE_TIMEOUT,
+                "hello not received within handshake timeout",
+            )
+            .await;
+            let _ = sink
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "handshake timeout".into(),
+                })))
+                .await;
+            return;
+        }
     };
+
+    // Validate the name charset/length before we ever hand it to the room. Saves a
+    // round-trip and keeps the violation accounting consistent with malformed messages.
+    if let Err(reason) = protocol::validate_bot_name(&name) {
+        warn!(%peer, name = %name, %reason, "rejecting invalid bot name");
+        send_error(&mut sink, error_code::INVALID_NAME, reason).await;
+        let _ = sink
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "invalid name".into(),
+            })))
+            .await;
+        return;
+    }
 
     // Phase 2: register with the room and grab our outbound channel.
     let registration = match register(peer, &room_tx, name, version, &mut sink).await {
@@ -261,6 +424,29 @@ async fn handle_bot(
                                 fire,
                                 sensor_mode,
                             }) => {
+                                if let Err(reason) =
+                                    validate_command_floats(throttle, rudder, fire.as_ref())
+                                {
+                                    violations += 1;
+                                    warn!(
+                                        %peer,
+                                        bot_id = %bot_id,
+                                        violations,
+                                        %reason,
+                                        "rejecting command with non-finite float",
+                                    );
+                                    send_error(
+                                        &mut sink,
+                                        error_code::NON_FINITE_VALUE,
+                                        reason,
+                                    )
+                                    .await;
+                                    if violations >= MAX_VIOLATIONS {
+                                        disconnect_for_violations(&mut sink).await;
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 let command = PendingCommand {
                                     tick,
                                     throttle,
@@ -530,6 +716,31 @@ async fn handle_spectator(
     }
 }
 
+/// Reject `command` frames containing `NaN` / `Inf`. Without this, NaN propagates into
+/// `physics::step_world` (NaN positions, broken distance checks) and is a determinism
+/// hazard as well as a DoS sink for the JSON parser if combined with huge payloads.
+fn validate_command_floats(
+    throttle: f32,
+    rudder: f32,
+    fire: Option<&FireCommand>,
+) -> Result<(), &'static str> {
+    if !throttle.is_finite() {
+        return Err("throttle must be finite");
+    }
+    if !rudder.is_finite() {
+        return Err("rudder must be finite");
+    }
+    if let Some(f) = fire {
+        if !f.bearing_deg.is_finite() {
+            return Err("fire.bearing_deg must be finite");
+        }
+        if !f.range.is_finite() {
+            return Err("fire.range must be finite");
+        }
+    }
+    Ok(())
+}
+
 async fn send_error(sink: &mut WsSink, code: &str, message: impl Into<String>) {
     send_server_msg(sink, &protocol::error_msg(code, message)).await;
 }
@@ -558,16 +769,6 @@ async fn disconnect_for_violations(sink: &mut WsSink) {
         .send(Message::Close(Some(CloseFrame {
             code: CloseCode::Policy,
             reason: "too many protocol violations".into(),
-        })))
-        .await;
-}
-
-async fn close_with_reason(ws: Ws, code: CloseCode, reason: String) {
-    let (mut sink, _) = ws.split();
-    let _ = sink
-        .send(Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.into(),
         })))
         .await;
 }

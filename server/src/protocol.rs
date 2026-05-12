@@ -216,6 +216,38 @@ pub mod error_code {
     pub const LATE_COMMAND: &str = "late_command";
     pub const COOLDOWN_ACTIVE: &str = "cooldown_active";
     pub const NO_AMMO: &str = "no_ammo";
+    pub const INVALID_NAME: &str = "invalid_name";
+    pub const DUPLICATE_NAME: &str = "duplicate_name";
+    pub const STALE_COMMAND: &str = "stale_command";
+    pub const NON_FINITE_VALUE: &str = "non_finite_value";
+    pub const HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
+    pub const CONNECTION_LIMIT: &str = "connection_limit";
+}
+
+/// Maximum length of a bot's `hello.name`. Names are also restricted to
+/// `[A-Za-z0-9 _-]`; see [`validate_bot_name`].
+pub const MAX_BOT_NAME_LEN: usize = 32;
+
+/// Returns `Ok(())` if `name` is a valid bot identifier:
+/// - 1..=`MAX_BOT_NAME_LEN` characters,
+/// - every byte is ASCII alphanumeric, space, underscore, or hyphen.
+///
+/// Restricting the charset keeps replay logs greppable and stops spectator-UI injection
+/// via unicode controls / RTL overrides.
+pub fn validate_bot_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("name must not be empty");
+    }
+    if name.len() > MAX_BOT_NAME_LEN {
+        return Err("name exceeds 32 bytes");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'_' || b == b'-')
+    {
+        return Err("name may only contain A-Z, a-z, 0-9, space, underscore, or hyphen");
+    }
+    Ok(())
 }
 
 /// Build a `ServerMsg::Error`.
@@ -406,5 +438,25 @@ mod tests {
     fn rejects_empty_object() {
         let result: Result<BotMsg, _> = serde_json::from_str("{}");
         assert!(result.is_err(), "empty object has no `type` discriminant");
+    }
+
+    #[test]
+    fn validate_bot_name_accepts_typical_names() {
+        for ok in ["alice", "Bot_42", "captain kirk", "ship-1", "A"] {
+            assert!(validate_bot_name(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn validate_bot_name_rejects_garbage() {
+        assert!(validate_bot_name("").is_err(), "empty name rejected");
+        let too_long = "x".repeat(MAX_BOT_NAME_LEN + 1);
+        assert!(
+            validate_bot_name(&too_long).is_err(),
+            "33-byte name rejected"
+        );
+        for bad in ["alice\n", "bob\t", "🛳️ ship", "<script>", "../etc/passwd"] {
+            assert!(validate_bot_name(bad).is_err(), "should reject {bad:?}");
+        }
     }
 }

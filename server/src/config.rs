@@ -36,6 +36,22 @@ pub struct Config {
     /// still connect; the room ticks at `--tick-hz` and broadcasts as if it were live.
     #[arg(long, value_name = "FILE")]
     pub replay: Option<PathBuf>,
+
+    /// Maximum simultaneous TCP connections from a single peer IP. Above this, additional
+    /// connects from that IP are refused at accept time. Set to 0 to disable the cap.
+    #[arg(long, default_value_t = 8)]
+    pub max_connections_per_ip: u32,
+
+    /// Seconds to wait for the HTTP head and the WebSocket `hello` message before forcibly
+    /// dropping a half-open connection. Closes the slow-loris vector on the handshake.
+    #[arg(long, default_value_t = 5)]
+    pub handshake_timeout_secs: u64,
+
+    /// Tournament mode: restrict the `/spectate` endpoint to loopback (127.0.0.1, ::1) so
+    /// competing bots cannot subscribe to ground-truth world state. Bots may still join
+    /// over the network.
+    #[arg(long, default_value_t = false)]
+    pub tournament: bool,
 }
 
 fn parse_map_size(s: &str) -> Result<(u32, u32), String> {

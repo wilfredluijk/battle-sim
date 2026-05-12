@@ -74,6 +74,10 @@ struct BotEntry {
     pending_command: Option<PendingCommand>,
     /// Last commanded sensor mode. Persists across ticks until the bot changes it.
     sensor_mode: SensorMode,
+    /// Tick of the most recent fire-cooldown error sent to this bot. Used to suppress
+    /// duplicate cooldown/no-ammo error frames inside the same tick — a bot spamming
+    /// `fire` would otherwise flood its own outbound buffer.
+    last_fire_error_tick: Option<u64>,
 }
 
 /// A command waiting to be applied at the next tick. Lifted from `BotMsg::Command` —
@@ -102,6 +106,8 @@ pub struct BotRegistration {
 pub enum JoinError {
     NotInLobby,
     RoomFull,
+    DuplicateName,
+    InvalidName,
 }
 
 impl JoinError {
@@ -109,6 +115,8 @@ impl JoinError {
         match self {
             JoinError::NotInLobby => "room is not accepting bots (already running or ended)",
             JoinError::RoomFull => "room is full",
+            JoinError::DuplicateName => "another bot is already registered with that name",
+            JoinError::InvalidName => "bot name is invalid",
         }
     }
 }
@@ -616,7 +624,11 @@ impl Room {
     /// Translate a `FireError` into a protocol error and queue it on the bot's outbound
     /// channel. `ShipDead` and `UnknownShip` are silent — the bot already received (or
     /// is about to receive) `game_over`; spamming an error message would be noise.
-    fn send_fire_error(&self, bot_id: &BotId, err: FireError) {
+    ///
+    /// Cooldown / no-ammo errors are coalesced: at most one per (bot, tick). A bot that
+    /// blindly issues `fire` every tick would otherwise queue one error frame per tick
+    /// into a 32-slot outbound buffer, pushing real `tick` frames over the edge.
+    fn send_fire_error(&mut self, bot_id: &BotId, err: FireError) {
         let (code, msg): (&str, String) = match err {
             FireError::CooldownActive => (
                 error_code::COOLDOWN_ACTIVE,
@@ -625,9 +637,14 @@ impl Room {
             FireError::NoAmmo => (error_code::NO_AMMO, "ship is out of ammo".to_string()),
             FireError::ShipDead | FireError::UnknownShip => return,
         };
-        let Some(entry) = self.bots.get(bot_id) else {
+        let world_tick = self.world.tick;
+        let Some(entry) = self.bots.get_mut(bot_id) else {
             return;
         };
+        if entry.last_fire_error_tick == Some(world_tick) {
+            return;
+        }
+        entry.last_fire_error_tick = Some(world_tick);
         if let Err(e) = entry.outbound.try_send(protocol::error_msg(code, msg)) {
             debug!(
                 room = %self.name,
@@ -689,6 +706,7 @@ impl Room {
         let state = self.state;
         let deadline_ms = self.tick_deadline_ms;
         let send_time = self.tick_send_time;
+        let world_tick = self.world.tick;
 
         let Some(entry) = self.bots.get_mut(&bot_id) else {
             warn!(room = %self.name, bot = %bot_id, "command from unknown bot, ignored");
@@ -696,6 +714,38 @@ impl Room {
         };
 
         if state == RoomState::Running {
+            // The bot must echo the tick of the last frame it received. Accept the current
+            // tick plus a one-tick window for racing frame boundaries; anything further
+            // out is either a confused bot or a replay attempt.
+            let max_lag: u64 = 1;
+            let min_acceptable = world_tick.saturating_sub(max_lag);
+            let max_acceptable = world_tick.saturating_add(max_lag);
+            if command.tick < min_acceptable || command.tick > max_acceptable {
+                let err = protocol::error_msg(
+                    error_code::STALE_COMMAND,
+                    format!(
+                        "command.tick {} is outside the accepted window [{}, {}]",
+                        command.tick, min_acceptable, max_acceptable,
+                    ),
+                );
+                if let Err(e) = entry.outbound.try_send(err) {
+                    debug!(
+                        room = %self.name,
+                        bot = %bot_id,
+                        error = %e,
+                        "couldn't push stale_command error",
+                    );
+                }
+                debug!(
+                    room = %self.name,
+                    bot = %bot_id,
+                    command_tick = command.tick,
+                    world_tick,
+                    "rejected stale command",
+                );
+                return;
+            }
+
             if let Some(t) = send_time {
                 let elapsed = now.duration_since(t);
                 if elapsed.as_millis() > u128::from(deadline_ms) {
@@ -897,6 +947,14 @@ impl Room {
         if self.bot_count() as u32 >= self.max_bots {
             return Err(JoinError::RoomFull);
         }
+        // Defensive: net.rs already enforces the charset, but the room is the
+        // authoritative gatekeeper for what ends up in replay logs and spectator UIs.
+        if protocol::validate_bot_name(&name).is_err() {
+            return Err(JoinError::InvalidName);
+        }
+        if self.bots.values().any(|b| b.name == name) {
+            return Err(JoinError::DuplicateName);
+        }
 
         let n = self.next_index;
         self.next_index += 1;
@@ -937,6 +995,7 @@ impl Room {
                 ready: false,
                 pending_command: None,
                 sensor_mode: SensorMode::Passive,
+                last_fire_error_tick: None,
             },
         );
 
@@ -1130,6 +1189,80 @@ mod tests {
             }
             other => panic!("expected Welcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_name_is_rejected() {
+        let mut room = test_room();
+        let _r1 = connect(&mut room, "alice").expect("first alice");
+        let err = connect(&mut room, "alice").expect_err("duplicate should fail");
+        assert_eq!(err, JoinError::DuplicateName);
+        // The second registration must not have consumed a slot.
+        assert_eq!(room.bot_count(), 1);
+    }
+
+    #[test]
+    fn invalid_name_is_rejected() {
+        let mut room = test_room();
+        let err = connect(&mut room, "alice\n").expect_err("invalid name should fail");
+        assert_eq!(err, JoinError::InvalidName);
+        assert_eq!(room.bot_count(), 0);
+    }
+
+    #[test]
+    fn stale_command_tick_is_rejected_with_error() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+        // Advance well past tick 0 so a tick=0 command is far outside the ±1 window.
+        for _ in 0..5 {
+            room.step_tick();
+            let _ = r.outbound.try_recv();
+        }
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r.bot_id.clone(),
+            command: cmd(0, 1.0, 0.0),
+        });
+        let msg = r.outbound.try_recv().expect("error frame");
+        match msg {
+            ServerMsg::Error { code, .. } => assert_eq!(code, error_code::STALE_COMMAND),
+            other => panic!("expected stale_command error, got {other:?}"),
+        }
+        // Ship retains previous (zero) throttle since the stale command was discarded.
+        let ship = room.world.ships.get(&r.ship_id).unwrap();
+        assert_eq!(ship.throttle, 0.0);
+    }
+
+    #[test]
+    fn duplicate_fire_errors_in_same_tick_are_coalesced() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        let _ = r.outbound.try_recv();
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = r.outbound.try_recv();
+        // Empty the magazine.
+        room.world.ships.get_mut(&r.ship_id).unwrap().ammo = 0;
+        for _ in 0..5 {
+            room.send_fire_error(&r.bot_id, FireError::NoAmmo);
+        }
+        let mut error_count = 0;
+        while let Ok(ServerMsg::Error { code, .. }) = r.outbound.try_recv() {
+            if code == error_code::NO_AMMO {
+                error_count += 1;
+            }
+        }
+        assert_eq!(
+            error_count, 1,
+            "five fire errors in one tick should coalesce to a single frame"
+        );
     }
 
     #[test]
@@ -1547,9 +1680,9 @@ mod tests {
         assert_eq!(ship.throttle, 0.0, "stale Lobby command should not apply");
     }
 
-    fn cmd_with_mode(throttle: f32, rudder: f32, mode: SensorMode) -> PendingCommand {
+    fn cmd_with_mode(tick: u64, throttle: f32, rudder: f32, mode: SensorMode) -> PendingCommand {
         PendingCommand {
-            tick: 0,
+            tick,
             throttle,
             rudder,
             sensor_mode: mode,
@@ -1595,11 +1728,11 @@ mod tests {
 
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
 
@@ -1636,11 +1769,11 @@ mod tests {
         // empty (cleared at start_match), so the passive listener should NOT yet hear.
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
 
@@ -1657,11 +1790,11 @@ mod tests {
         // the passive listener picks it up.
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
 
@@ -1691,11 +1824,11 @@ mod tests {
         for _ in 0..3 {
             room.handle_event(RoomEvent::BotCommand {
                 bot_id: r1.bot_id.clone(),
-                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+                command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
             });
             room.handle_event(RoomEvent::BotCommand {
                 bot_id: r2.bot_id.clone(),
-                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+                command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
             });
             room.step_tick();
             assert!(next_tick_contacts(&mut r1).is_empty());
@@ -1712,11 +1845,11 @@ mod tests {
 
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
 
@@ -1725,9 +1858,9 @@ mod tests {
 
     // ----- Phase 6 (combat) ------------------------------------------------
 
-    fn cmd_fire(throttle: f32, fire: FireCommand, mode: SensorMode) -> PendingCommand {
+    fn cmd_fire(tick: u64, throttle: f32, fire: FireCommand, mode: SensorMode) -> PendingCommand {
         PendingCommand {
-            tick: 0,
+            tick,
             throttle,
             rudder: 0.0,
             sensor_mode: mode,
@@ -1759,6 +1892,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 90.0,
@@ -1781,6 +1915,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 0.0,
@@ -1796,6 +1931,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 0.0,
@@ -1828,6 +1964,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 90.0,
@@ -1843,7 +1980,7 @@ mod tests {
         for _ in 0..40 {
             room.handle_event(RoomEvent::BotCommand {
                 bot_id: r2.bot_id.clone(),
-                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+                command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
             });
             room.step_tick();
             m1.extend(drain(&mut r1));
@@ -1880,11 +2017,11 @@ mod tests {
         room.world.tick = MATCH_TIMEOUT_TICKS - 1;
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
         assert_eq!(room.state, RoomState::Ended);
@@ -1910,11 +2047,11 @@ mod tests {
         room.world.tick = MATCH_TIMEOUT_TICKS - 1;
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: "b_2".to_string(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
         let msgs = drain(&mut r1);
@@ -1955,11 +2092,11 @@ mod tests {
         room.world.next_shell_index = 2;
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
         });
         room.step_tick();
         assert_eq!(room.state, RoomState::Ended);
@@ -1998,7 +2135,7 @@ mod tests {
         // Active sensor command so the world payload reports `sensor_mode: "active"`.
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.step_tick();
 
@@ -2023,6 +2160,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: "b_1".to_string(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 90.0,
@@ -2036,7 +2174,7 @@ mod tests {
         for _ in 0..45 {
             room.handle_event(RoomEvent::BotCommand {
                 bot_id: r2.bot_id.clone(),
-                command: cmd_with_mode(0.0, 0.0, SensorMode::Passive),
+                command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
             });
             room.step_tick();
             // Pull off the latest tick frame and check.
@@ -2065,6 +2203,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: "b_1".to_string(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 90.0,
@@ -2075,7 +2214,7 @@ mod tests {
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.step_tick();
         let msgs = drain(&mut r2);
@@ -2100,7 +2239,7 @@ mod tests {
         for _ in 0..constants::GUN_COOLDOWN_TICKS as usize {
             room.handle_event(RoomEvent::BotCommand {
                 bot_id: r2.bot_id.clone(),
-                command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+                command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
             });
             room.step_tick();
             let _ = drain(&mut r2);
@@ -2108,6 +2247,7 @@ mod tests {
         room.handle_event(RoomEvent::BotCommand {
             bot_id: "b_1".to_string(),
             command: cmd_fire(
+                room.world.tick,
                 0.0,
                 FireCommand {
                     bearing_deg: 90.0,
@@ -2118,7 +2258,7 @@ mod tests {
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd_with_mode(0.0, 0.0, SensorMode::Active),
+            command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Active),
         });
         room.step_tick();
         let msgs = drain(&mut r2);
