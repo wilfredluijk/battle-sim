@@ -40,20 +40,47 @@ class Bot:
 
     # ---- Callbacks subclasses override ----
     def on_welcome(self, welcome: Welcome) -> None:
-        """Called once, right after the handshake completes."""
+        """Fires once, right after the server's `welcome` frame is parsed.
+
+        Use it to stash gameplay constants (`welcome.ship_specs.shell_speed`,
+        `max_shell_range`, etc.) on `self` so `on_tick` can read them cheaply.
+        Runs before the SDK sends `ready` to the server.
+        """
 
     def on_game_start(self, tick: int, starting_position, starting_heading_deg: float) -> None:
-        """Called when the room transitions to `running`."""
+        """Fires when the operator transitions the room to `running`.
+
+        `tick` is the tick at which the match starts (usually 0). The starting
+        position and heading are also reflected on the *next* `on_tick`'s
+        `view.me`, so most bots can ignore this hook entirely.
+        """
 
     def on_tick(self, view: WorldView) -> Command:
-        """Called every tick. Return a `Command`; default holds station."""
+        """Decide what to do this tick. **Override me.**
+
+        Called every simulation tick (default: 10 Hz). Return a `Command` —
+        the SDK serializes it back to the server before `view.deadline_ms`
+        elapses. If you return `None` or raise, the SDK logs the error and
+        emits a hold-station command, keeping the connection alive.
+
+        See README's "Example bots" section for typical patterns.
+        """
         return Command(throttle=0.0, rudder=0.0, sensor_mode="active")
 
     def on_game_over(self, result: GameOver) -> None:
-        """Called once, just before the connection closes."""
+        """Fires once, just before the SDK closes the connection.
+
+        `result.winner` is the winning `bot_id`, or `None` for a draw. The
+        replay JSONL is at `replays/<result.replay_id>.jsonl` on the server.
+        """
 
     def on_error(self, code: str, message: str) -> None:
-        """Called whenever the server sends an `error` frame."""
+        """Fires whenever the server sends a typed `error` frame.
+
+        Common codes: `late_command`, `cooldown_active`, `no_ammo`. Override
+        to react (e.g. drop sensor pings when you keep missing the deadline).
+        Default behaviour is to log at WARNING level.
+        """
         log.warning("server error code=%s: %s", code, message)
 
     # ---- Escape hatches for power users ----
