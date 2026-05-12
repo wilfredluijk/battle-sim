@@ -21,7 +21,8 @@ Conventions:
 | 6 | Combat | **complete** |
 | 7 | Spectator | pending |
 | 8 | Replay | pending |
-| 9 | Python SDK | pending |
+| 9 | Python SDK | **complete** |
+| 9b | Java SDK | **complete** |
 | 10 | Examples and onboarding | pending |
 | 11 | Polish | pending |
 
@@ -171,19 +172,69 @@ Conventions:
 
 ---
 
-## Phase 9 — Python SDK
+## Phase 9 — Python SDK  *(complete)*
 
-### 9.1 Package skeleton
+### 9.1 Package skeleton  *(done)*
 - **Deliverable:** `sdk-python/pyproject.toml`; `naval_sdk/__init__.py` exporting `Bot`, `WorldView`, `Command`, `run`; `pip install -e .` works.
 - **Acceptance:** `python -c "import naval_sdk"` succeeds.
 
-### 9.2 Connection and message loop
+### 9.2 Connection and message loop  *(done)*
 - **Deliverable:** `naval_sdk/bot.py` with `run()`: connects, handshakes, dispatches `on_welcome` / `on_tick` / `on_game_over`; `raw_send`/`raw_recv` escape hatches; logs and continues on malformed messages.
 - **Acceptance:** A `Bot` subclass that returns `Command(throttle=1.0)` drives the ship forward against a live server.
 
-### 9.3 Typed views and helpers
+### 9.3 Typed views and helpers  *(done)*
 - **Deliverable:** `WorldView`, `Contact`, `SelfState` dataclasses; helpers `bearing_to`, `distance`, `lead_target`; `Command.fire_at(pos, lead=True)` using shell speed = 50.
 - **Acceptance:** Unit tests for the math helpers; `Command.fire_at` produces the expected bearing for a moving target.
+
+---
+
+## Phase 9b — Java SDK  *(complete)*
+
+A second reference SDK for JVM bot authors. Same trust model and ergonomics as
+the Python SDK: subclass `Bot`, override `onTick`, return a `Command`. The
+runtime owns the WebSocket, the handshake, and the message dispatch. Bot code
+never sees raw frames unless it opts in via the `rawSend` / `rawRecv` escape
+hatches.
+
+### 9b.1 Module skeleton  *(done)*
+- **Deliverable:** `sdk-java/` Maven project (`pom.xml`) producing artifact
+  `naval-sdk` under group `com.battlesim`. Minimal runtime deps: `Java-WebSocket`
+  for transport and `Jackson` for JSON; `junit-jupiter` for tests only. JDK 17+.
+- **Acceptance:** `mvn -q -DskipTests package` produces a jar; `mvn -q test`
+  runs (even with zero tests).
+
+### 9b.2 Protocol classes  *(done)*
+- **Deliverable:** `com.battlesim.naval.protocol` package mirroring the Python
+  dataclasses: immutable POJOs for `Welcome`, `ShipSpecs`, `MapInfo`,
+  `GameStart`, `WorldView`, `SelfState`, `Contact`, `GameOver`, plus event
+  types `HitEvent` / `ShellSplashEvent`. Outbound `Command` builder with
+  `fireAt(...)` analogous to the Python helper, and `FireCommand` value type.
+  All parsed via Jackson with tolerant `from(JsonNode)` factories that log and
+  skip unknown fields rather than throwing.
+- **Acceptance:** Round-trip tests that read the canonical `tick` and `welcome`
+  frames from PROTOCOL.md and assert the parsed values; `Command.toJson(tick)`
+  matches the schema documented in PROTOCOL.md §1.1.
+
+### 9b.3 Connection and message loop  *(done)*
+- **Deliverable:** `com.battlesim.naval.Bot` abstract class with overridable
+  callbacks (`onWelcome`, `onGameStart`, `onTick`, `onGameOver`, `onError`).
+  `BotRunner.run(bot, host, port, name)` performs the WebSocket connect, sends
+  `hello`, waits for `welcome`, sends `ready`, then pumps frames until
+  `game_over`. Malformed frames are logged (via `java.util.logging`) and
+  skipped, mirroring Python SDK behaviour. `rawSend(ObjectNode)` and
+  `rawRecv()` are exposed for power users.
+- **Acceptance:** A `Bot` subclass returning `new Command().throttle(1.0)` is
+  documented in the README as the smoke-test bot; `mvn test` includes
+  protocol-parse tests but not a live-server integration test (that lives
+  outside the SDK module).
+
+### 9b.4 Math helpers  *(done)*
+- **Deliverable:** `com.battlesim.naval.Geometry` with `bearingTo`, `distance`,
+  `leadTarget` matching the Python SDK's behaviour and bearing convention
+  (0° = north / -y, 90° = east / +x).
+- **Acceptance:** JUnit tests cover the four cardinal bearings, the
+  stationary-target lead case, a crossing-target lead case, and the
+  unreachable-target case.
 
 ---
 
