@@ -80,6 +80,20 @@
   window.addEventListener("resize", fitCanvas);
   fitCanvas();
 
+  // View toggle: split (canvas + sidebar) vs. full (canvas fills the window).
+  const mainEl = document.querySelector("main");
+  const viewToggleBtn = document.getElementById("view-toggle");
+  if (mainEl && viewToggleBtn) {
+    viewToggleBtn.addEventListener("click", () => {
+      const isFull = mainEl.classList.toggle("layout-full");
+      mainEl.classList.toggle("layout-split", !isFull);
+      viewToggleBtn.setAttribute("aria-pressed", isFull ? "true" : "false");
+      viewToggleBtn.textContent = isFull ? "Split view" : "Fit battlefield";
+      // The canvas just changed size; re-sync its pixel buffer.
+      fitCanvas();
+    });
+  }
+
   function connect() {
     const url = `ws://${location.host}/spectate`;
     setStatus(false, "connecting…");

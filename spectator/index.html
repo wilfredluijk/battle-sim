@@ -6,13 +6,25 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main>
+    <nav class="topbar">
+      <span class="topbar-title">Naval Battle</span>
+      <div id="status" class="status status-disconnected">connecting…</div>
+      <span class="topbar-spacer"></span>
+      <div class="topbar-controls">
+        <button
+          id="view-toggle"
+          class="topbar-btn"
+          type="button"
+          aria-pressed="false"
+          title="Hide the sidebar and let the battlefield fill the window"
+        >
+          Fit battlefield
+        </button>
+      </div>
+    </nav>
+    <main class="layout-split">
       <canvas id="board" width="800" height="800" aria-label="naval battle map"></canvas>
       <aside id="sidebar">
-        <header>
-          <h1>Naval Battle</h1>
-          <div id="status" class="status status-disconnected">connecting…</div>
-        </header>
         <section>
           <h2>Tick</h2>
           <div id="tick" class="tick">—</div>
