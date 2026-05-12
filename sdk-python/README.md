@@ -21,21 +21,22 @@ if __name__ == "__main__":
 That bot connects, completes the handshake, and drives its ship straight
 ahead until the match ends.
 
+> **Read first:** [`../docs/SDK_GUIDE.md`](../docs/SDK_GUIDE.md) — the
+> shared, language-agnostic guide covering the match lifecycle,
+> coordinate system, common pitfalls, and protocol versioning. This
+> README focuses on the Python-specific surface.
+
 ---
 
 ## Table of contents
 
 1. [Install](#install)
 2. [Quickstart](#quickstart)
-3. [How a match flows](#how-a-match-flows)
-4. [API reference](#api-reference)
-5. [Coordinates, bearings, and units](#coordinates-bearings-and-units)
-6. [Example bots](#example-bots)
-7. [Logging and debugging](#logging-and-debugging)
-8. [Escape hatches: raw frames](#escape-hatches-raw-frames)
-9. [Testing your bot](#testing-your-bot)
-10. [Common pitfalls](#common-pitfalls)
-11. [Versioning and compatibility](#versioning-and-compatibility)
+3. [API reference](#api-reference)
+4. [Example bots](#example-bots)
+5. [Logging and debugging](#logging-and-debugging)
+6. [Escape hatches: raw frames](#escape-hatches-raw-frames)
+7. [Testing your bot](#testing-your-bot)
 
 ---
 
@@ -99,32 +100,6 @@ if __name__ == "__main__":
     args = p.parse_args()
     run(Forward(), host=args.host, port=args.port, name=args.name)
 ```
-
----
-
-## How a match flows
-
-Every bot connection follows the same sequence. The SDK drives all of
-this for you — the table below is for understanding *what your callbacks
-see and when*.
-
-| # | Direction | Frame        | SDK behaviour                                                              |
-|---|-----------|--------------|----------------------------------------------------------------------------|
-| 1 | bot → srv | `hello`      | Sent automatically when `run()` opens the WebSocket.                       |
-| 2 | srv → bot | `welcome`    | SDK parses, stores `bot.welcome`, calls `on_welcome(welcome)`, sends `ready`. |
-| 3 | srv → bot | `game_start` | SDK calls `on_game_start(tick, pos, heading_deg)`.                         |
-| 4 | srv → bot | `tick` …     | SDK calls `on_tick(view)` and sends your returned `Command` back.          |
-| 5 | srv → bot | `game_over`  | SDK calls `on_game_over(result)` once, then closes the connection.         |
-
-Between (2) and (3) the server is in **lobby**: it waits for *all*
-connected bots to be ready before starting. Your bot can connect any
-time and will simply idle until `game_start` fires.
-
-The server is authoritative on every aspect of the simulation. Your
-`Command` is a *request* — throttle and rudder get clamped to `[-1, 1]`,
-fire requests get rejected with an `error` frame if the gun is on
-cooldown or out of ammo, and command frames that arrive after
-`deadline_ms` are dropped (your previous controls persist).
 
 ---
 
@@ -262,22 +237,6 @@ payload if the match completed, else `None`.
 
 The same thing, but as a coroutine. Use it if your bot already runs
 inside an async program.
-
----
-
-## Coordinates, bearings, and units
-
-- World coordinates: origin top-left, **+x right**, **+y down** (canvas
-  convention).
-- Bearings: **0° points along -y** (up on screen), **90° along +x**
-  (right). Increase clockwise. Range `[0, 360)`.
-- Speeds, distances, and headings are `float`. HP and ammo are `int`.
-- Tick rate is set by the server (default `--tick-hz 10`, so
-  `dt = 0.1s`).
-
-Because the server's bearing convention is non-trivial, **use
-`bearing_to(from_pos, to_pos)` rather than hand-rolling `atan2`**. The
-helper returns the value the server expects.
 
 ---
 
@@ -479,36 +438,15 @@ bot uses `random`, seed it yourself so your matches are reproducible.
 
 ---
 
-## Common pitfalls
+## See also
 
-- **Forgetting `shooter_pos`** — `fire_at(target.pos)` without
-  `shooter_pos=view.me.pos` computes the bearing from the origin, not
-  from your ship. Always pass it.
-- **Hand-rolled bearings** — `math.atan2(dy, dx)` gives radians from
-  +x. The server wants compass degrees from -y, clockwise. Use
-  `bearing_to()`.
-- **Passive contacts have no range** — `contact.range` is `Optional`.
-  Guard before doing math on it.
-- **Active mode is loud** — anyone on the map can see your bearing
-  while you're pinging, regardless of distance. Don't camp on
-  `"active"` unless you mean to.
-- **Stable contact IDs are a myth** — `contact.id` is per-tick. To
-  track an enemy across ticks, key on position/bearing similarity
-  yourself.
-- **Tick deadline is real** — the default is 80 ms. If your `on_tick`
-  blocks longer (heavy planning, I/O, sleeps), your command is dropped
-  and the previous tick's controls persist.
+- [`../docs/SDK_GUIDE.md`](../docs/SDK_GUIDE.md) — match lifecycle,
+  coordinate system, common pitfalls, versioning policy.
+- [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md) — full wire protocol
+  spec.
+- [`../sdk-java/README.md`](../sdk-java/README.md) — the JVM equivalent.
 
----
-
-## Versioning and compatibility
-
-- `naval_sdk.__version__` is the SDK's own version. The wire protocol
-  version comes from the server in the `welcome` frame.
-- Additive server changes (new optional fields, new event types) are
-  parsed but ignored by older SDKs — your bot keeps working.
-- Breaking server changes bump the version string and are documented in
-  `docs/PROTOCOL.md`. Pin the SDK version alongside your bot if you
-  care about reproducibility.
-
-See the parallel Java SDK in `sdk-java/` for the JVM equivalent.
+`naval_sdk.__version__` is the Python SDK's own version; the wire
+protocol version comes from the server in the `welcome` frame. See
+[`SDK_GUIDE.md`](../docs/SDK_GUIDE.md#versioning-and-compatibility)
+for the compatibility policy.

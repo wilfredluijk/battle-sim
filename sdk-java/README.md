@@ -27,6 +27,11 @@ public final class ForwardBot extends Bot {
 That bot connects, completes the handshake, and drives its ship straight
 ahead until the match ends.
 
+> **Read first:** [`../docs/SDK_GUIDE.md`](../docs/SDK_GUIDE.md) — the
+> shared, language-agnostic guide covering the match lifecycle,
+> coordinate system, common pitfalls, and protocol versioning. This
+> README focuses on the Java-specific surface.
+
 ---
 
 ## Table of contents
@@ -34,15 +39,11 @@ ahead until the match ends.
 1. [Requirements](#requirements)
 2. [Install](#install)
 3. [Quickstart](#quickstart)
-4. [How a match flows](#how-a-match-flows)
-5. [API reference](#api-reference)
-6. [Coordinates, bearings, and units](#coordinates-bearings-and-units)
-7. [Example bots](#example-bots)
-8. [Logging and debugging](#logging-and-debugging)
-9. [Escape hatches: raw frames](#escape-hatches-raw-frames)
-10. [Testing your bot](#testing-your-bot)
-11. [Common pitfalls](#common-pitfalls)
-12. [Versioning and compatibility](#versioning-and-compatibility)
+4. [API reference](#api-reference)
+5. [Example bots](#example-bots)
+6. [Logging and debugging](#logging-and-debugging)
+7. [Escape hatches: raw frames](#escape-hatches-raw-frames)
+8. [Testing your bot](#testing-your-bot)
 
 ---
 
@@ -141,35 +142,6 @@ public final class ForwardBot extends Bot {
     }
 }
 ```
-
----
-
-## How a match flows
-
-Every bot connection follows the same sequence. The SDK drives all of
-this for you — the table below is for understanding *what your callbacks
-see and when*.
-
-| # | Direction | Frame        | SDK behaviour                                                              |
-|---|-----------|--------------|----------------------------------------------------------------------------|
-| 1 | bot → srv | `hello`      | Sent automatically when `BotRunner.run` opens the WebSocket.               |
-| 2 | srv → bot | `welcome`    | SDK parses, stores `bot.welcome()`, calls `onWelcome`, sends `ready`.      |
-| 3 | srv → bot | `game_start` | SDK calls `onGameStart(gameStart)`.                                        |
-| 4 | srv → bot | `tick` …     | SDK calls `onTick(view)` and sends your returned `Command` back.           |
-| 5 | srv → bot | `game_over`  | SDK calls `onGameOver(result)` once, then closes the connection.           |
-
-Between (2) and (3) the server is in **lobby**: it waits for *all*
-connected bots to be ready before starting. Your bot can connect any
-time and will simply idle until `game_start` fires.
-
-The server is authoritative on every aspect of the simulation. Your
-`Command` is a *request* — throttle and rudder get clamped to `[-1, 1]`,
-fire requests get rejected with an `error` frame if the gun is on
-cooldown or out of ammo, and command frames that arrive after
-`deadlineMs` are dropped (your previous controls persist).
-
-If your `onTick` throws, the SDK logs the exception and sends a
-hold-station command instead — the connection stays open.
 
 ---
 
@@ -307,23 +279,6 @@ Optional<GameOver> BotRunner.run(Bot bot, String host, int port,
 
 Blocks until `game_over` or the WebSocket closes. Returns the
 `GameOver` payload if the match ended cleanly, else `Optional.empty()`.
-
----
-
-## Coordinates, bearings, and units
-
-- World coordinates: origin top-left, **+x right**, **+y down** (canvas
-  convention).
-- Bearings: **0° points along -y** (up on screen), **90° along +x**
-  (right). Increase clockwise. Range `[0, 360)`.
-- Distances, speeds, headings, rudders, throttles are `float`. HP, ammo,
-  ticks are integer.
-- Tick rate is set by the server (default `--tick-hz 10`, so
-  `dt = 0.1s`).
-
-The server's bearing convention is not the math-textbook one. Use
-`Geometry.bearingTo(from, to)` rather than hand-rolling `Math.atan2` —
-the helper returns the value the server expects.
 
 ---
 
@@ -570,41 +525,30 @@ If your bot uses `Random`, seed it yourself so matches are reproducible.
 
 ---
 
-## Common pitfalls
+## Java-specific pitfalls
 
-- **Forgetting `shooterPos`** — there's no zero-arg `fireAt`; always
-  pass `view.self().pos()` as the first argument. Without your real
-  position the bearing is meaningless.
-- **Hand-rolled bearings** — `Math.atan2(dy, dx)` gives radians from
-  +x. The server wants compass degrees from -y, clockwise. Use
-  `Geometry.bearingTo`.
-- **Passive contacts have no range** — `Contact.range()` is
-  `OptionalDouble`. Guard before doing math on it.
-- **Active mode is loud** — anyone on the map can see your bearing
-  while you're pinging, regardless of distance. Don't camp on
-  `ACTIVE` unless you mean to.
-- **Stable contact IDs are a myth** — `Contact.id()` is per-tick. To
-  track an enemy across ticks, key on position/bearing similarity
-  yourself.
-- **Tick deadline is real** — the default is 80 ms. If your `onTick`
-  blocks longer (heavy planning, I/O, sleeps), your command is dropped
-  and the previous tick's controls persist.
+The shared
+[common pitfalls](../docs/SDK_GUIDE.md#common-pitfalls) list applies to
+every SDK. One extra thing to watch out for on the JVM:
+
 - **`Bot` is not thread-safe** — the runtime calls your callbacks on a
   single thread. If you spawn workers yourself, synchronize access to
   bot state.
 
 ---
 
-## Versioning and compatibility
+## See also
 
-- The SDK artifact version is set in `pom.xml`. The wire protocol
-  version comes from the server in the `welcome` frame.
-- Additive server changes (new optional fields, new event types) parse
-  but are ignored by older SDKs — your bot keeps working.
-  `TickEvent.Unknown` exists exactly for this case.
-- Breaking server changes bump the version string and are documented in
-  `docs/PROTOCOL.md`. Pin the SDK version alongside your bot if you
-  care about reproducibility.
+- [`../docs/SDK_GUIDE.md`](../docs/SDK_GUIDE.md) — match lifecycle,
+  coordinate system, common pitfalls, versioning policy.
+- [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md) — full wire protocol
+  spec.
+- [`../sdk-python/README.md`](../sdk-python/README.md) — the Python
+  equivalent.
 
-See the parallel Python SDK in `sdk-python/` for the same functionality
-in Python.
+The SDK artifact version is set in `pom.xml`; the wire protocol version
+comes from the server in the `welcome` frame. `TickEvent.Unknown` is
+how the Java SDK stays forward-compatible with additive protocol
+changes — see
+[`SDK_GUIDE.md`](../docs/SDK_GUIDE.md#versioning-and-compatibility)
+for the full compatibility policy.
