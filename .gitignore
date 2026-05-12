@@ -1,1 +1,4 @@
 /server/target/
+/sdk-java/target/
+/examples/*/target/
+/server/replays/

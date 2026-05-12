@@ -180,8 +180,20 @@ pub struct SpectatorShip {
     pub bot_name: String,
     pub pos: Pos,
     pub heading_deg: f32,
+    /// Signed scalar speed: positive = ahead, negative = reverse.
+    pub speed: f32,
     pub hp: u32,
+    pub ammo: u32,
+    /// Last commanded throttle in `[-1, 1]`.
+    pub throttle: f32,
+    /// Last commanded rudder in `[-1, 1]`.
+    pub rudder: f32,
     pub alive: bool,
+    /// Lobby readiness flag. `true` once the bot has sent `ready`.
+    pub ready: bool,
+    /// Commands accepted by the room over the most recent rolling 1-second window
+    /// (1s of *sim* time, i.e. `tick_hz` ticks). Stays 0 while the room is in lobby.
+    pub commands_per_sec: f32,
     /// Last commanded sensor mode. Used by the renderer to draw an active-radar ring.
     pub sensor_mode: SensorMode,
 }
@@ -366,8 +378,14 @@ mod tests {
                 bot_name: "captain_kirk".into(),
                 pos: [203.4, 511.7],
                 heading_deg: 92.3,
+                speed: 4.1,
                 hp: 78,
+                ammo: 14,
+                throttle: 0.8,
+                rudder: -0.3,
                 alive: true,
+                ready: true,
+                commands_per_sec: 10.0,
                 sensor_mode: SensorMode::Active,
             }],
             shells: vec![SpectatorShell {

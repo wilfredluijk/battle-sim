@@ -5,7 +5,7 @@
 //! to bots via per-connection mpsc senders. Bot lifecycle (Phase 4.1) lives here; per-tick
 //! command exchange lands in Phase 4.3.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,6 +78,11 @@ struct BotEntry {
     /// duplicate cooldown/no-ammo error frames inside the same tick — a bot spamming
     /// `fire` would otherwise flood its own outbound buffer.
     last_fire_error_tick: Option<u64>,
+    /// World ticks at which we accepted a command from this bot, used to surface a
+    /// rolling commands-per-second figure on the spectator feed. Entries older than
+    /// `tick_hz` ticks are trimmed at push time. Observability only — not part of any
+    /// simulation state.
+    command_ticks: VecDeque<u64>,
 }
 
 /// A command waiting to be applied at the next tick. Lifted from `BotMsg::Command` —
@@ -272,8 +277,11 @@ impl Room {
     /// in time. Replay playback uses this to inject recorded commands without tripping the
     /// deadline check; live mode goes through `RoomEvent::BotCommand` instead.
     pub fn inject_replay_command(&mut self, bot_id: &BotId, command: PendingCommand) {
+        let world_tick = self.world.tick;
+        let window = u64::from(self.tick_hz);
         if let Some(entry) = self.bots.get_mut(bot_id) {
             entry.pending_command = Some(command);
+            record_command_tick(&mut entry.command_ticks, world_tick, window);
         } else {
             warn!(room = %self.name, bot = %bot_id, "replay command for unknown bot, dropped");
         }
@@ -500,18 +508,32 @@ impl Room {
         // Ships in BotId order via the bot registry, so the wire payload is stable across
         // identical runs. Falling back to `world.ships` would also be deterministic
         // (BTreeMap on ShipId), but going through `bots` keeps `bot_name` in lock-step.
+        let world_tick = self.world.tick;
+        let cps_window = u64::from(self.tick_hz);
+        let cps_cutoff = world_tick.saturating_sub(cps_window.saturating_sub(1));
         let ships: Vec<SpectatorShip> = self
             .bots
             .values()
             .filter_map(|entry| {
                 let ship = self.world.ships.get(&entry.ship_id)?;
+                let recent = entry
+                    .command_ticks
+                    .iter()
+                    .filter(|&&t| t >= cps_cutoff)
+                    .count() as f32;
                 Some(SpectatorShip {
                     id: ship.id.clone(),
                     bot_name: entry.name.clone(),
                     pos: [ship.pos.x, ship.pos.y],
                     heading_deg: ship.heading_deg,
+                    speed: ship.speed,
                     hp: ship.hp,
+                    ammo: ship.ammo,
+                    throttle: ship.throttle,
+                    rudder: ship.rudder,
                     alive: ship.alive,
+                    ready: entry.ready,
+                    commands_per_sec: recent,
                     sensor_mode: entry.sensor_mode,
                 })
             })
@@ -779,6 +801,7 @@ impl Room {
         }
 
         entry.pending_command = Some(command);
+        record_command_tick(&mut entry.command_ticks, world_tick, u64::from(self.tick_hz));
     }
 
     /// Operator-triggered transition `Lobby` → `Running`. Places ships on the §5.6 ring
@@ -996,6 +1019,7 @@ impl Room {
                 pending_command: None,
                 sensor_mode: SensorMode::Passive,
                 last_fire_error_tick: None,
+                command_ticks: VecDeque::new(),
             },
         );
 
@@ -1015,6 +1039,20 @@ impl Room {
             outbound: out_rx,
         })
     }
+}
+
+/// Append `world_tick` to a bot's command-receipt window, trimming entries older than
+/// `window` ticks. Used to derive the commands-per-second figure shown to spectators.
+fn record_command_tick(history: &mut VecDeque<u64>, world_tick: u64, window: u64) {
+    let cutoff = world_tick.saturating_sub(window.saturating_sub(1));
+    while let Some(&front) = history.front() {
+        if front < cutoff {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
+    history.push_back(world_tick);
 }
 
 /// Pick the combat events this bot should perceive this tick:
@@ -2149,6 +2187,18 @@ mod tests {
         assert_eq!(ships[0]["bot_name"], "alice");
         assert_eq!(ships[0]["alive"], true);
         assert_eq!(ships[0]["sensor_mode"], "active");
+        // New observability fields land in every frame.
+        assert!(ships[0]["speed"].is_number(), "speed missing from frame");
+        assert!(ships[0]["ammo"].is_number(), "ammo missing from frame");
+        assert!(ships[0]["throttle"].is_number(), "throttle missing from frame");
+        assert!(ships[0]["rudder"].is_number(), "rudder missing from frame");
+        assert_eq!(ships[0]["ready"], true);
+        // We accepted one command this second, so cps is at least 1.
+        assert!(
+            ships[0]["commands_per_sec"].as_f64().unwrap() >= 1.0,
+            "expected commands_per_sec ≥ 1 after one accepted command, got {}",
+            ships[0]["commands_per_sec"],
+        );
     }
 
     #[test]

@@ -184,8 +184,14 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
       "bot_name": "captain_kirk",
       "pos": [203.4, 511.7],
       "heading_deg": 92.3,
+      "speed": 4.1,
       "hp": 78,
+      "ammo": 14,
+      "throttle": 0.8,
+      "rudder": -0.3,
       "alive": true,
+      "ready": true,
+      "commands_per_sec": 10.0,
       "sensor_mode": "active"
     }
   ],
@@ -208,6 +214,12 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
 `shells[].id_index` is a stable-per-shell index used by renderers to track trails across ticks.
 
 `ships[].sensor_mode` is the bot's most recently commanded mode (`"active"` or `"passive"`); the renderer uses it to draw the active-radar ring.
+
+`ships[].speed` is the ship's signed scalar velocity (positive = ahead, negative = astern); `throttle` and `rudder` are the last commanded control values, both in `[-1.0, 1.0]`.
+
+`ships[].ready` is the lobby-readiness flag — `true` once the bot has sent `ready`. It stays `true` for the rest of the match.
+
+`ships[].commands_per_sec` is the number of `command` frames the room accepted from this bot over the last second of sim time (i.e. the last `tick_hz` ticks). The value is zero in the lobby and ticks up once the match is running. Late, stale, or violation-rejected commands do not count.
 
 ---
 
@@ -249,6 +261,10 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-05-12 — richer spectator world frames
+
+- `ships[]` in the `world` payload now carries `speed`, `ammo`, `throttle`, `rudder`, `ready`, and `commands_per_sec` in addition to the existing fields. Backwards compatible: existing spectator clients can ignore them.
 
 ## 2026-05-12 — security hardening
 

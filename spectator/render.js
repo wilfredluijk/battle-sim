@@ -35,12 +35,24 @@
     return colorByName.get(name);
   }
 
+  // Default ship specs — used to scale the HP/ammo meters when the spectator never sees
+  // a `welcome` frame. These match `ShipSpecs::DEFAULT` server-side.
+  const MAX_HP = 100;
+  const MAX_AMMO = 20;
+  const MAX_FORWARD_SPEED = 6.0;
+  const MAX_REVERSE_SPEED = 2.0;
+
   const canvas = document.getElementById("board");
   const ctx = canvas.getContext("2d");
   const statusEl = document.getElementById("status");
   const tickEl = document.getElementById("tick");
-  const playersEl = document.getElementById("players");
+  const botsEl = document.getElementById("bots");
   const eventsEl = document.getElementById("events");
+
+  // Bots we've seen at least once, keyed by ship id. We keep the last-known snapshot so
+  // a disconnect (bot vanishes from the world frame) can still surface the final state
+  // in the sidebar instead of silently dropping the card.
+  const botCards = new Map();
 
   // Most recent world snapshot from the server. Ticks arrive at ~10 Hz; we redraw every
   // animation frame so splash rings can interpolate smoothly.
@@ -116,7 +128,7 @@
       renderEvents();
     }
 
-    renderPlayers(world.ships || []);
+    renderBots(world.tick, world.ships || []);
   }
 
   function formatEvent(tick, ev) {
@@ -134,47 +146,202 @@
     }
   }
 
-  function renderPlayers(ships) {
-    playersEl.innerHTML = "";
+  function renderBots(tick, ships) {
+    // Update the in-memory map: refresh entries we saw this tick, mark the rest as
+    // disconnected so the operator can tell when a bot drops mid-match. Order is the
+    // first-seen order, which lines up with the server's `BotId` ordering.
     for (const ship of ships) {
-      const li = document.createElement("li");
-      if (!ship.alive) li.classList.add("dead");
-
-      const swatch = document.createElement("span");
-      swatch.className = "player-color";
-      swatch.style.background = colorFor(ship.bot_name);
-
-      const name = document.createElement("span");
-      name.className = "player-name";
-      name.textContent = ship.bot_name;
-      name.title = `${ship.bot_name} (${ship.id})`;
-
-      const meta = document.createElement("span");
-      meta.className = "player-meta";
-      meta.textContent = `${ship.hp} HP`;
-
-      const hpWrap = document.createElement("div");
-      hpWrap.className = "player-hp-wrap";
-      const hpFill = document.createElement("div");
-      hpFill.className = "player-hp-fill";
-      const pct = Math.max(0, Math.min(100, ship.hp));
-      hpFill.style.width = `${pct}%`;
-      hpFill.style.background =
-        ship.hp > 60 ? "var(--good)" : ship.hp > 25 ? "#f4d35e" : "var(--bad)";
-      hpWrap.appendChild(hpFill);
-
-      li.appendChild(swatch);
-      const middle = document.createElement("div");
-      middle.style.display = "flex";
-      middle.style.flexDirection = "column";
-      middle.style.gap = "3px";
-      middle.style.minWidth = "0";
-      middle.appendChild(name);
-      middle.appendChild(hpWrap);
-      li.appendChild(middle);
-      li.appendChild(meta);
-      playersEl.appendChild(li);
+      const prev = botCards.get(ship.id);
+      botCards.set(ship.id, {
+        ship,
+        lastSeenTick: tick,
+        firstSeenOrder: prev ? prev.firstSeenOrder : botCards.size,
+        connected: true,
+      });
     }
+    for (const [id, card] of botCards) {
+      if (card.lastSeenTick !== tick) {
+        card.connected = false;
+      }
+    }
+
+    const ordered = Array.from(botCards.values()).sort(
+      (a, b) => a.firstSeenOrder - b.firstSeenOrder,
+    );
+
+    botsEl.innerHTML = "";
+    for (const card of ordered) {
+      botsEl.appendChild(buildBotCard(card));
+    }
+  }
+
+  function buildBotCard(card) {
+    const ship = card.ship;
+    const li = document.createElement("li");
+    li.className = "bot";
+    if (!ship.alive) li.classList.add("dead");
+    if (!card.connected) li.classList.add("disconnected");
+
+    // Header row: color swatch, name, status pill.
+    const header = document.createElement("div");
+    header.className = "bot-header";
+
+    const swatch = document.createElement("span");
+    swatch.className = "bot-swatch";
+    swatch.style.background = colorFor(ship.bot_name);
+
+    const name = document.createElement("span");
+    name.className = "bot-name";
+    name.textContent = ship.bot_name;
+    name.title = `${ship.bot_name} (${ship.id})`;
+
+    const status = document.createElement("span");
+    const { label: statusLabel, cls: statusCls } = statusFor(ship, card.connected);
+    status.className = `bot-status ${statusCls}`;
+    status.textContent = statusLabel;
+
+    header.appendChild(swatch);
+    header.appendChild(name);
+    header.appendChild(status);
+
+    // Resource meters (HP + ammo).
+    const meters = document.createElement("div");
+    meters.className = "bot-meters";
+    meters.appendChild(meterRow("HP", ship.hp, MAX_HP, hpColor(ship.hp), `${ship.hp}/${MAX_HP}`));
+    meters.appendChild(meterRow("AMMO", ship.ammo, MAX_AMMO, "#6cb1ff", `${ship.ammo}/${MAX_AMMO}`));
+
+    // Control sliders (throttle + rudder) and speed readout.
+    const controls = document.createElement("div");
+    controls.className = "bot-controls";
+    controls.appendChild(sliderRow("THR", ship.throttle, signedFmt(ship.throttle)));
+    controls.appendChild(speedRow(ship.speed));
+    controls.appendChild(sliderRow("RUD", ship.rudder, signedFmt(ship.rudder)));
+
+    // Footer: commands-per-second + sensor mode.
+    const footer = document.createElement("div");
+    footer.className = "bot-footer";
+    const cps = document.createElement("span");
+    cps.className = "bot-stat";
+    const cpsValue = typeof ship.commands_per_sec === "number" ? ship.commands_per_sec : 0;
+    cps.innerHTML = `<span class="bot-stat-key">CPS</span> ${cpsValue.toFixed(0)}/s`;
+    const sensor = document.createElement("span");
+    sensor.className = `bot-stat bot-sensor-${ship.sensor_mode || "passive"}`;
+    sensor.innerHTML = `<span class="bot-stat-key">SENSOR</span> ${ship.sensor_mode || "—"}`;
+    footer.appendChild(cps);
+    footer.appendChild(sensor);
+
+    li.appendChild(header);
+    li.appendChild(meters);
+    li.appendChild(controls);
+    li.appendChild(footer);
+    return li;
+  }
+
+  function statusFor(ship, connected) {
+    if (!connected) return { label: "disconnected", cls: "pill-bad" };
+    if (!ship.alive) return { label: "destroyed", cls: "pill-bad" };
+    if (!ship.ready) return { label: "lobby", cls: "pill-muted" };
+    return { label: "live", cls: "pill-good" };
+  }
+
+  function hpColor(hp) {
+    if (hp > 60) return "var(--good)";
+    if (hp > 25) return "#f4d35e";
+    return "var(--bad)";
+  }
+
+  function meterRow(label, value, max, fill, valueText) {
+    const row = document.createElement("div");
+    row.className = "meter-row";
+    const key = document.createElement("span");
+    key.className = "meter-key";
+    key.textContent = label;
+    const track = document.createElement("div");
+    track.className = "meter-track";
+    const bar = document.createElement("div");
+    bar.className = "meter-fill";
+    const pct = Math.max(0, Math.min(1, value / max));
+    bar.style.width = `${pct * 100}%`;
+    bar.style.background = fill;
+    track.appendChild(bar);
+    const valueEl = document.createElement("span");
+    valueEl.className = "meter-value";
+    valueEl.textContent = valueText;
+    row.appendChild(key);
+    row.appendChild(track);
+    row.appendChild(valueEl);
+    return row;
+  }
+
+  function sliderRow(label, value, valueText) {
+    const row = document.createElement("div");
+    row.className = "meter-row";
+    const key = document.createElement("span");
+    key.className = "meter-key";
+    key.textContent = label;
+    const track = document.createElement("div");
+    track.className = "slider-track";
+    const center = document.createElement("div");
+    center.className = "slider-center";
+    track.appendChild(center);
+    const fill = document.createElement("div");
+    fill.className = "slider-fill";
+    const clamped = Math.max(-1, Math.min(1, value || 0));
+    const widthPct = Math.abs(clamped) * 50;
+    if (clamped >= 0) {
+      fill.style.left = "50%";
+    } else {
+      fill.style.left = `${50 - widthPct}%`;
+    }
+    fill.style.width = `${widthPct}%`;
+    fill.style.background = clamped >= 0 ? "#6cb1ff" : "#ef9a4a";
+    track.appendChild(fill);
+    const valueEl = document.createElement("span");
+    valueEl.className = "meter-value";
+    valueEl.textContent = valueText;
+    row.appendChild(key);
+    row.appendChild(track);
+    row.appendChild(valueEl);
+    return row;
+  }
+
+  function speedRow(speed) {
+    const row = document.createElement("div");
+    row.className = "meter-row";
+    const key = document.createElement("span");
+    key.className = "meter-key";
+    key.textContent = "SPD";
+    const track = document.createElement("div");
+    track.className = "slider-track";
+    const center = document.createElement("div");
+    center.className = "slider-center";
+    track.appendChild(center);
+    const fill = document.createElement("div");
+    fill.className = "slider-fill";
+    const ratio =
+      speed >= 0 ? speed / MAX_FORWARD_SPEED : speed / MAX_REVERSE_SPEED;
+    const clamped = Math.max(-1, Math.min(1, ratio));
+    const widthPct = Math.abs(clamped) * 50;
+    if (clamped >= 0) {
+      fill.style.left = "50%";
+    } else {
+      fill.style.left = `${50 - widthPct}%`;
+    }
+    fill.style.width = `${widthPct}%`;
+    fill.style.background = clamped >= 0 ? "var(--good)" : "#ef9a4a";
+    track.appendChild(fill);
+    const valueEl = document.createElement("span");
+    valueEl.className = "meter-value";
+    valueEl.textContent = `${speed.toFixed(1)} u/s`;
+    row.appendChild(key);
+    row.appendChild(track);
+    row.appendChild(valueEl);
+    return row;
+  }
+
+  function signedFmt(v) {
+    if (typeof v !== "number" || Number.isNaN(v)) return "—";
+    return (v >= 0 ? "+" : "") + v.toFixed(2);
   }
 
   function renderEvents() {
