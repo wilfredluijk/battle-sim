@@ -36,9 +36,15 @@ fn start(room: &mut Room, name: &str) -> Result<(), StartError> {
     rx.try_recv().expect("oneshot reply")
 }
 
-fn cmd(throttle: f32, rudder: f32, mode: SensorMode, fire: Option<FireCommand>) -> PendingCommand {
+fn cmd(
+    tick: u64,
+    throttle: f32,
+    rudder: f32,
+    mode: SensorMode,
+    fire: Option<FireCommand>,
+) -> PendingCommand {
     PendingCommand {
-        tick: 0,
+        tick,
         throttle,
         rudder,
         sensor_mode: mode,
@@ -68,13 +74,14 @@ fn run_match(room: &mut Room, r1: &mut BotRegistration, r2: &mut BotRegistration
         } else {
             None
         };
+        let t = room.world.tick;
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r1.bot_id.clone(),
-            command: cmd(0.8, 0.4, SensorMode::Active, fire),
+            command: cmd(t, 0.8, 0.4, SensorMode::Active, fire),
         });
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd(-0.3, -0.2, SensorMode::Passive, None),
+            command: cmd(t, -0.3, -0.2, SensorMode::Passive, None),
         });
         room.step_tick();
         drain(r1);
@@ -195,9 +202,11 @@ fn replay_log_has_header_then_ticks_then_end_when_match_ends() {
     room.world.ships.get_mut(&r1.ship_id).unwrap().pos = glam::Vec2::new(500.0, 500.0);
     room.world.ships.get_mut(&r2.ship_id).unwrap().pos = glam::Vec2::new(700.0, 500.0);
     room.world.ships.get_mut(&r2.ship_id).unwrap().hp = 1;
+    let t0 = room.world.tick;
     room.handle_event(RoomEvent::BotCommand {
         bot_id: r1.bot_id.clone(),
         command: cmd(
+            t0,
             0.0,
             0.0,
             SensorMode::Passive,
@@ -208,9 +217,10 @@ fn replay_log_has_header_then_ticks_then_end_when_match_ends() {
         ),
     });
     for _ in 0..50 {
+        let t = room.world.tick;
         room.handle_event(RoomEvent::BotCommand {
             bot_id: r2.bot_id.clone(),
-            command: cmd(0.0, 0.0, SensorMode::Passive, None),
+            command: cmd(t, 0.0, 0.0, SensorMode::Passive, None),
         });
         room.step_tick();
         drain(&mut r1);
