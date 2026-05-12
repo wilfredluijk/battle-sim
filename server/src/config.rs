@@ -17,11 +17,11 @@ pub struct Config {
     pub tick_deadline_ms: u64,
 
     /// Map size in WIDTHxHEIGHT units (e.g. 1000x1000)
-    #[arg(long, default_value = "1000x1000", value_parser = parse_map_size)]
+    #[arg(long, default_value = "700x700", value_parser = parse_map_size)]
     pub map: (u32, u32),
 
     /// Maximum number of bots per room
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 24)]
     pub max_bots: u32,
 
     /// RNG seed used to drive the deterministic simulation
@@ -39,7 +39,7 @@ pub struct Config {
 
     /// Maximum simultaneous TCP connections from a single peer IP. Above this, additional
     /// connects from that IP are refused at accept time. Set to 0 to disable the cap.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 25)]
     pub max_connections_per_ip: u32,
 
     /// Seconds to wait for the HTTP head and the WebSocket `hello` message before forcibly

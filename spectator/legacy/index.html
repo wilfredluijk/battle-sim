@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Naval Battle — Spectator</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <nav class="topbar">
+      <span class="topbar-title">Naval Battle</span>
+      <div id="status" class="status status-disconnected">connecting…</div>
+      <span class="topbar-spacer"></span>
+      <div class="topbar-controls">
+        <button
+          id="view-toggle"
+          class="topbar-btn"
+          type="button"
+          aria-pressed="false"
+          title="Hide the sidebar and let the battlefield fill the window"
+        >
+          Fit battlefield
+        </button>
+      </div>
+    </nav>
+    <main class="layout-split">
+      <canvas id="board" width="800" height="800" aria-label="naval battle map"></canvas>
+      <aside id="sidebar">
+        <section>
+          <h2>Tick</h2>
+          <div id="tick" class="tick">—</div>
+        </section>
+        <section>
+          <h2>Bots</h2>
+          <ul id="bots" class="bots"></ul>
+        </section>
+        <section>
+          <h2>Recent events</h2>
+          <ul id="events" class="events"></ul>
+        </section>
+      </aside>
+    </main>
+    <script src="render.js"></script>
+  </body>
+</html>

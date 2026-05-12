@@ -1,0 +1,12 @@
+services:
+  battle-sim:
+    build: .
+    image: battle-sim:local
+    container_name: battle-sim
+    ports:
+      - "7878:7878"
+    volumes:
+      # Persist replay JSONL logs on the host. The server writes to /app/replays inside
+      # the container per `CMD` in the Dockerfile.
+      - ./replays:/app/replays
+    restart: unless-stopped

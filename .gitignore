@@ -2,3 +2,6 @@
 /sdk-java/target/
 /examples/*/target/
 /server/replays/
+/spectator/node_modules/
+/spectator/.svelte-kit/
+/spectator/vite.config.ts.timestamp-*.mjs

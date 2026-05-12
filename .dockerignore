@@ -1,0 +1,27 @@
+# Exclude build artefacts and editor / VCS noise from the docker build context.
+# Without this the context easily bloats past 1 GB (server/target/ alone is several
+# hundred MB).
+.git
+.gitignore
+.idea
+*.iml
+.claude
+
+# Rust build outputs
+**/target
+
+# Node / Vite
+**/node_modules
+spectator/dist
+spectator/.svelte-kit
+
+# Local replay logs — produced by `cargo run`, not needed inside the image.
+server/replays
+replays
+
+# Docs / sibling projects not needed by the server build.
+docs
+sdk-java
+sdk-python
+examples
+spectator/legacy
