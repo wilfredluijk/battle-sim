@@ -20,7 +20,7 @@ Conventions:
 | 5 | Sensors | **complete** |
 | 6 | Combat | **complete** |
 | 7 | Spectator | **complete** |
-| 8 | Replay | pending |
+| 8 | Replay | **complete** |
 | 9 | Python SDK | pending |
 | 10 | Examples and onboarding | pending |
 | 11 | Polish | pending |
@@ -155,17 +155,17 @@ Conventions:
 
 ---
 
-## Phase 8 — Replay
+## Phase 8 — Replay  *(complete)*
 
-### 8.1 Replay log writer
+### 8.1 Replay log writer  *(done)*
 - **Deliverable:** `src/replay.rs` writes a JSONL file per match in `--replay-dir`: header line (seed, config, bot names) + one line per tick (tick number + sorted commands).
 - **Acceptance:** A finished match leaves a `match_<timestamp>.jsonl` file with one header + N tick lines.
 
-### 8.2 Replay playback flag
+### 8.2 Replay playback flag  *(done)*
 - **Deliverable:** `--replay <file>` flag re-runs the simulation from the log and broadcasts to spectators (no bot connections).
 - **Acceptance:** Replaying a saved match in the browser is visually identical to the live run.
 
-### 8.3 Replay determinism test
+### 8.3 Replay determinism test  *(done)*
 - **Deliverable:** `server/tests/replay_determinism.rs` runs a fixed-seed match, captures final world state, replays from the log, asserts byte-identical final state.
 - **Acceptance:** `cargo test replay_determinism` passes.
 

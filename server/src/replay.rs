@@ -1,0 +1,541 @@
+//! Replay log: a JSONL record of every match for re-running the simulation later.
+//!
+//! Format (one JSON object per line):
+//!   1. Header (line 0): version, seed, tick rate, map size, bots in registration order.
+//!   2. Tick records: one per tick the room produces in `Running` state, listing the
+//!      commands actually applied that tick (sorted by `bot_id`, matching the order the
+//!      simulation processed them).
+//!   3. End record: terminal line with the final tick and winner.
+//!
+//! Determinism (see `CLAUDE.md`): the log captures only the *inputs* that drove the
+//! simulation. Replaying = re-running the same simulation with the same seed and feeding
+//! the recorded commands back through `Room::step_tick`. State is reconstructed, never
+//! deserialized.
+
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, oneshot};
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::{info, warn};
+
+use crate::protocol::{FireCommand, MapInfo, SensorMode};
+use crate::room::{PendingCommand, Room, RoomEvent, SpectatorFrame};
+
+/// Bumped on any breaking change to the on-disk format. Readers reject mismatched versions
+/// rather than silently misinterpreting old logs.
+pub const REPLAY_FORMAT_VERSION: u32 = 1;
+
+/// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
+/// alongside the variant payload — the on-disk shape is exactly what bot authors see when
+/// they `cat` the file.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplayRecord {
+    Header(ReplayHeader),
+    Tick(ReplayTick),
+    End(ReplayEnd),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplayHeader {
+    pub version: u32,
+    pub replay_id: String,
+    pub room: String,
+    pub seed: u64,
+    pub tick_hz: u32,
+    pub tick_deadline_ms: u64,
+    pub map: MapInfo,
+    pub max_bots: u32,
+    pub bots: Vec<ReplayBot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplayBot {
+    pub bot_id: String,
+    pub ship_id: String,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplayTick {
+    pub tick: u64,
+    pub commands: Vec<ReplayCommand>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplayCommand {
+    pub bot_id: String,
+    pub throttle: f32,
+    pub rudder: f32,
+    pub sensor_mode: SensorMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire: Option<FireCommand>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplayEnd {
+    pub tick: u64,
+    pub winner: Option<String>,
+}
+
+/// Sink for replay records. Either appends to a file on disk or to a shared in-memory
+/// buffer (used by tests). Construction is fallible for the file variant; everything else
+/// is infallible at the type level — write errors are reported per-call.
+pub struct ReplayWriter {
+    sink: Box<dyn Write + Send>,
+    replay_id: String,
+    /// Path on disk if this writer is file-backed. `None` for in-memory writers.
+    path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ReplayWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayWriter")
+            .field("replay_id", &self.replay_id)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplayWriter {
+    /// Open `<dir>/<replay_id>.jsonl` for writing, creating the directory tree if needed.
+    pub fn create_file(dir: &Path, replay_id: String) -> io::Result<Self> {
+        fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{replay_id}.jsonl"));
+        let file = File::create(&path)?;
+        Ok(Self {
+            sink: Box::new(BufWriter::new(file)),
+            replay_id,
+            path: Some(path),
+        })
+    }
+
+    /// Build a writer whose output is captured in a shared `Vec<u8>`. Returns the writer
+    /// plus a clone of the buffer the caller can read from after writing finishes.
+    pub fn in_memory(replay_id: String) -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = SharedBuf(Arc::clone(&buf));
+        (
+            Self {
+                sink: Box::new(sink),
+                replay_id,
+                path: None,
+            },
+            buf,
+        )
+    }
+
+    pub fn replay_id(&self) -> &str {
+        &self.replay_id
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Write a single record followed by a `\n` and flush. Flushing per-line keeps the
+    /// log usable if the server crashes mid-match — at 10 Hz the cost is negligible.
+    pub fn write(&mut self, record: &ReplayRecord) -> io::Result<()> {
+        // Serialization is infallible for our types; treat any error as a bug.
+        let json = serde_json::to_string(record).expect("ReplayRecord always serializes");
+        self.sink.write_all(json.as_bytes())?;
+        self.sink.write_all(b"\n")?;
+        self.sink.flush()
+    }
+}
+
+/// `Write` adapter over a shared `Arc<Mutex<Vec<u8>>>` so tests can grab the bytes back
+/// without owning the writer.
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("replay buffer poisoned"))?;
+        guard.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Read a JSONL replay log into a list of records. Bails on the first malformed line —
+/// partial replays are not supported. Empty lines are silently skipped to tolerate trailing
+/// newlines and cosmetic padding.
+pub fn read_records(path: &Path) -> io::Result<Vec<ReplayRecord>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rec: ReplayRecord = serde_json::from_str(trimmed).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed replay line {}: {e}", lineno + 1),
+            )
+        })?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+/// Same as `read_records` but reads from any `BufRead`. Useful for tests that keep the
+/// log in memory.
+pub fn read_records_from<R: BufRead>(reader: R) -> io::Result<Vec<ReplayRecord>> {
+    let mut out = Vec::new();
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rec: ReplayRecord = serde_json::from_str(trimmed).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed replay line {}: {e}", lineno + 1),
+            )
+        })?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+/// Generate a replay identifier of the form `match_<room>_<unix_secs>`. The unix timestamp
+/// is a wall-clock read, so this MUST NOT be called inside the simulation — it's strictly
+/// for naming the file we're about to write.
+pub fn make_replay_id(room: &str) -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("match_{room}_{secs}")
+}
+
+/// Reconstruct a `Room` from a `ReplayHeader`. Used by both the live replay player
+/// (`run_replay`) and the determinism test. The bots are pre-registered with the same
+/// ids the live run assigned, then marked ready and started — so the resulting Room is
+/// in `Running` state at tick 0, ready to accept injected commands.
+pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayError> {
+    let mut room = Room::new(
+        header.room.clone(),
+        header.map.width as f32,
+        header.map.height as f32,
+        header.seed,
+        header.tick_hz,
+        header.tick_deadline_ms,
+        header.max_bots.max(header.bots.len() as u32),
+    );
+
+    for bot in &header.bots {
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        room.handle_event(RoomEvent::BotConnect {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            name: bot.name.clone(),
+            version: "replay".into(),
+            reply: reply_tx,
+        });
+        // `handle_event` is synchronous and fills the reply before returning, so try_recv
+        // always succeeds here.
+        let reg = reply_rx
+            .try_recv()
+            .map_err(|_| ReplayError::Header("room dropped registration reply".into()))?
+            .map_err(|e| ReplayError::Header(format!("bot register failed: {}", e.as_str())))?;
+        if reg.bot_id != bot.bot_id {
+            return Err(ReplayError::Header(format!(
+                "bot id drift on rebuild: header expected `{}`, room assigned `{}`",
+                bot.bot_id, reg.bot_id
+            )));
+        }
+        if reg.ship_id != bot.ship_id {
+            return Err(ReplayError::Header(format!(
+                "ship id drift on rebuild: header expected `{}`, room assigned `{}`",
+                bot.ship_id, reg.ship_id
+            )));
+        }
+        // The receiver will never be drained — drop it. `try_send`s into the sender will
+        // either succeed silently into the buffer or fail once it fills. Both are fine in
+        // replay mode.
+        drop(reg.outbound);
+        room.handle_event(RoomEvent::BotReady { bot_id: reg.bot_id });
+    }
+
+    let (start_tx, mut start_rx) = oneshot::channel();
+    room.handle_event(RoomEvent::OperatorStart {
+        room: header.room.clone(),
+        reply: start_tx,
+    });
+    start_rx
+        .try_recv()
+        .map_err(|_| ReplayError::Header("room dropped start reply".into()))?
+        .map_err(|e| ReplayError::Header(format!("start refused: {}", e.as_str())))?;
+
+    Ok(room)
+}
+
+/// Errors that can stop a replay run before it finishes.
+#[derive(Debug)]
+pub enum ReplayError {
+    Io(io::Error),
+    /// The header was missing, malformed, or referenced bots the rebuilt room couldn't
+    /// reproduce.
+    Header(String),
+    Version(u32),
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayError::Io(e) => write!(f, "io error: {e}"),
+            ReplayError::Header(msg) => write!(f, "replay header error: {msg}"),
+            ReplayError::Version(v) => write!(
+                f,
+                "unsupported replay format version {v}; expected {}",
+                REPLAY_FORMAT_VERSION
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+impl From<io::Error> for ReplayError {
+    fn from(e: io::Error) -> Self {
+        ReplayError::Io(e)
+    }
+}
+
+/// Drive a replay end-to-end: read the file, rebuild the room, then tick at the recorded
+/// `tick_hz` injecting commands and broadcasting spectator frames. Returns when the log
+/// is exhausted, the shutdown channel fires, or an error occurs.
+pub async fn run_replay(
+    path: PathBuf,
+    spec_tx: broadcast::Sender<SpectatorFrame>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> Result<(), ReplayError> {
+    let records = tokio::task::spawn_blocking(move || read_records(&path))
+        .await
+        .map_err(|e| ReplayError::Io(io::Error::other(format!("blocking read panicked: {e}"))))??;
+
+    let mut iter = records.into_iter();
+    let header = match iter.next() {
+        Some(ReplayRecord::Header(h)) => h,
+        Some(_) => {
+            return Err(ReplayError::Header(
+                "replay log does not begin with a header record".into(),
+            ))
+        }
+        None => return Err(ReplayError::Header("replay log is empty".into())),
+    };
+    if header.version != REPLAY_FORMAT_VERSION {
+        return Err(ReplayError::Version(header.version));
+    }
+
+    let tick_hz = header.tick_hz.max(1);
+    let mut room = tokio::task::spawn_blocking(move || rebuild_room_from_header(&header))
+        .await
+        .map_err(|e| ReplayError::Header(format!("rebuild room blocking task panicked: {e}")))??;
+    room.set_spectator_broadcast(spec_tx);
+
+    let period = Duration::from_secs_f64(1.0 / f64::from(tick_hz));
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    info!(tick_hz, "replay running");
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => {
+                info!("replay: shutdown signal received");
+                break;
+            }
+            _ = ticker.tick() => {
+                let next = iter.next();
+                match next {
+                    Some(ReplayRecord::Tick(rec)) => {
+                        for cmd in rec.commands {
+                            let pending = PendingCommand {
+                                tick: rec.tick,
+                                throttle: cmd.throttle,
+                                rudder: cmd.rudder,
+                                fire: cmd.fire,
+                                sensor_mode: cmd.sensor_mode,
+                            };
+                            room.inject_replay_command(&cmd.bot_id, pending);
+                        }
+                        // Step until we reach the recorded tick. Empty-command ticks were
+                        // not written by the writer (it skips records with no commands),
+                        // so we may need to advance multiple ticks per record.
+                        while room.world.tick < rec.tick {
+                            room.step_tick();
+                        }
+                    }
+                    Some(ReplayRecord::End(end)) => {
+                        // Run remaining ticks (if any) so the spectator sees the final
+                        // state at the same world.tick the live run reached.
+                        while room.world.tick < end.tick {
+                            room.step_tick();
+                        }
+                        info!(final_tick = end.tick, winner = ?end.winner, "replay finished");
+                        break;
+                    }
+                    Some(ReplayRecord::Header(_)) => {
+                        warn!("replay: stray header record mid-stream, ignored");
+                    }
+                    None => {
+                        info!("replay: log exhausted with no end record");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn sample_header() -> ReplayHeader {
+        ReplayHeader {
+            version: REPLAY_FORMAT_VERSION,
+            replay_id: "match_test_42".into(),
+            room: "test".into(),
+            seed: 42,
+            tick_hz: 10,
+            tick_deadline_ms: 80,
+            map: MapInfo {
+                width: 1000,
+                height: 1000,
+            },
+            max_bots: 4,
+            bots: vec![
+                ReplayBot {
+                    bot_id: "b_1".into(),
+                    ship_id: "s_1".into(),
+                    name: "alice".into(),
+                },
+                ReplayBot {
+                    bot_id: "b_2".into(),
+                    ship_id: "s_2".into(),
+                    name: "bob".into(),
+                },
+            ],
+        }
+    }
+
+    fn sample_tick() -> ReplayTick {
+        ReplayTick {
+            tick: 7,
+            commands: vec![
+                ReplayCommand {
+                    bot_id: "b_1".into(),
+                    throttle: 1.0,
+                    rudder: -0.25,
+                    sensor_mode: SensorMode::Active,
+                    fire: None,
+                },
+                ReplayCommand {
+                    bot_id: "b_2".into(),
+                    throttle: -0.5,
+                    rudder: 0.0,
+                    sensor_mode: SensorMode::Passive,
+                    fire: Some(FireCommand {
+                        bearing_deg: 90.0,
+                        range: 200.0,
+                    }),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn record_roundtrips() {
+        for rec in [
+            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Tick(sample_tick()),
+            ReplayRecord::End(ReplayEnd {
+                tick: 1843,
+                winner: Some("b_1".into()),
+            }),
+            ReplayRecord::End(ReplayEnd {
+                tick: 3000,
+                winner: None,
+            }),
+        ] {
+            let json = serde_json::to_string(&rec).expect("serialize");
+            let parsed: ReplayRecord = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(rec, parsed, "roundtrip mismatch: {json}");
+        }
+    }
+
+    #[test]
+    fn writer_emits_jsonl() {
+        let (mut writer, buf) = ReplayWriter::in_memory("match_test_0".into());
+        writer
+            .write(&ReplayRecord::Header(sample_header()))
+            .expect("write header");
+        writer
+            .write(&ReplayRecord::Tick(sample_tick()))
+            .expect("write tick");
+        writer
+            .write(&ReplayRecord::End(ReplayEnd {
+                tick: 9,
+                winner: None,
+            }))
+            .expect("write end");
+
+        let bytes = buf.lock().unwrap().clone();
+        let text = String::from_utf8(bytes).expect("utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Each line must be a valid `ReplayRecord` with the discriminator field intact.
+        for line in &lines {
+            assert!(line.contains("\"type\":"), "missing type tag: {line}");
+            let _: ReplayRecord = serde_json::from_str(line).expect("each line parses");
+        }
+    }
+
+    #[test]
+    fn read_records_from_skips_blank_lines() {
+        let text = format!(
+            "{}\n\n{}\n",
+            serde_json::to_string(&ReplayRecord::Header(sample_header())).unwrap(),
+            serde_json::to_string(&ReplayRecord::End(ReplayEnd {
+                tick: 1,
+                winner: None
+            }))
+            .unwrap()
+        );
+        let records = read_records_from(Cursor::new(text)).expect("read");
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn read_records_rejects_garbage() {
+        let text = "{\"type\":\"header\"}\nnot-json\n";
+        let err = read_records_from(Cursor::new(text)).expect_err("should error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn make_replay_id_starts_with_match_room() {
+        let id = make_replay_id("main");
+        assert!(id.starts_with("match_main_"), "got {id}");
+    }
+}

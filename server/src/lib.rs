@@ -5,5 +5,6 @@ pub mod config;
 pub mod control;
 pub mod net;
 pub mod protocol;
+pub mod replay;
 pub mod room;
 pub mod sim;

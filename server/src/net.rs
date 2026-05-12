@@ -644,7 +644,10 @@ fn resolve_static(path: &str) -> Option<(&'static str, &'static [u8])> {
     let path_only = path.split('?').next().unwrap_or(path);
     match path_only {
         "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML.as_bytes())),
-        "/render.js" => Some(("application/javascript; charset=utf-8", RENDER_JS.as_bytes())),
+        "/render.js" => Some((
+            "application/javascript; charset=utf-8",
+            RENDER_JS.as_bytes(),
+        )),
         "/style.css" => Some(("text/css; charset=utf-8", STYLE_CSS.as_bytes())),
         _ => None,
     }

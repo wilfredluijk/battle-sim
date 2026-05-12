@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use naval_server::{
     config::Config,
-    control, net,
+    control, net, replay,
     room::{self, Room, SpectatorFrame, ROOM_EVENT_BUFFER},
 };
 
@@ -47,17 +47,37 @@ async fn main() {
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
     let (spec_tx, _) = broadcast::channel::<SpectatorFrame>(SPECTATOR_BROADCAST_BUFFER);
 
-    let mut main_room = Room::new(
-        "main".into(),
-        config.map.0 as f32,
-        config.map.1 as f32,
-        config.seed,
-        config.tick_hz,
-        config.tick_deadline_ms,
-        config.max_bots,
-    );
-    main_room.set_spectator_broadcast(spec_tx.clone());
-    let room_handle = tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()));
+    let replay_path = config.replay.clone();
+
+    let room_handle = if let Some(path) = replay_path.as_ref() {
+        // Replay mode: drive a Room from a recorded JSONL log instead of accepting bot
+        // connections. The room_rx is dropped immediately so any /bot connections that
+        // sneak through fail-fast on registration.
+        info!(path = %path.display(), "starting in replay mode");
+        drop(room_rx);
+        let path = path.clone();
+        let spec_tx = spec_tx.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = replay::run_replay(path, spec_tx, shutdown_rx).await {
+                tracing::error!(error = %e, "replay failed");
+            }
+            0u64
+        })
+    } else {
+        let mut main_room = Room::new(
+            "main".into(),
+            config.map.0 as f32,
+            config.map.1 as f32,
+            config.seed,
+            config.tick_hz,
+            config.tick_deadline_ms,
+            config.max_bots,
+        );
+        main_room.set_spectator_broadcast(spec_tx.clone());
+        main_room.set_replay_dir(config.replay_dir.clone());
+        tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()))
+    };
 
     let net_handle = tokio::spawn(net::run(
         config.clone(),

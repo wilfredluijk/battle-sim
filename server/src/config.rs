@@ -31,6 +31,11 @@ pub struct Config {
     /// Directory where replay JSONL logs are written
     #[arg(long, default_value = "./replays")]
     pub replay_dir: PathBuf,
+
+    /// Replay an existing JSONL log instead of accepting bot connections. Spectators may
+    /// still connect; the room ticks at `--tick-hz` and broadcasts as if it were live.
+    #[arg(long, value_name = "FILE")]
+    pub replay: Option<PathBuf>,
 }
 
 fn parse_map_size(s: &str) -> Result<(u32, u32), String> {

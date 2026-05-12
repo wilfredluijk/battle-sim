@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,10 @@ use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
     MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, SpectatorEvent, SpectatorMsg,
     SpectatorShell, SpectatorShip, TickEvent,
+};
+use crate::replay::{
+    self, ReplayBot, ReplayCommand, ReplayEnd, ReplayHeader, ReplayRecord, ReplayTick,
+    ReplayWriter, REPLAY_FORMAT_VERSION,
 };
 use crate::sim::combat::{self, CombatEvent, FireError};
 use crate::sim::constants::{ACTIVE_RADAR_RANGE, PASSIVE_HEAR_NEARBY_RANGE};
@@ -162,6 +167,9 @@ pub struct Room {
     pub world: World,
     pub state: RoomState,
     pub rng: Pcg64,
+    /// Original seed used to construct `rng`. Stashed so the replay header can record it
+    /// (the Pcg64 itself doesn't expose its seed).
+    pub seed: u64,
     pub tick_hz: u32,
     pub tick_deadline_ms: u64,
     pub max_bots: u32,
@@ -183,6 +191,17 @@ pub struct Room {
     /// runtime in `main.rs` always wires a real channel. Send failures (no subscribers)
     /// are ignored — the simulation never blocks on the spectator UI.
     spectator_tx: Option<broadcast::Sender<SpectatorFrame>>,
+    /// Directory where replay JSONL files should be written. When set, `start_match`
+    /// opens a fresh writer and emits the header line; subsequent ticks append. `None`
+    /// in unit tests and in `--replay` mode.
+    replay_dir: Option<PathBuf>,
+    /// Active replay log writer. Open between `start_match` and `broadcast_game_over`.
+    /// In `--replay` mode this stays `None` — replay playback never writes a new log.
+    replay_writer: Option<ReplayWriter>,
+    /// Identifier for the current match. Generated at `start_match` time and reused both
+    /// for the replay filename and the `replay_id` field of `game_over` so a player who
+    /// just lost can find their log without grepping.
+    replay_id: Option<String>,
 }
 
 impl Room {
@@ -200,6 +219,7 @@ impl Room {
             world: World::new(width, height),
             state: RoomState::Lobby,
             rng: Pcg64::seed_from_u64(seed),
+            seed,
             tick_hz,
             tick_deadline_ms,
             max_bots,
@@ -209,6 +229,9 @@ impl Room {
             previous_active_pingers: BTreeSet::new(),
             starting_bot_count: 0,
             spectator_tx: None,
+            replay_dir: None,
+            replay_writer: None,
+            replay_id: None,
         }
     }
 
@@ -216,6 +239,36 @@ impl Room {
     /// `world` frame to every subscriber. Call this once at construction time.
     pub fn set_spectator_broadcast(&mut self, tx: broadcast::Sender<SpectatorFrame>) {
         self.spectator_tx = Some(tx);
+    }
+
+    /// Configure the directory where replay logs are written. Call before `start_match` —
+    /// the writer is opened on the lobby→running transition.
+    pub fn set_replay_dir(&mut self, dir: PathBuf) {
+        self.replay_dir = Some(dir);
+    }
+
+    /// Inject a pre-built `ReplayWriter` instead of opening one from `replay_dir`. Used
+    /// by tests to capture replay bytes in memory.
+    pub fn set_replay_writer(&mut self, writer: ReplayWriter) {
+        self.replay_id = Some(writer.replay_id().to_string());
+        self.replay_writer = Some(writer);
+    }
+
+    /// Take ownership of the active writer. Used by tests after a match to read back the
+    /// log; under normal operation the writer is dropped on `broadcast_game_over`.
+    pub fn take_replay_writer(&mut self) -> Option<ReplayWriter> {
+        self.replay_writer.take()
+    }
+
+    /// Bypass the late-command path and queue `command` for `bot_id` as if it had arrived
+    /// in time. Replay playback uses this to inject recorded commands without tripping the
+    /// deadline check; live mode goes through `RoomEvent::BotCommand` instead.
+    pub fn inject_replay_command(&mut self, bot_id: &BotId, command: PendingCommand) {
+        if let Some(entry) = self.bots.get_mut(bot_id) {
+            entry.pending_command = Some(command);
+        } else {
+            warn!(room = %self.name, bot = %bot_id, "replay command for unknown bot, dropped");
+        }
     }
 
     /// Number of bots currently registered (regardless of `ready` state).
@@ -251,6 +304,11 @@ impl Room {
 
         let bot_ids: Vec<BotId> = self.bots.keys().cloned().collect();
 
+        // Snapshot of commands actually applied this tick, in BotId order. Written to the
+        // replay log after the tick counter is bumped so the on-disk tick number matches
+        // the post-step world state.
+        let mut applied_commands: Vec<ReplayCommand> = Vec::new();
+
         // 1. Drain pending commands and apply them in BotId order. Fire processed after
         //    throttle/rudder so a successful shot is reflected in this tick's cooldown.
         for bot_id in &bot_ids {
@@ -279,6 +337,18 @@ impl Room {
                     self.send_fire_error(bot_id, err);
                 }
             }
+            // Record the raw command (un-clamped) so a replay re-applies the exact same
+            // input the live run saw. Clamping happens deterministically inside step_tick,
+            // so the post-clamp ship state will match.
+            if self.replay_writer.is_some() {
+                applied_commands.push(ReplayCommand {
+                    bot_id: bot_id.clone(),
+                    throttle: cmd.throttle,
+                    rudder: cmd.rudder,
+                    sensor_mode: cmd.sensor_mode,
+                    fire: cmd.fire,
+                });
+            }
         }
 
         // 2 + 3. Movement, then shell flight & splashes.
@@ -287,6 +357,11 @@ impl Room {
 
         // 4. Bump the tick counter so the outbound frames carry the new tick number.
         self.world.tick = self.world.tick.saturating_add(1);
+
+        // Persist the commands that drove this tick. Writing here (post-bump) means the
+        // recorded `tick` field equals the world tick the commands produced, which is the
+        // tick the bots received next time around.
+        self.write_replay_tick(applied_commands);
 
         // Spectator broadcast: full ground truth + every combat event. Done before the
         // end-of-match check so the deciding tick (with its death events) is visible.
@@ -483,12 +558,15 @@ impl Room {
     }
 
     /// Send `game_over` to every registered bot — alive or dead. The dead bots' channels
-    /// have been kept open precisely so they can receive this message.
-    fn broadcast_game_over(&self, winner: Option<BotId>) {
+    /// have been kept open precisely so they can receive this message. Also writes the
+    /// terminal `end` record to the replay log and drops the writer (which flushes the
+    /// underlying file).
+    fn broadcast_game_over(&mut self, winner: Option<BotId>) {
         let final_tick = self.world.tick;
-        // Replay IDs are properly assigned in Phase 8; for now use a tick-stamped name so
-        // the field is non-empty and unique within a session.
-        let replay_id = format!("match_{}_{}", self.name, final_tick);
+        let replay_id = self
+            .replay_id
+            .clone()
+            .unwrap_or_else(|| format!("match_{}_{}", self.name, final_tick));
         info!(
             room = %self.name,
             final_tick,
@@ -509,6 +587,29 @@ impl Room {
                     "game_over not delivered"
                 );
             }
+        }
+
+        // Close the replay log: write the terminal record, then drop the writer so the
+        // BufWriter flushes to disk.
+        if let Some(writer) = self.replay_writer.as_mut() {
+            let end = ReplayRecord::End(ReplayEnd {
+                tick: final_tick,
+                winner: winner.clone(),
+            });
+            if let Err(e) = writer.write(&end) {
+                warn!(room = %self.name, error = %e, "failed to write replay end record");
+            }
+        }
+        if let Some(writer) = self.replay_writer.take() {
+            if let Some(path) = writer.path() {
+                info!(
+                    room = %self.name,
+                    replay_id = %replay_id,
+                    path = %path.display(),
+                    "replay log closed"
+                );
+            }
+            drop(writer);
         }
     }
 
@@ -691,7 +792,97 @@ impl Room {
         self.previous_active_pingers.clear();
         self.starting_bot_count = self.bots.len() as u32;
         info!(room = %self.name, bots = self.bots.len(), "match started");
+
+        // Open a new replay log (unless a writer was injected externally — e.g. by tests)
+        // and emit the header. Failures here are logged but not fatal: the match runs even
+        // if we can't write the log.
+        self.open_replay_writer_if_configured();
+        self.write_replay_header();
         Ok(())
+    }
+
+    /// If `replay_dir` was set and no writer is yet open, generate a replay id and create
+    /// a `<dir>/<replay_id>.jsonl` writer. Errors are logged; the match continues without
+    /// a log on failure.
+    fn open_replay_writer_if_configured(&mut self) {
+        if self.replay_writer.is_some() {
+            return;
+        }
+        let Some(dir) = self.replay_dir.clone() else {
+            return;
+        };
+        let replay_id = replay::make_replay_id(&self.name);
+        match ReplayWriter::create_file(&dir, replay_id.clone()) {
+            Ok(writer) => {
+                if let Some(path) = writer.path() {
+                    info!(
+                        room = %self.name,
+                        replay_id = %replay_id,
+                        path = %path.display(),
+                        "replay log opened"
+                    );
+                }
+                self.replay_id = Some(replay_id);
+                self.replay_writer = Some(writer);
+            }
+            Err(e) => {
+                warn!(
+                    room = %self.name,
+                    dir = %dir.display(),
+                    error = %e,
+                    "failed to open replay writer"
+                );
+            }
+        }
+    }
+
+    /// Build and write the JSONL header from the current room/world state. No-op when no
+    /// writer is open.
+    fn write_replay_header(&mut self) {
+        let Some(writer) = self.replay_writer.as_mut() else {
+            return;
+        };
+        let header = ReplayHeader {
+            version: REPLAY_FORMAT_VERSION,
+            replay_id: writer.replay_id().to_string(),
+            room: self.name.clone(),
+            seed: self.seed,
+            tick_hz: self.tick_hz,
+            tick_deadline_ms: self.tick_deadline_ms,
+            map: MapInfo {
+                width: self.world.width as u32,
+                height: self.world.height as u32,
+            },
+            max_bots: self.max_bots,
+            bots: self
+                .bots
+                .values()
+                .map(|b| ReplayBot {
+                    bot_id: b.bot_id.clone(),
+                    ship_id: b.ship_id.clone(),
+                    name: b.name.clone(),
+                })
+                .collect(),
+        };
+        if let Err(e) = writer.write(&ReplayRecord::Header(header)) {
+            warn!(room = %self.name, error = %e, "failed to write replay header");
+        }
+    }
+
+    /// Append a `tick` record to the log. Skipped silently when no writer is open or no
+    /// commands fired this tick — empty-tick lines aren't useful and just inflate the log.
+    fn write_replay_tick(&mut self, commands: Vec<ReplayCommand>) {
+        if commands.is_empty() {
+            return;
+        }
+        let tick = self.world.tick;
+        let Some(writer) = self.replay_writer.as_mut() else {
+            return;
+        };
+        let record = ReplayRecord::Tick(ReplayTick { tick, commands });
+        if let Err(e) = writer.write(&record) {
+            warn!(room = %self.name, error = %e, "failed to write replay tick");
+        }
     }
 
     fn register_bot(
@@ -1812,8 +2003,7 @@ mod tests {
         room.step_tick();
 
         let frame = spec_rx.try_recv().expect("spectator frame published");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&frame).expect("frame is valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("frame is valid JSON");
         assert_eq!(parsed["type"], "world");
         assert_eq!(parsed["tick"], 1);
         let ships = parsed["ships"].as_array().expect("ships array");
