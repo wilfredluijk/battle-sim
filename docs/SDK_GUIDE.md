@@ -17,8 +17,9 @@ while you write your first bot.
 3. [What you see each tick](#what-you-see-each-tick)
 4. [How a match flows](#how-a-match-flows)
 5. [Coordinates, bearings, and units](#coordinates-bearings-and-units)
-6. [Common pitfalls](#common-pitfalls)
-7. [Versioning and compatibility](#versioning-and-compatibility)
+6. [Errors and how to react](#errors-and-how-to-react)
+7. [Common pitfalls](#common-pitfalls)
+8. [Versioning and compatibility](#versioning-and-compatibility)
 
 ---
 
@@ -249,6 +250,87 @@ lives in [`PROTOCOL.md`](PROTOCOL.md).
 The server's bearing convention is **not** the math-textbook one. Use
 your SDK's `bearing_to` / `bearingTo` helper rather than hand-rolling
 `atan2` — the helper returns the value the server expects.
+
+---
+
+## Errors and how to react
+
+Every time the server rejects something your bot did, it sends an
+`error` frame: a short `code` string and a human-readable `message`.
+Branch on `code` for behaviour, surface `message` for diagnostics.
+
+Your SDK exposes this via `on_error` / `onError`. The default
+implementation just logs the frame; override it only if you want
+custom counters, alerts, or to close the connection on a specific
+code. The complete list of codes is below, grouped by how the server
+treats them.
+
+### Gameplay errors — bot stays connected
+
+These mean "the game refused what you asked for." They are *not*
+protocol violations and don't count toward disconnection. Most bots
+can ignore them; you only need to handle them if your decision logic
+depends on whether a specific action took effect.
+
+| Code              | Trigger                                                                | Effect                                                              |
+|-------------------|------------------------------------------------------------------------|---------------------------------------------------------------------|
+| `late_command`    | Your `command` arrived after `deadline_ms` for that tick.              | Previous tick's throttle / rudder / sensor persist; no shot fires.  |
+| `stale_command`   | Your `command.tick` was outside `[world_tick − 1, world_tick + 1]`.    | The command is dropped entirely.                                    |
+| `cooldown_active` | You issued `fire` while the gun was still cooling down.                | Movement / sensor changes still apply; no shell spawns.             |
+| `no_ammo`         | You issued `fire` with an empty magazine.                              | Movement / sensor changes still apply; no shell spawns.             |
+
+`late_command` is the one to watch in development — if you see it
+under load, your tick handler is doing too much work or blocking on
+I/O. `cooldown_active` and `no_ammo` are easy to avoid by tracking
+`gun_cooldown_ticks` and `view.me.ammo` yourself before issuing
+`fire`.
+
+### Protocol violations — five strikes and you're out
+
+These mean "your message was malformed." The server replies with the
+error *and* bumps an internal violation counter. After **5
+violations** on a single connection, the server sends
+`too_many_violations` and closes the WebSocket with code
+`Policy (1008)`. The SDKs build every frame for you, so under normal
+use you'll never see these — they only fire if you're using the raw
+escape hatches (`raw_send` / `rawSend`) and producing malformed JSON.
+
+| Code                        | Trigger                                                                                                                          |
+|-----------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `malformed_json`            | The frame didn't parse as JSON.                                                                                                  |
+| `invalid_message`           | JSON parsed but didn't match any known schema, *or* you sent a non-`hello` frame before completing the handshake.                |
+| `non_finite_value`          | A float field (`throttle`, `rudder`, `bearing_deg`, `range`) was `NaN` or `±Infinity`.                                           |
+| `binary_frames_unsupported` | You sent a WebSocket binary frame. The `/bot` endpoint is text-only.                                                             |
+| `too_many_violations`       | The fifth violation on this connection. The server closes the WebSocket immediately after sending this; the SDK will not retry. |
+
+If you do see one, sanity-check the payload against
+[`PROTOCOL.md`](PROTOCOL.md).
+
+### Connection-lifecycle errors — connection dies immediately
+
+These can fire before or instead of a match. After sending the error
+the server closes the WebSocket with code `Policy (1008)`. The SDK
+does not auto-reconnect.
+
+| Code                | Trigger                                                                                            |
+|---------------------|----------------------------------------------------------------------------------------------------|
+| `handshake_timeout` | You connected but didn't send `hello` before the server's handshake deadline (5 s by default).     |
+| `invalid_name`      | `hello.name` was empty, longer than 32 bytes, or contained anything outside `[A-Za-z0-9 _-]`.      |
+
+Two more setup-time rejections surface differently — be aware so you
+don't go looking for codes that never arrive:
+
+- **Duplicate name.** If another live bot in the same room already
+  holds your `name`, the server rejects registration with
+  `invalid_message` (the `message` field carries the reason) and
+  closes the connection. Pick a different `name` argument to
+  `run` / `BotRunner.run` and retry.
+- **Per-IP connection cap.** If the server is configured with a
+  `--max-connections-per-ip` limit and your IP is at that cap, the
+  TCP stream is dropped *before* the WebSocket handshake. The bot
+  sees a connection-refused / immediate close with no error frame
+  at all. Wait for existing connections to drain, or ask the
+  operator to raise the cap.
 
 ---
 
