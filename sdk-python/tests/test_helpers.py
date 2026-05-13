@@ -2,7 +2,14 @@ import math
 
 import pytest
 
-from naval_sdk.helpers import bearing_to, distance, lead_target
+from naval_sdk.helpers import (
+    bearing_to,
+    clamp,
+    distance,
+    lead_target,
+    signed_bearing_delta,
+    wrap_bearing,
+)
 
 
 def test_distance_basic():
@@ -55,3 +62,26 @@ def test_lead_target_unreachable():
     # Target faster than shell, running directly away -> no solution.
     pred = lead_target((0.0, 0.0), (10.0, 0.0), (1000.0, 0.0), shell_speed=50.0)
     assert pred is None
+
+
+def test_wrap_bearing_normalizes_to_range():
+    assert wrap_bearing(0.0) == pytest.approx(0.0)
+    assert wrap_bearing(359.9) == pytest.approx(359.9)
+    assert wrap_bearing(360.0) == pytest.approx(0.0)
+    assert wrap_bearing(-90.0) == pytest.approx(270.0)
+    assert wrap_bearing(720.5) == pytest.approx(0.5)
+
+
+def test_signed_bearing_delta_short_path():
+    # Turning right from 350° to 10° is +20°, not -340°.
+    assert signed_bearing_delta(10.0, 350.0) == pytest.approx(20.0)
+    # Turning left from 10° to 350° is -20°.
+    assert signed_bearing_delta(350.0, 10.0) == pytest.approx(-20.0)
+    # 180° from any reference is +180 (canonical choice).
+    assert abs(signed_bearing_delta(180.0, 0.0)) == pytest.approx(180.0)
+
+
+def test_clamp():
+    assert clamp(5.0, 0.0, 10.0) == 5.0
+    assert clamp(-1.0, 0.0, 10.0) == 0.0
+    assert clamp(11.0, 0.0, 10.0) == 10.0

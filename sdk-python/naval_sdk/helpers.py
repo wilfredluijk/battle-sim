@@ -20,6 +20,33 @@ def distance(a: Point, b: Point) -> float:
     return math.hypot(dx, dy)
 
 
+def wrap_bearing(deg: float) -> float:
+    """Normalize a compass bearing to ``[0, 360)``."""
+    result = deg % 360.0
+    if result < 0.0:
+        result += 360.0
+    return result
+
+
+def signed_bearing_delta(target_deg: float, current_deg: float) -> float:
+    """Shortest signed turn from ``current_deg`` to ``target_deg``, in degrees.
+
+    Positive means turn clockwise (right rudder in this game's coordinate system).
+    Result is in ``(-180, 180]``.
+    """
+    delta = (target_deg - current_deg + 540.0) % 360.0 - 180.0
+    return delta
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    """Clamp ``value`` to the inclusive range ``[lo, hi]``."""
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+
 def bearing_to(from_pos: Point, to_pos: Point) -> float:
     """Compass bearing in degrees from `from_pos` to `to_pos`.
 

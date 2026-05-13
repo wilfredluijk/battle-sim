@@ -375,6 +375,10 @@ don't go looking for codes that never arrive:
 
 - [`PROTOCOL.md`](PROTOCOL.md) — wire protocol spec (frames, fields,
   error codes).
+- [`TACTICAL_TOOLKIT.md`](TACTICAL_TOOLKIT.md) — Python SDK opt-in
+  helpers for tracking, fire control, steering, sensors, and evasion,
+  plus a high-level `TacticalBot` you can subclass to write strategy
+  instead of plumbing.
 - [`../system-design.md`](../system-design.md) — full system design,
   trust model, replay semantics.
 - [`../sdk-python/README.md`](../sdk-python/README.md) — Python SDK.
