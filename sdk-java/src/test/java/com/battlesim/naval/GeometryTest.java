@@ -70,4 +70,28 @@ class GeometryTest {
                 Geometry.leadTarget(new Vec2(0, 0), new Vec2(10, 0), new Vec2(1000, 0), 50.0f);
         assertTrue(p.isEmpty());
     }
+
+    @Test
+    void wrapBearingNormalizesRange() {
+        assertEquals(0.0f, Geometry.wrapBearing(0.0f), EPS);
+        assertEquals(359.9f, Geometry.wrapBearing(359.9f), EPS);
+        assertEquals(0.0f, Geometry.wrapBearing(360.0f), EPS);
+        assertEquals(270.0f, Geometry.wrapBearing(-90.0f), EPS);
+        assertEquals(0.5f, Geometry.wrapBearing(720.5f), 1e-2);
+    }
+
+    @Test
+    void signedBearingDeltaShortPath() {
+        // Turning right from 350° to 10° is +20°, not -340°.
+        assertEquals(20.0f, Geometry.signedBearingDelta(10.0f, 350.0f), EPS);
+        assertEquals(-20.0f, Geometry.signedBearingDelta(350.0f, 10.0f), EPS);
+        assertEquals(180.0f, Math.abs(Geometry.signedBearingDelta(180.0f, 0.0f)), EPS);
+    }
+
+    @Test
+    void clamp() {
+        assertEquals(5.0f, Geometry.clamp(5.0f, 0.0f, 10.0f), EPS);
+        assertEquals(0.0f, Geometry.clamp(-1.0f, 0.0f, 10.0f), EPS);
+        assertEquals(10.0f, Geometry.clamp(11.0f, 0.0f, 10.0f), EPS);
+    }
 }

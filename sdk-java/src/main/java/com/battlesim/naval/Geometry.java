@@ -16,6 +16,31 @@ public final class Geometry {
         return a.distanceTo(b);
     }
 
+    /** Normalize a compass bearing to {@code [0, 360)}. */
+    public static float wrapBearing(float deg) {
+        float r = deg % 360.0f;
+        if (r < 0.0f) r += 360.0f;
+        return r;
+    }
+
+    /**
+     * Shortest signed turn from {@code currentDeg} to {@code targetDeg}, in degrees.
+     *
+     * <p>Positive means turn clockwise (right rudder in this game's coordinate
+     * system). Result is in {@code (-180, 180]}.
+     */
+    public static float signedBearingDelta(float targetDeg, float currentDeg) {
+        float d = ((targetDeg - currentDeg) % 360.0f + 540.0f) % 360.0f - 180.0f;
+        return d;
+    }
+
+    /** Clamp {@code value} to the inclusive range {@code [lo, hi]}. */
+    public static float clamp(float value, float lo, float hi) {
+        if (value < lo) return lo;
+        if (value > hi) return hi;
+        return value;
+    }
+
     /** Compass bearing in degrees from {@code from} to {@code to}, in {@code [0, 360)}. */
     public static float bearingTo(Vec2 from, Vec2 to) {
         float dx = to.x() - from.x();

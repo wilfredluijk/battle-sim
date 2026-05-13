@@ -7,6 +7,11 @@ Language-specific bot examples live in subfolders:
   - `tracking_bot.py`, `tactician_bot.py` — composed L2 tactical components
     (`Tracker`, `Gunner`, `Helm`, `Evader`, `SensorPolicy`).
   - `strategist_bot.py` — Layer 3 `TacticalBot` with a single `decide()` method.
-  - See [`../docs/TACTICAL_TOOLKIT.md`](../docs/TACTICAL_TOOLKIT.md) for the
-    layered SDK overview.
-- [`java`](java) — Java bots built on `sdk-java`.
+- [`java`](java) — Java bots built on `sdk-java`:
+  - `SimpleCircleBot` — bare protocol (Layer 0).
+  - `TrackingCircleBot`, `StrongTacticalBot` — composed L2 tactical
+    components (`Tracker`, `Gunner`, `Helm`, `Evader`, `SensorPolicy`).
+  - `StrategistBot` — Layer 3 `TacticalBot` with a single `decide()` method.
+
+See [`../docs/TACTICAL_TOOLKIT.md`](../docs/TACTICAL_TOOLKIT.md) for the
+layered SDK overview, which applies to both languages.

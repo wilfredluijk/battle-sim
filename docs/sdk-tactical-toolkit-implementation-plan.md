@@ -78,6 +78,27 @@ Companion to [`design-decisions/sdk-tactical-toolkit.md`](./design-decisions/sdk
 
 ## Out of scope (deferred)
 
-- Cross-language SDK port (TS/Rust). Revisit once the Python API has lived through one hackathon and stabilized.
 - Kalman-filter `Tracker` variant. Add only if EMA proves insufficient in practice.
 - Replay-analysis tooling. Belongs in a separate `tools/` effort, not the runtime SDK.
+
+---
+
+## Follow-up: Java SDK parity (completed)
+
+After landing the Python toolkit, the same shapes were ported to the Java
+SDK under `com.battlesim.naval.tactical` with identical default constants:
+
+- Geometry helpers (`signedBearingDelta`, `wrapBearing`, `clamp`) added to
+  `com.battlesim.naval.Geometry`.
+- L2 components ported as Java classes: `Tracker`, `Gunner`, `Helm`,
+  `SensorPolicy` (functional interface + four nested static
+  implementations), `Evader`.
+- L3 orchestrator ported as `TacticalBot` with `Intent` as a sealed
+  interface and record variants.
+- Mirrored test suite: 53 Java tests (was 16) covering each component and
+  an end-to-end synthetic-match harness.
+- Example bots rewritten: `TrackingCircleBot` (190 → 68 lines),
+  `StrongTacticalBot` (330 → 120 lines), new `StrategistBot` (~65 lines,
+  ~30 of tactical code).
+- `docs/TACTICAL_TOOLKIT.md` updated with a Python ↔ Java shape map so the
+  same document serves both languages.

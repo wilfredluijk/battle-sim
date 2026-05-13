@@ -1,8 +1,20 @@
-# Tactical Toolkit (Python SDK)
+# Tactical Toolkit
 
-Opt-in helpers in `naval_sdk.tactical` for bot authors who want to focus on
-*strategy* (when to engage, when to break off, what to prioritize) instead of
-the mechanics of contact tracking, lead calculation, steering, and evasion.
+Opt-in helpers for bot authors who want to focus on *strategy* (when to
+engage, when to break off, what to prioritize) instead of the mechanics of
+contact tracking, lead calculation, steering, and evasion.
+
+Available in both supported SDKs with the same shape:
+
+| Language | Package                            |
+|----------|------------------------------------|
+| Python   | `naval_sdk.tactical`               |
+| Java     | `com.battlesim.naval.tactical`     |
+
+This document uses Python in the code snippets for brevity; every type and
+method has a 1:1 Java equivalent under the package above. Java idioms
+(records vs. dataclasses, `Optional<T>` vs. nullable, sealed interfaces vs.
+tagged unions) are noted inline where they differ.
 
 Design rationale and trade-offs live in
 [`design-decisions/sdk-tactical-toolkit.md`](./design-decisions/sdk-tactical-toolkit.md);
@@ -265,4 +277,30 @@ determinism violation.
   base `Bot` class never went away.
 
 See `examples/python/` for one bot at each layer: `circle_bot.py` (L0),
-`tactician_bot.py` (L2), `strategist_bot.py` (L3).
+`tactician_bot.py` (L2), `strategist_bot.py` (L3). The Java examples in
+`examples/java/` mirror the same three layers: `SimpleCircleBot` (L0),
+`TrackingCircleBot`/`StrongTacticalBot` (L2), `StrategistBot` (L3).
+
+---
+
+## Java vs. Python: name and shape map
+
+The shapes are identical; only the naming and idioms differ.
+
+| Concept              | Python                                 | Java                                                       |
+|----------------------|----------------------------------------|------------------------------------------------------------|
+| Package              | `naval_sdk.tactical`                   | `com.battlesim.naval.tactical`                             |
+| Tracker              | `Tracker(specs, tick_hz, ...)`         | `new Tracker(specs, tickHz)` or `new Tracker(specs, tickHz, new Tracker.Config())` |
+| Track                | `Track` dataclass                      | `Track` class with getters (`track.pos()`, `track.vel()`, …) |
+| Gunner               | `Gunner(specs, ...)`, `solve(...) -> FireSolution \| None` | `new Gunner(specs)`, `solve(...) -> Optional<FireSolution>` |
+| Helm                 | `Helm(specs, ...)`                     | `new Helm(specs, helmConfig)`                              |
+| Helm result          | tuple `(throttle, rudder)`             | `Helm.Steering` record (`.throttle()`, `.rudder()`)        |
+| SensorPolicy         | `Protocol` (duck-typed)                | `@FunctionalInterface SensorPolicy`; built-ins as nested static classes (`SensorPolicy.AlwaysActive`, etc.) |
+| Evader               | `Evader(...)`, `update(view) -> Command \| None` | `new Evader(...)`, `update(view) -> Optional<Command>` |
+| Intent               | dataclass + factory classmethods       | sealed interface with records (`Intent.Engage`, `Intent.Patrol`, …) and `Intent.engage(...)`, etc. factories |
+| TacticalContext      | dataclass                              | record                                                      |
+| TacticalBot          | subclass and override `decide(ctx)`    | subclass and override `decide(ctx)`                        |
+
+The Java SDK keeps the same default constants (active gate `60.0`, passive
+bearing gate `20°`, velocity α `0.3`, velocity window `10`, staleness `40`
+ticks) so behaviour is consistent across languages.

@@ -114,6 +114,12 @@ mvn -q compile exec:java -Dexec.mainClass=com.example.ForwardBot
 room start main
 ```
 
+If you just want to ship a competitive bot fast, jump straight to the
+**tactical toolkit** ([`docs/TACTICAL_TOOLKIT.md`](../docs/TACTICAL_TOOLKIT.md)) —
+it provides opt-in `Tracker`/`Gunner`/`Helm`/`Evader` components and a
+high-level `TacticalBot` you can subclass with a single `decide()` method.
+The rest of this README documents the base, language-level API.
+
 A self-contained `ForwardBot.java` you can save and run as-is:
 
 ```java
