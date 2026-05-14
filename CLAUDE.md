@@ -56,7 +56,10 @@ server/         Rust binary. Cargo workspace root is here.
   src/control.rs    stdin command parser
 
 sdk-python/     Reference Python SDK
-spectator/      Static HTML/JS, served by the Rust server at /
+spectator/      Svelte + TypeScript + Vite app, built to spectator/dist/ and
+                baked into the server binary via `include_str!`. Served at /.
+                Pure logic lives under src/lib/ (unit-tested with Vitest);
+                Svelte components in src/components/ are thin glue.
 examples/       Example bots (circle_bot.py, chaser_bot.py, sniper_bot.py)
 docs/
   system-design.md   Full design doc — source of truth for architecture
@@ -89,7 +92,23 @@ pytest
 # Run an example bot against a local server
 python examples/chaser_bot.py --host localhost --port 7878 --name chaser
 
-# Spectator: just open spectator/index.html, or visit http://localhost:7878/
+# Spectator (Svelte / TS / Vite)
+cd spectator
+npm install                  # first time only
+npm run build                # emits dist/{index.html,index.js,index.css}
+                             #   — these are include_str!'d by the server, so
+                             #   you must rebuild the server crate after.
+npm test                     # vitest run — lib/ unit tests
+npm run dev                  # http://localhost:5173 with HMR.
+                             #   /spectate + /bot are proxied to ws://localhost:7878,
+                             #   so run `cargo run` in another terminal first.
+
+# Once the spectator is built, visit http://localhost:7878/ to view a match
+# via the server's static handler.
+
+# Containerised run (single command, no local Rust/Node needed)
+docker compose up --build    # builds the multi-stage image and serves on :7878.
+                             #   Replays land in ./replays/ via bind-mount.
 ```
 
 The server reads operator commands from stdin while running. Type `room list`, `room start main`, `quit`, etc. See `docs/system-design.md §3.3` for the full list.

@@ -12,6 +12,7 @@ Language-specific bot examples live in subfolders:
   - `TrackingCircleBot`, `StrongTacticalBot` — composed L2 tactical
     components (`Tracker`, `Gunner`, `Helm`, `Evader`, `SensorPolicy`).
   - `StrategistBot` — Layer 3 `TacticalBot` with a single `decide()` method.
+  - `AcousticShadowBot` — bespoke sound-first ambusher (bare protocol).
 
 See [`../docs/TACTICAL_TOOLKIT.md`](../docs/TACTICAL_TOOLKIT.md) for the
 layered SDK overview, which applies to both languages.

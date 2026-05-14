@@ -81,10 +81,15 @@ impl Drop for IpConnGuard {
 }
 
 /// Static spectator assets, embedded at compile time so the server has no runtime path
-/// dependency on the `spectator/` directory.
-static INDEX_HTML: &str = include_str!("../../spectator/index.html");
-static RENDER_JS: &str = include_str!("../../spectator/render.js");
-static STYLE_CSS: &str = include_str!("../../spectator/style.css");
+/// dependency on the `spectator/` directory. Reads from `spectator/dist/` — the Vite
+/// build output. Vite is configured to emit predictable filenames (`index.js`,
+/// `index.css`) so these `include_str!` paths stay stable; see `spectator/vite.config.ts`.
+/// Before the JS toolchain is wired up, `spectator/dist/` is seeded with the legacy
+/// `render.js` + `style.css`, so the existing `INDEX_JS` / `INDEX_CSS` constant names below
+/// resolve to those files until the migration's Svelte build replaces them.
+static INDEX_HTML: &str = include_str!("../../spectator/dist/index.html");
+static INDEX_JS: &str = include_str!("../../spectator/dist/index.js");
+static INDEX_CSS: &str = include_str!("../../spectator/dist/index.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Endpoint {
@@ -845,11 +850,11 @@ fn resolve_static(path: &str) -> Option<(&'static str, &'static [u8])> {
     let path_only = path.split('?').next().unwrap_or(path);
     match path_only {
         "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML.as_bytes())),
-        "/render.js" => Some((
+        "/index.js" => Some((
             "application/javascript; charset=utf-8",
-            RENDER_JS.as_bytes(),
+            INDEX_JS.as_bytes(),
         )),
-        "/style.css" => Some(("text/css; charset=utf-8", STYLE_CSS.as_bytes())),
+        "/index.css" => Some(("text/css; charset=utf-8", INDEX_CSS.as_bytes())),
         _ => None,
     }
 }
@@ -965,8 +970,8 @@ mod tests {
     fn static_routes() {
         assert!(resolve_static("/").is_some());
         assert!(resolve_static("/index.html").is_some());
-        assert!(resolve_static("/render.js").is_some());
-        assert!(resolve_static("/style.css").is_some());
+        assert!(resolve_static("/index.js").is_some());
+        assert!(resolve_static("/index.css").is_some());
         assert!(resolve_static("/etc/passwd").is_none());
         // Query strings are stripped before matching.
         assert!(resolve_static("/?cachebust=1").is_some());

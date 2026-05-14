@@ -12,21 +12,33 @@ protocol that bots speak lives in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ```
 server/         Rust binary — authoritative simulation, WebSocket server, replay log
-spectator/      Static HTML/JS canvas renderer (served by the Rust server at /)
+spectator/      Svelte + TypeScript + Vite app. Bundle is built to spectator/dist/
+                and baked into the server binary via `include_str!`.
 docs/           PROTOCOL.md and friends
+Dockerfile      Multi-stage build (node → rust → debian-slim) producing a
+                self-contained server image.
+docker-compose.yml  One-service compose for `docker compose up --build`.
 system-design.md  Architecture and gameplay reference
 ```
 
 ## Prerequisites
 
-- **Rust** 1.75+ (stable). Install via [rustup](https://rustup.rs/).
+- **Rust** 1.86+ (stable). Install via [rustup](https://rustup.rs/).
+- **Node** 20+ and **npm** for building the spectator (not needed if you use Docker).
 - A WebSocket-capable browser for the spectator UI (any modern Chromium / Firefox / Safari).
 - Optional: `wscat` (`npm i -g wscat`) for poking at the protocol by hand.
 
 ## Build and run the server
 
+The server embeds the spectator bundle at compile time, so the spectator must be
+built once before the first `cargo build`:
+
 ```bash
-cd server
+cd spectator
+npm install        # one-time
+npm run build      # emits dist/{index.html,index.js,index.css}
+
+cd ../server
 cargo run -- --port 7878 --tick-hz 10 --seed 42
 ```
 
@@ -36,6 +48,34 @@ list. The most useful one is `room start main`, which transitions the room
 from `Lobby` to `Running` once every connected bot has signaled `ready`.
 
 Type `quit` (or hit Ctrl-C) to shut down cleanly.
+
+### Or use Docker
+
+If you don't want to install Rust + Node locally, the compose file builds the
+whole stack (spectator → server) in a multi-stage image:
+
+```bash
+docker compose up --build
+```
+
+Server listens on `127.0.0.1:7878`; replays land in `./replays/` via a
+bind-mount. Stop with `docker compose down`.
+
+### Spectator dev loop
+
+For iterating on the spectator UI without rebuilding the Rust binary each time:
+
+```bash
+# terminal 1
+cd server
+cargo run -- --port 7878
+
+# terminal 2
+cd spectator
+npm run dev     # http://localhost:5173, HMR enabled, /spectate proxied to 7878
+```
+
+Run `npm test` for the Vitest unit tests against `src/lib/`.
 
 ### Server flags
 
