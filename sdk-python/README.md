@@ -75,6 +75,12 @@ python my_bot.py --host localhost --port 7878 --name kirk
 room start main
 ```
 
+If you just want to ship a competitive bot fast, jump straight to the
+**tactical toolkit** ([`docs/TACTICAL_TOOLKIT.md`](../docs/TACTICAL_TOOLKIT.md)) —
+it provides opt-in `Tracker`/`Gunner`/`Helm`/`Evader` components and a
+high-level `TacticalBot` you can subclass with a single `decide()` method.
+The rest of this README documents the base, language-level API.
+
 A skeleton `my_bot.py` you can save and run as-is:
 
 ```python
