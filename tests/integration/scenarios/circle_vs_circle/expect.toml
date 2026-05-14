@@ -1,0 +1,21 @@
+# Smoke-test assertions. Outcome-specific values (winner, exact final tick) are
+# intentionally omitted: this scenario only confirms the full stack ran to
+# completion and produced a well-formed log.
+seed = 42
+tick_hz = 200
+bots = ["circler-a", "circler-b"]
+
+require_end_record = true
+
+# At --max-ticks 300 the match ends at exactly tick 300 unless one bot dies
+# first. Either way the final tick lives in this window.
+min_final_tick = 50
+max_final_tick = 300
+
+# Each bot issues a command every tick once the match starts, so we expect at
+# least a couple of hundred tick records in 300 ticks.
+min_tick_records = 50
+
+# Both bots fire on cooldown — across 300 ticks at 15-tick cooldown each, expect
+# well over a dozen shots fired.
+min_fire_commands = 10

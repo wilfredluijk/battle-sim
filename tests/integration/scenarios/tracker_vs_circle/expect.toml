@@ -1,0 +1,14 @@
+# Tracker vs. circle. The matchup is asymmetric so combat assertions are
+# meaningful, but the exact winner depends on balance tuning — we only assert
+# that the match concluded and that shots were exchanged.
+seed = 7
+tick_hz = 200
+bots = ["tracker", "circler"]
+
+require_end_record = true
+
+min_final_tick = 20
+max_final_tick = 600
+
+min_tick_records = 50
+min_fire_commands = 5

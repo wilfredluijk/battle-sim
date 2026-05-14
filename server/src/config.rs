@@ -52,6 +52,18 @@ pub struct Config {
     /// over the network.
     #[arg(long, default_value_t = false)]
     pub tournament: bool,
+
+    /// Override the default 3000-tick match timeout. Used by integration tests so a
+    /// scenario can declare "run N ticks and stop" instead of waiting for the standard
+    /// match cap. The simulation is unchanged; only the end condition shifts.
+    #[arg(long, value_name = "N")]
+    pub max_ticks: Option<u64>,
+
+    /// Start the match automatically once `--max-bots` bots are connected and `ready`,
+    /// skipping the `room start` operator command. Designed for headless / scripted runs
+    /// where there is no human at the stdin prompt.
+    #[arg(long, default_value_t = false)]
+    pub auto_start: bool,
 }
 
 fn parse_map_size(s: &str) -> Result<(u32, u32), String> {

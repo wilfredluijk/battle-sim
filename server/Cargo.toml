@@ -17,6 +17,15 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 httparse = "1"
+toml = "0.8"
+
+[[bin]]
+name = "naval-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "validate-replay"
+path = "src/bin/validate_replay.rs"
 
 [profile.release]
 opt-level = 3

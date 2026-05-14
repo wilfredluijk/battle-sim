@@ -48,7 +48,7 @@ async fn start_server_with(tick_hz: u32, tick_deadline_ms: u64) -> ServerHandle 
         config.tick_deadline_ms,
         config.max_bots,
     );
-    tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe()));
+    tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe(), false));
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
     tokio::spawn(net::run(config, room_tx.clone(), spec_tx, shutdown_rx_net));
 

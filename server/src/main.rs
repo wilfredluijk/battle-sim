@@ -24,8 +24,7 @@ const BANNER: &str = r#"
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -76,7 +75,13 @@ async fn main() {
         );
         main_room.set_spectator_broadcast(spec_tx.clone());
         main_room.set_replay_dir(config.replay_dir.clone());
-        tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()))
+        main_room.set_max_ticks(config.max_ticks);
+        tokio::spawn(room::run_room(
+            main_room,
+            room_rx,
+            shutdown_tx.subscribe(),
+            config.auto_start,
+        ))
     };
 
     let net_handle = tokio::spawn(net::run(

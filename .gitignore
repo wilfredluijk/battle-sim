@@ -2,3 +2,4 @@
 /sdk-java/target/
 /examples/*/target/
 /server/replays/
+/tests/integration/scenarios/*/replays/

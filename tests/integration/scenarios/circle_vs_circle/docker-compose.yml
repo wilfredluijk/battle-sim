@@ -1,0 +1,58 @@
+# Two circle bots with different seeds. Neither aims, so the match is mostly
+# Brownian gunfire — used as a smoke test that the server, both Python clients,
+# the replay log, and the validator all line up end-to-end.
+#
+# Notes:
+# - --tick-hz 200 runs the sim at ~20x real-time so a 300-tick match finishes
+#   in ~1.5s wall-clock instead of 30s.
+# - --max-ticks 300 caps the match; the room ends naturally at tick 300 and
+#   writes the terminal `end` record.
+# - --auto-start removes the need for an operator to type `room start main`.
+
+services:
+  server:
+    image: battlesim/server:test
+    build:
+      context: ../../../server
+      dockerfile: Dockerfile
+    command:
+      - --port=7878
+      - --seed=42
+      - --tick-hz=200
+      - --max-bots=2
+      - --max-ticks=300
+      - --auto-start
+    volumes:
+      - ./replays:/app/replays
+    networks: [match]
+
+  bot_a:
+    image: battlesim/bot-python:test
+    build:
+      context: ../../..
+      dockerfile: sdk-python/Dockerfile
+    environment:
+      BOT_HOST: server
+      BOT_PORT: "7878"
+      BOT_NAME: circler-a
+      BOT_SCRIPT: circle_bot.py
+      BOT_SEED: "1"
+    depends_on: [server]
+    networks: [match]
+
+  bot_b:
+    image: battlesim/bot-python:test
+    build:
+      context: ../../..
+      dockerfile: sdk-python/Dockerfile
+    environment:
+      BOT_HOST: server
+      BOT_PORT: "7878"
+      BOT_NAME: circler-b
+      BOT_SCRIPT: circle_bot.py
+      BOT_SEED: "2"
+    depends_on: [server]
+    networks: [match]
+
+networks:
+  match: {}

@@ -215,6 +215,10 @@ pub struct Room {
     /// for the replay filename and the `replay_id` field of `game_over` so a player who
     /// just lost can find their log without grepping.
     replay_id: Option<String>,
+    /// Override for the default `MATCH_TIMEOUT_TICKS` cap. `None` means use the default.
+    /// Lowering this is how integration scenarios bound a run's wall-clock length without
+    /// changing physics behavior.
+    max_ticks: Option<u64>,
 }
 
 impl Room {
@@ -245,7 +249,13 @@ impl Room {
             replay_dir: None,
             replay_writer: None,
             replay_id: None,
+            max_ticks: None,
         }
+    }
+
+    /// Override the default match tick cap. `None` reverts to `MATCH_TIMEOUT_TICKS`.
+    pub fn set_max_ticks(&mut self, max_ticks: Option<u64>) {
+        self.max_ticks = max_ticks;
     }
 
     /// Wire a spectator broadcast channel. Subsequent `step_tick` calls will publish a
@@ -480,7 +490,8 @@ impl Room {
         if self.starting_bot_count >= 2 && alive.len() <= 1 {
             return Some(alive.first().map(|s| s.bot_id.clone()));
         }
-        if self.world.tick >= MATCH_TIMEOUT_TICKS {
+        let tick_cap = self.max_ticks.unwrap_or(MATCH_TIMEOUT_TICKS);
+        if self.world.tick >= tick_cap {
             // BTreeMap iteration is BotId-stable, so `max_by_key` deterministically
             // resolves further ties by BotId order (later wins).
             let winner = alive
@@ -643,6 +654,39 @@ impl Room {
         }
     }
 
+    /// Write a terminal `end` record if a replay log is still open. Called when the room
+    /// is torn down by shutdown rather than a natural match end, so the on-disk JSONL is
+    /// well-formed for downstream validators. `winner` is `None` because there was no
+    /// `match_outcome` resolution — the run was cut short.
+    pub fn finalize_replay_if_running(&mut self) {
+        if self.state != RoomState::Running {
+            return;
+        }
+        let final_tick = self.world.tick;
+        if let Some(writer) = self.replay_writer.as_mut() {
+            let end = ReplayRecord::End(ReplayEnd {
+                tick: final_tick,
+                winner: None,
+            });
+            if let Err(e) = writer.write(&end) {
+                warn!(room = %self.name, error = %e, "failed to write replay end on shutdown");
+            }
+        }
+        // Drop the writer so the BufWriter flushes to disk.
+        if let Some(writer) = self.replay_writer.take() {
+            if let Some(path) = writer.path() {
+                info!(
+                    room = %self.name,
+                    final_tick,
+                    path = %path.display(),
+                    "replay log closed on shutdown"
+                );
+            }
+            drop(writer);
+        }
+        self.state = RoomState::Ended;
+    }
+
     /// Translate a `FireError` into a protocol error and queue it on the bot's outbound
     /// channel. `ShipDead` and `UnknownShip` are silent — the bot already received (or
     /// is about to receive) `game_over`; spamming an error message would be noise.
@@ -801,7 +845,11 @@ impl Room {
         }
 
         entry.pending_command = Some(command);
-        record_command_tick(&mut entry.command_ticks, world_tick, u64::from(self.tick_hz));
+        record_command_tick(
+            &mut entry.command_ticks,
+            world_tick,
+            u64::from(self.tick_hz),
+        );
     }
 
     /// Operator-triggered transition `Lobby` → `Running`. Places ships on the §5.6 ring
@@ -1123,29 +1171,54 @@ fn compass_deg_facing(from: Vec2, to: Vec2) -> f32 {
 
 /// Drive a room's tick loop until the shutdown channel fires. Consumes `RoomEvent`s
 /// from `event_rx` between ticks; events are applied in arrival order.
+///
+/// When `auto_start` is true, the room transitions to `Running` as soon as `max_bots`
+/// bots are connected and every one is `ready` — no operator command required. The room
+/// also self-terminates once `state == Ended`, so a scripted scenario reaches a clean
+/// shutdown without an external `quit` signal.
 pub async fn run_room(
     mut room: Room,
     mut event_rx: mpsc::Receiver<RoomEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    auto_start: bool,
 ) -> u64 {
     let period = Duration::from_secs_f64(1.0 / f64::from(room.tick_hz.max(1)));
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let name = room.name.clone();
-    info!(room = %name, tick_hz = room.tick_hz, "room started");
+    let target_bots = room.max_bots;
+    info!(room = %name, tick_hz = room.tick_hz, auto_start, "room started");
 
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!(room = %name, final_tick = room.world.tick, "room: shutdown");
+                // If the match was still running, close the replay log so the validator
+                // sees a terminal `end` record instead of a truncated file.
+                room.finalize_replay_if_running();
                 break;
             }
             Some(event) = event_rx.recv() => {
                 room.handle_event(event);
+                if auto_start
+                    && room.state == RoomState::Lobby
+                    && room.bot_count() as u32 >= target_bots
+                    && room.all_ready()
+                {
+                    let (tx, _rx) = oneshot::channel();
+                    room.handle_event(RoomEvent::OperatorStart {
+                        room: name.clone(),
+                        reply: tx,
+                    });
+                }
             }
             _ = ticker.tick() => {
                 room.step_tick();
                 debug!(room = %name, tick = room.world.tick, state = ?room.state, "tick");
+                if room.state == RoomState::Ended {
+                    info!(room = %name, final_tick = room.world.tick, "room: match ended, stopping");
+                    break;
+                }
             }
         }
     }
@@ -2190,7 +2263,10 @@ mod tests {
         // New observability fields land in every frame.
         assert!(ships[0]["speed"].is_number(), "speed missing from frame");
         assert!(ships[0]["ammo"].is_number(), "ammo missing from frame");
-        assert!(ships[0]["throttle"].is_number(), "throttle missing from frame");
+        assert!(
+            ships[0]["throttle"].is_number(),
+            "throttle missing from frame"
+        );
         assert!(ships[0]["rudder"].is_number(), "rudder missing from frame");
         assert_eq!(ships[0]["ready"], true);
         // We accepted one command this second, so cps is at least 1.

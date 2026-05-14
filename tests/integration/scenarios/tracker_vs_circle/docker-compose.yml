@@ -1,0 +1,51 @@
+# A tracking bot vs. a circle bot. The tracker actively aims at contacts; the
+# circle bot just sprays. We expect non-trivial combat — the assertion file
+# requires at least some fire commands but does not pin a winner, since the
+# matchup outcome may shift with simulation tuning.
+
+services:
+  server:
+    image: battlesim/server:test
+    build:
+      context: ../../../server
+      dockerfile: Dockerfile
+    command:
+      - --port=7878
+      - --seed=7
+      - --tick-hz=200
+      - --max-bots=2
+      - --max-ticks=600
+      - --auto-start
+    volumes:
+      - ./replays:/app/replays
+    networks: [match]
+
+  tracker:
+    image: battlesim/bot-python:test
+    build:
+      context: ../../..
+      dockerfile: sdk-python/Dockerfile
+    environment:
+      BOT_HOST: server
+      BOT_PORT: "7878"
+      BOT_NAME: tracker
+      BOT_SCRIPT: tracking_bot.py
+    depends_on: [server]
+    networks: [match]
+
+  circler:
+    image: battlesim/bot-python:test
+    build:
+      context: ../../..
+      dockerfile: sdk-python/Dockerfile
+    environment:
+      BOT_HOST: server
+      BOT_PORT: "7878"
+      BOT_NAME: circler
+      BOT_SCRIPT: circle_bot.py
+      BOT_SEED: "3"
+    depends_on: [server]
+    networks: [match]
+
+networks:
+  match: {}
