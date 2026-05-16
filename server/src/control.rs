@@ -49,19 +49,34 @@ pub async fn run(shutdown_tx: broadcast::Sender<()>, room_tx: mpsc::Sender<RoomE
                 println!(
                     "  room start <name>       transition the named room from lobby to running"
                 );
+                println!("  room abort              force-end the running match (no winner)");
+                println!("  room reset              return the room to lobby (only when ended)");
+                println!("  room kick <bot_id>      disconnect a bot by id");
                 println!("  room list               (not yet implemented)");
-                println!("  room abort <name>       (not yet implemented)");
-                println!("  room kick <name> <bot>  (not yet implemented)");
                 println!("  seed <value>            (not yet implemented)");
+                println!();
+                println!("  Note: the same actions are exposed over the WS /admin endpoint;");
+                println!("        see the admin token printed at server start.");
             }
             "room" => match rest.as_slice() {
                 ["start", name] => {
                     handle_room_start(&room_tx, name).await;
                 }
-                ["list"] | ["abort", _] | ["kick", _, _] => {
-                    info!(args = ?rest, "control: room command (not implemented yet)");
+                ["abort"] => {
+                    handle_room_abort(&room_tx).await;
                 }
-                _ => warn!("usage: room start <name>"),
+                ["reset"] => {
+                    handle_room_reset(&room_tx).await;
+                }
+                ["kick", bot_id] => {
+                    handle_room_kick(&room_tx, bot_id).await;
+                }
+                ["list"] => {
+                    info!(args = ?rest, "control: room list (not implemented yet)");
+                }
+                _ => {
+                    warn!("usage: room start <name> | room abort | room reset | room kick <bot_id>")
+                }
             },
             "seed" => {
                 info!(args = ?rest, "control: seed command (not implemented yet)");
@@ -92,5 +107,59 @@ async fn handle_room_start(room_tx: &mpsc::Sender<RoomEvent>, name: &str) {
         Ok(Ok(())) => println!("room `{name}` started"),
         Ok(Err(e)) => println!("room `{name}` start refused: {}", e.as_str()),
         Err(_) => warn!(room = name, "control: room dropped start reply"),
+    }
+}
+
+async fn handle_room_abort(room_tx: &mpsc::Sender<RoomEvent>) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if room_tx
+        .send(RoomEvent::OperatorAbort { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        warn!("control: room channel closed; cannot abort");
+        return;
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => println!("match aborted"),
+        Ok(Err(e)) => println!("abort refused: {}", e.as_str()),
+        Err(_) => warn!("control: room dropped abort reply"),
+    }
+}
+
+async fn handle_room_reset(room_tx: &mpsc::Sender<RoomEvent>) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if room_tx
+        .send(RoomEvent::OperatorReset { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        warn!("control: room channel closed; cannot reset");
+        return;
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => println!("room returned to lobby"),
+        Ok(Err(e)) => println!("reset refused: {}", e.as_str()),
+        Err(_) => warn!("control: room dropped reset reply"),
+    }
+}
+
+async fn handle_room_kick(room_tx: &mpsc::Sender<RoomEvent>, bot_id: &str) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if room_tx
+        .send(RoomEvent::OperatorKick {
+            bot_id: bot_id.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        warn!(bot = bot_id, "control: room channel closed; cannot kick");
+        return;
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => println!("kicked bot `{bot_id}`"),
+        Ok(Err(e)) => println!("kick refused: {}", e.as_str()),
+        Err(_) => warn!(bot = bot_id, "control: room dropped kick reply"),
     }
 }

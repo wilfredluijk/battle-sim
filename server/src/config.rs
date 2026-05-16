@@ -52,6 +52,12 @@ pub struct Config {
     /// over the network.
     #[arg(long, default_value_t = false)]
     pub tournament: bool,
+
+    /// Admin token required to authenticate to the `/admin` WebSocket. When omitted, the
+    /// server generates a fresh random token at startup and logs it once at INFO. Provide
+    /// a fixed value for tests / scripted runs.
+    #[arg(long, value_name = "TOKEN")]
+    pub admin_token: Option<String>,
 }
 
 fn parse_map_size(s: &str) -> Result<(u32, u32), String> {

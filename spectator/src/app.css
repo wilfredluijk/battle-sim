@@ -189,9 +189,24 @@ h2 {
 
 .bot-header {
   display: grid;
-  grid-template-columns: 10px 1fr auto;
+  grid-template-columns: 10px 1fr auto auto;
   align-items: center;
   gap: 8px;
+}
+.bot-kick {
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  background: rgba(239, 107, 107, 0.12);
+  color: var(--bad);
+  border: 1px solid rgba(239, 107, 107, 0.4);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.bot-kick:hover {
+  background: rgba(239, 107, 107, 0.22);
 }
 .bot-swatch {
   width: 10px;
@@ -323,4 +338,72 @@ h2 {
 }
 .events li:last-child {
   border-bottom: none;
+}
+
+/* ----- Admin panel (Topbar inline) ----- */
+.admin-panel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.admin-token-input {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  width: 160px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ink);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+}
+.admin-token-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.admin-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+.admin-badge-lobby {
+  color: var(--accent);
+  border-color: rgba(108, 177, 255, 0.4);
+  background: rgba(108, 177, 255, 0.1);
+}
+.admin-badge-running {
+  color: var(--good);
+  border-color: rgba(88, 214, 141, 0.4);
+  background: rgba(88, 214, 141, 0.1);
+}
+.admin-badge-ended {
+  color: var(--ink-muted);
+  border-color: var(--panel-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+.admin-winner {
+  font-size: 11px;
+  color: var(--good);
+}
+.admin-rejected {
+  font-size: 11px;
+  color: var(--bad);
+}
+.admin-connecting {
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+.admin-disconnect {
+  border-color: rgba(239, 107, 107, 0.35);
+  color: var(--bad);
+  background: rgba(239, 107, 107, 0.08);
+}
+.admin-disconnect:hover {
+  background: rgba(239, 107, 107, 0.18);
+}
+.topbar-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }

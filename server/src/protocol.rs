@@ -76,6 +76,13 @@ pub enum ServerMsg {
         final_tick: u64,
         replay_id: String,
     },
+    /// Emitted by the room when it transitions back to the lobby after a match. Bots
+    /// that wish to participate in the next match should re-send `ready`. `tick` is
+    /// always `0` and is included only to give the message a numeric field for parity
+    /// with `GameStart`.
+    Lobby {
+        tick: u64,
+    },
     Error {
         code: String,
         message: String,

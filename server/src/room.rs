@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::admin::{AdminBotInfo, AdminServerMsg, AdminState};
 use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
     MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, SpectatorEvent, SpectatorMsg,
@@ -51,6 +52,13 @@ const STARTING_RING_RADIUS: f32 = 400.0;
 /// Hard match timeout per §5.5. After this many ticks the room ends regardless of how
 /// many ships are alive; the highest-HP survivor (tie-break: highest remaining ammo) wins.
 const MATCH_TIMEOUT_TICKS: u64 = 3000;
+
+/// Ticks the room stays in `Ended` before auto-returning to `Lobby` after a match. At the
+/// default `tick_hz = 10` this is ~2 seconds — long enough for the spectator UI to show
+/// the final frame and the winner banner, short enough that the operator doesn't have to
+/// click "Reset" between every match. Bots see this gap as silence between the `game_over`
+/// frame and the next `lobby` frame.
+pub const POST_GAME_LOBBY_TICKS: u64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomState {
@@ -146,6 +154,48 @@ impl StartError {
     }
 }
 
+/// Reasons an `OperatorAbort` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortError {
+    NotRunning,
+}
+
+impl AbortError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AbortError::NotRunning => "room is not running",
+        }
+    }
+}
+
+/// Reasons an `OperatorReset` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResetError {
+    NotEnded,
+}
+
+impl ResetError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResetError::NotEnded => "room is not in ended state",
+        }
+    }
+}
+
+/// Reasons an `OperatorKick` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KickError {
+    UnknownBot,
+}
+
+impl KickError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KickError::UnknownBot => "no bot with that id",
+        }
+    }
+}
+
 /// Events the room consumes from connection tasks and the operator. The room is
 /// single-threaded with respect to its own state; this channel serializes all mutations.
 #[derive(Debug)]
@@ -171,6 +221,28 @@ pub enum RoomEvent {
     OperatorStart {
         room: String,
         reply: oneshot::Sender<Result<(), StartError>>,
+    },
+    /// Operator-issued abort. Forces an ongoing match to end with no winner. The room
+    /// then auto-returns to `Lobby` after the usual post-game pause.
+    OperatorAbort {
+        reply: oneshot::Sender<Result<(), AbortError>>,
+    },
+    /// Operator-issued reset. Only valid in `Ended`; cuts the post-game pause short and
+    /// returns the room to `Lobby` immediately.
+    OperatorReset {
+        reply: oneshot::Sender<Result<(), ResetError>>,
+    },
+    /// Operator-issued kick. Removes a bot from the room. The bot's connection task
+    /// observes its outbound channel close and exits cleanly.
+    OperatorKick {
+        bot_id: BotId,
+        reply: oneshot::Sender<Result<(), KickError>>,
+    },
+    /// Admin client subscribed to room-state pushes. The room replies with a fresh
+    /// `broadcast::Receiver` and immediately publishes the current snapshot so the new
+    /// receiver's first frame is the state.
+    AdminSubscribe {
+        reply: oneshot::Sender<broadcast::Receiver<AdminServerMsg>>,
     },
 }
 
@@ -215,6 +287,18 @@ pub struct Room {
     /// for the replay filename and the `replay_id` field of `game_over` so a player who
     /// just lost can find their log without grepping.
     replay_id: Option<String>,
+    /// `world.tick` at which the most recent match ended. Drives the deterministic
+    /// `Ended → Lobby` countdown in `step_tick`. `None` while the room has never run, or
+    /// after a successful transition back to `Lobby`.
+    end_tick: Option<u64>,
+    /// Winner of the most recent match, or `None` for a draw / aborted match. Surfaced to
+    /// admin clients via `AdminState.last_winner` so the UI can show the result during the
+    /// post-game pause and on Lobby afterwards.
+    last_winner: Option<BotId>,
+    /// Optional broadcast sender for admin state pushes. `None` in unit tests; the
+    /// runtime in `main.rs` wires a real channel. Receivers are added via
+    /// `RoomEvent::AdminSubscribe`.
+    admin_tx: Option<broadcast::Sender<AdminServerMsg>>,
 }
 
 impl Room {
@@ -245,7 +329,17 @@ impl Room {
             replay_dir: None,
             replay_writer: None,
             replay_id: None,
+            end_tick: None,
+            last_winner: None,
+            admin_tx: None,
         }
+    }
+
+    /// Wire an admin broadcast channel. `AdminSubscribe` events return clones of this
+    /// sender's receiver; lifecycle transitions publish through it. Call once at
+    /// construction time.
+    pub fn set_admin_broadcast(&mut self, tx: broadcast::Sender<AdminServerMsg>) {
+        self.admin_tx = Some(tx);
     }
 
     /// Wire a spectator broadcast channel. Subsequent `step_tick` calls will publish a
@@ -311,6 +405,19 @@ impl Room {
     ///    sensor-filtered combat events.
     /// 7. Snapshot the now-current `Active` pingers for use by next tick's passives.
     pub fn step_tick(&mut self) {
+        // Post-game pause: after a match ends the room stays in `Ended` for
+        // `POST_GAME_LOBBY_TICKS` so the spectator UI can show the final frame and bots
+        // can react to `game_over`. Once the gap elapses, transition back to `Lobby` and
+        // notify bots so they can rearm for the next match.
+        if self.state == RoomState::Ended {
+            if let Some(end_tick) = self.end_tick {
+                if self.world.tick.saturating_sub(end_tick) >= POST_GAME_LOBBY_TICKS {
+                    self.transition_to_lobby();
+                    self.publish_admin_state();
+                }
+            }
+        }
+
         if self.state != RoomState::Running {
             self.world.tick = self.world.tick.saturating_add(1);
             // Spectators still see the lobby/ended state — full ground truth, no events.
@@ -388,7 +495,10 @@ impl Room {
         //    `tick` frame is sent for the deciding tick.
         if let Some(winner) = self.match_outcome() {
             self.state = RoomState::Ended;
+            self.end_tick = Some(self.world.tick);
+            self.last_winner = winner.clone();
             self.broadcast_game_over(winner);
+            self.publish_admin_state();
             return;
         }
 
@@ -587,6 +697,130 @@ impl Room {
         let _ = tx.send(Arc::new(json));
     }
 
+    /// Operator-triggered abort. Force-ends a running match with no winner and starts
+    /// the post-game pause; the room will auto-return to `Lobby` after
+    /// `POST_GAME_LOBBY_TICKS` ticks, identical to a natural match end.
+    fn abort_match(&mut self) -> Result<(), AbortError> {
+        if self.state != RoomState::Running {
+            return Err(AbortError::NotRunning);
+        }
+        info!(room = %self.name, tick = self.world.tick, "match aborted by operator");
+        self.state = RoomState::Ended;
+        self.end_tick = Some(self.world.tick);
+        self.last_winner = None;
+        self.broadcast_game_over(None);
+        Ok(())
+    }
+
+    /// Operator-triggered reset. Only valid in `Ended`; cuts the post-game pause short
+    /// and returns to `Lobby` immediately so the operator can start the next match
+    /// without waiting out the timer.
+    fn reset_to_lobby(&mut self) -> Result<(), ResetError> {
+        if self.state != RoomState::Ended {
+            return Err(ResetError::NotEnded);
+        }
+        self.transition_to_lobby();
+        Ok(())
+    }
+
+    /// Return the room to `Lobby` after a match. Clears world state (shells, ship damage
+    /// and motion), clears per-bot `ready` flags, reseeds the RNG so the next match is
+    /// deterministic from the same `seed`, and broadcasts `ServerMsg::Lobby` to every
+    /// bot so SDKs can rearm.
+    fn transition_to_lobby(&mut self) {
+        info!(room = %self.name, "returning to lobby for next match");
+        let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
+        self.world.tick = 0;
+        self.world.shells.clear();
+        self.world.next_shell_index = 0;
+        for entry in self.bots.values_mut() {
+            if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
+                ship.reset_for_round(center, 0.0);
+            }
+            entry.ready = false;
+            entry.pending_command = None;
+            entry.sensor_mode = SensorMode::Passive;
+            entry.last_fire_error_tick = None;
+            entry.command_ticks.clear();
+        }
+        self.tick_send_time = None;
+        self.previous_active_pingers.clear();
+        self.starting_bot_count = 0;
+        self.end_tick = None;
+        self.state = RoomState::Lobby;
+        self.rng = Pcg64::seed_from_u64(self.seed);
+        for entry in self.bots.values() {
+            let msg = ServerMsg::Lobby { tick: 0 };
+            if let Err(e) = entry.outbound.try_send(msg) {
+                debug!(
+                    room = %self.name,
+                    bot = %entry.bot_id,
+                    error = %e,
+                    "lobby frame not delivered"
+                );
+            }
+        }
+    }
+
+    /// Remove a bot from the room and delete its ship. Called both from the natural
+    /// disconnect path (the connection task observed a close) and from operator kick.
+    fn handle_bot_disconnect(&mut self, bot_id: BotId, reason: &'static str) {
+        if let Some(entry) = self.bots.remove(&bot_id) {
+            self.world.ships.remove(&entry.ship_id);
+            info!(
+                room = %self.name,
+                bot = %bot_id,
+                ship = %entry.ship_id,
+                reason,
+                "bot removed"
+            );
+        }
+    }
+
+    /// Publish the current room state to admin subscribers. No-op when no admin channel
+    /// is wired or no admin client is currently connected.
+    fn publish_admin_state(&self) {
+        let Some(tx) = self.admin_tx.as_ref() else {
+            return;
+        };
+        if tx.receiver_count() == 0 {
+            return;
+        }
+        let _ = tx.send(AdminServerMsg::State(self.admin_state_snapshot()));
+    }
+
+    /// Build a snapshot of room state suitable for the admin wire protocol.
+    fn admin_state_snapshot(&self) -> AdminState {
+        let state_str = match self.state {
+            RoomState::Lobby => "lobby",
+            RoomState::Running => "running",
+            RoomState::Ended => "ended",
+        };
+        let bots = self
+            .bots
+            .values()
+            .map(|entry| AdminBotInfo {
+                bot_id: entry.bot_id.clone(),
+                name: entry.name.clone(),
+                ship_id: entry.ship_id.clone(),
+                ready: entry.ready,
+                alive: self
+                    .world
+                    .ships
+                    .get(&entry.ship_id)
+                    .map(|s| s.alive)
+                    .unwrap_or(false),
+            })
+            .collect();
+        AdminState {
+            room: self.name.clone(),
+            state: state_str.into(),
+            tick: self.world.tick,
+            last_winner: self.last_winner.clone(),
+            bots,
+        }
+    }
+
     /// Send `game_over` to every registered bot — alive or dead. The dead bots' channels
     /// have been kept open precisely so they can receive this message. Also writes the
     /// terminal `end` record to the replay log and drops the writer (which flushes the
@@ -689,24 +923,30 @@ impl Room {
             } => {
                 let result = self.register_bot(peer, name, &version);
                 let _ = reply.send(result);
+                self.publish_admin_state();
             }
             RoomEvent::BotReady { bot_id } => {
+                let mut changed = false;
                 if let Some(entry) = self.bots.get_mut(&bot_id) {
                     if !entry.ready {
                         entry.ready = true;
+                        changed = true;
                         info!(room = %self.name, bot = %bot_id, "bot ready");
                     }
                 } else {
                     warn!(room = %self.name, bot = %bot_id, "ready from unknown bot, ignored");
+                }
+                if changed {
+                    self.publish_admin_state();
                 }
             }
             RoomEvent::BotCommand { bot_id, command } => {
                 self.handle_bot_command(bot_id, command);
             }
             RoomEvent::BotDisconnect { bot_id } => {
-                if let Some(entry) = self.bots.remove(&bot_id) {
-                    self.world.ships.remove(&entry.ship_id);
-                    info!(room = %self.name, bot = %bot_id, ship = %entry.ship_id, "bot disconnected");
+                if self.bots.contains_key(&bot_id) {
+                    self.handle_bot_disconnect(bot_id, "disconnected");
+                    self.publish_admin_state();
                 }
             }
             RoomEvent::OperatorStart { room, reply } => {
@@ -715,6 +955,49 @@ impl Room {
                     warn!(room = %self.name, requested = %room, reason = e.as_str(), "operator start refused");
                 }
                 let _ = reply.send(result);
+                self.publish_admin_state();
+            }
+            RoomEvent::OperatorAbort { reply } => {
+                let result = self.abort_match();
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, reason = e.as_str(), "operator abort refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
+            RoomEvent::OperatorReset { reply } => {
+                let result = self.reset_to_lobby();
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, reason = e.as_str(), "operator reset refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
+            RoomEvent::OperatorKick { bot_id, reply } => {
+                let result = if self.bots.contains_key(&bot_id) {
+                    self.handle_bot_disconnect(bot_id.clone(), "kicked by operator");
+                    Ok(())
+                } else {
+                    Err(KickError::UnknownBot)
+                };
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, bot = %bot_id, reason = e.as_str(), "operator kick refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
+            RoomEvent::AdminSubscribe { reply } => {
+                if let Some(tx) = self.admin_tx.as_ref() {
+                    let rx = tx.subscribe();
+                    // Push the current snapshot through the broadcast so the new
+                    // receiver's first frame is the room state. The send may report no
+                    // active receivers (the reply hasn't been delivered yet), but the
+                    // tokio broadcast queues the message internally so the next `recv`
+                    // on `rx` will still pick it up.
+                    let _ = tx.send(AdminServerMsg::State(self.admin_state_snapshot()));
+                    let _ = reply.send(rx);
+                }
+                // No-op when no admin channel is wired (unit tests).
             }
         }
     }
@@ -801,7 +1084,11 @@ impl Room {
         }
 
         entry.pending_command = Some(command);
-        record_command_tick(&mut entry.command_ticks, world_tick, u64::from(self.tick_hz));
+        record_command_tick(
+            &mut entry.command_ticks,
+            world_tick,
+            u64::from(self.tick_hz),
+        );
     }
 
     /// Operator-triggered transition `Lobby` → `Running`. Places ships on the §5.6 ring
@@ -864,6 +1151,10 @@ impl Room {
         self.tick_send_time = None;
         self.previous_active_pingers.clear();
         self.starting_bot_count = self.bots.len() as u32;
+        // Fresh match — the previous winner is no longer "the current winner". Admin
+        // clients see this through the next `AdminServerMsg::State` push.
+        self.last_winner = None;
+        self.end_tick = None;
         info!(room = %self.name, bots = self.bots.len(), "match started");
 
         // Open a new replay log (unless a writer was injected externally — e.g. by tests)
@@ -2190,7 +2481,10 @@ mod tests {
         // New observability fields land in every frame.
         assert!(ships[0]["speed"].is_number(), "speed missing from frame");
         assert!(ships[0]["ammo"].is_number(), "ammo missing from frame");
-        assert!(ships[0]["throttle"].is_number(), "throttle missing from frame");
+        assert!(
+            ships[0]["throttle"].is_number(),
+            "throttle missing from frame"
+        );
         assert!(ships[0]["rudder"].is_number(), "rudder missing from frame");
         assert_eq!(ships[0]["ready"], true);
         // We accepted one command this second, so cps is at least 1.
@@ -2345,5 +2639,251 @@ mod tests {
         // East of center → heading 270° (west).
         let p = Vec2::new(600.0, 500.0);
         assert!((compass_deg_facing(p, c) - 270.0).abs() < 1e-4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle tests: abort / reset / kick / post-game-pause / multi-round
+    // -----------------------------------------------------------------------
+
+    fn abort(room: &mut Room) -> Result<(), AbortError> {
+        let (tx, mut rx) = oneshot::channel();
+        room.handle_event(RoomEvent::OperatorAbort { reply: tx });
+        rx.try_recv().expect("oneshot reply")
+    }
+
+    fn reset(room: &mut Room) -> Result<(), ResetError> {
+        let (tx, mut rx) = oneshot::channel();
+        room.handle_event(RoomEvent::OperatorReset { reply: tx });
+        rx.try_recv().expect("oneshot reply")
+    }
+
+    fn kick(room: &mut Room, bot_id: &str) -> Result<(), KickError> {
+        let (tx, mut rx) = oneshot::channel();
+        room.handle_event(RoomEvent::OperatorKick {
+            bot_id: bot_id.to_string(),
+            reply: tx,
+        });
+        rx.try_recv().expect("oneshot reply")
+    }
+
+    /// Drain any frames in a bot's outbound channel into a Vec for assertions.
+    fn drain_msgs(reg: &mut BotRegistration) -> Vec<ServerMsg> {
+        let mut out = Vec::new();
+        while let Ok(m) = reg.outbound.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    #[test]
+    fn abort_running_match_marks_ended_and_broadcasts_no_winner() {
+        let mut room = test_room();
+        let mut r1 = connect(&mut room, "a").expect("a");
+        let mut r2 = connect(&mut room, "b").expect("b");
+        for r in [&mut r1, &mut r2] {
+            room.handle_event(RoomEvent::BotReady {
+                bot_id: r.bot_id.clone(),
+            });
+        }
+        start(&mut room, "test").expect("start");
+        // Drain handshake frames so the next pop is the game_over.
+        let _ = drain_msgs(&mut r1);
+        let _ = drain_msgs(&mut r2);
+
+        abort(&mut room).expect("abort");
+        assert_eq!(room.state, RoomState::Ended);
+        assert!(room.end_tick.is_some(), "abort sets end_tick");
+        for r in [&mut r1, &mut r2] {
+            let msgs = drain_msgs(r);
+            let game_over = msgs
+                .iter()
+                .rev()
+                .find(|m| matches!(m, ServerMsg::GameOver { .. }));
+            match game_over.expect("game_over after abort") {
+                ServerMsg::GameOver { winner, .. } => {
+                    assert_eq!(*winner, None, "abort produces no winner");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn abort_in_lobby_is_rejected() {
+        let mut room = test_room();
+        let _ = connect(&mut room, "a").expect("a");
+        let err = abort(&mut room).expect_err("should refuse");
+        assert_eq!(err, AbortError::NotRunning);
+        assert_eq!(room.state, RoomState::Lobby);
+    }
+
+    #[test]
+    fn reset_in_running_is_rejected() {
+        let mut room = test_room();
+        let r = connect(&mut room, "a").expect("a");
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let err = reset(&mut room).expect_err("should refuse");
+        assert_eq!(err, ResetError::NotEnded);
+        assert_eq!(room.state, RoomState::Running);
+    }
+
+    #[test]
+    fn auto_lobby_transition_after_post_game_ticks() {
+        let mut room = test_room();
+        let mut r1 = connect(&mut room, "a").expect("a");
+        let mut r2 = connect(&mut room, "b").expect("b");
+        for r in [&mut r1, &mut r2] {
+            room.handle_event(RoomEvent::BotReady {
+                bot_id: r.bot_id.clone(),
+            });
+        }
+        start(&mut room, "test").expect("start");
+        let _ = drain_msgs(&mut r1);
+        let _ = drain_msgs(&mut r2);
+
+        // Force the match into Ended by killing one ship.
+        room.world.ships.get_mut(&r2.ship_id).unwrap().alive = false;
+        room.step_tick();
+        assert_eq!(room.state, RoomState::Ended);
+
+        // Run enough ticks for the post-game pause to elapse plus a buffer.
+        for _ in 0..(POST_GAME_LOBBY_TICKS + 5) {
+            room.step_tick();
+        }
+        assert_eq!(room.state, RoomState::Lobby, "auto-transition fires");
+        assert_eq!(
+            room.world.tick, 5,
+            "tick reset to 0 then advanced ~5 ticks in lobby"
+        );
+        assert!(
+            room.world.shells.is_empty(),
+            "shells cleared on lobby transition"
+        );
+
+        // Every bot's ship is healed and respawned at center; ready flags cleared.
+        for entry in room.bots.values() {
+            assert!(!entry.ready, "ready flag cleared after lobby transition");
+            let ship = room.world.ships.get(&entry.ship_id).expect("ship present");
+            assert_eq!(ship.hp, crate::sim::constants::HULL_HP);
+            assert_eq!(ship.ammo, crate::sim::constants::MAX_AMMO);
+            assert!(ship.alive);
+        }
+
+        // Every bot received exactly one `lobby` frame.
+        for r in [&mut r1, &mut r2] {
+            let msgs = drain_msgs(r);
+            let lobby_count = msgs
+                .iter()
+                .filter(|m| matches!(m, ServerMsg::Lobby { .. }))
+                .count();
+            assert_eq!(lobby_count, 1, "exactly one lobby frame per bot");
+        }
+    }
+
+    #[test]
+    fn bot_id_and_ship_id_stable_across_rounds() {
+        let mut room = test_room();
+        let mut r1 = connect(&mut room, "a").expect("a");
+        let mut r2 = connect(&mut room, "b").expect("b");
+        let bot_ids_before: Vec<BotId> = room.bots.keys().cloned().collect();
+        let ship_ids_before: Vec<ShipId> = room.bots.values().map(|e| e.ship_id.clone()).collect();
+
+        for r in [&mut r1, &mut r2] {
+            room.handle_event(RoomEvent::BotReady {
+                bot_id: r.bot_id.clone(),
+            });
+        }
+        start(&mut room, "test").expect("start");
+        // Force end-of-match (one ship dies).
+        room.world.ships.get_mut(&r2.ship_id).unwrap().alive = false;
+        room.step_tick();
+        for _ in 0..(POST_GAME_LOBBY_TICKS + 1) {
+            room.step_tick();
+        }
+        assert_eq!(room.state, RoomState::Lobby);
+
+        // Bot and ship identities preserved.
+        let bot_ids_after: Vec<BotId> = room.bots.keys().cloned().collect();
+        let ship_ids_after: Vec<ShipId> = room.bots.values().map(|e| e.ship_id.clone()).collect();
+        assert_eq!(bot_ids_before, bot_ids_after);
+        assert_eq!(ship_ids_before, ship_ids_after);
+    }
+
+    #[test]
+    fn reset_cuts_post_game_pause_short() {
+        let mut room = test_room();
+        let mut r = connect(&mut room, "a").expect("a");
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: r.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        let _ = drain_msgs(&mut r);
+
+        abort(&mut room).expect("abort");
+        assert_eq!(room.state, RoomState::Ended);
+        // Immediately reset (skip the pause) — must succeed and transition to lobby.
+        reset(&mut room).expect("reset");
+        assert_eq!(room.state, RoomState::Lobby);
+    }
+
+    #[test]
+    fn kick_removes_bot_and_ship() {
+        let mut room = test_room();
+        let r1 = connect(&mut room, "a").expect("a");
+        let _ = connect(&mut room, "b").expect("b");
+        assert_eq!(room.bot_count(), 2);
+
+        kick(&mut room, &r1.bot_id).expect("kick");
+        assert_eq!(room.bot_count(), 1);
+        assert!(!room.world.ships.contains_key(&r1.ship_id));
+    }
+
+    #[test]
+    fn kick_unknown_bot_is_rejected() {
+        let mut room = test_room();
+        let err = kick(&mut room, "b_999").expect_err("should refuse");
+        assert_eq!(err, KickError::UnknownBot);
+    }
+
+    #[test]
+    fn admin_subscribe_pushes_initial_snapshot() {
+        let mut room = test_room();
+        let (tx, _rx) = broadcast::channel::<AdminServerMsg>(8);
+        room.set_admin_broadcast(tx.clone());
+        let _r = connect(&mut room, "a").expect("a");
+
+        // Subscribe; the reply receiver will contain the snapshot.
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        room.handle_event(RoomEvent::AdminSubscribe { reply: reply_tx });
+        let mut admin_rx = reply_rx.try_recv().expect("subscribe reply");
+        let first = admin_rx.try_recv().expect("initial snapshot frame");
+        match first {
+            AdminServerMsg::State(state) => {
+                assert_eq!(state.room, "test");
+                assert_eq!(state.state, "lobby");
+                assert_eq!(state.bots.len(), 1);
+                assert_eq!(state.bots[0].name, "a");
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_events_publish_admin_state() {
+        let mut room = test_room();
+        let (tx, mut rx) = broadcast::channel::<AdminServerMsg>(16);
+        room.set_admin_broadcast(tx);
+        // Drain any initial frames so the next push corresponds to BotConnect.
+        while rx.try_recv().is_ok() {}
+
+        let _r = connect(&mut room, "alice").expect("a");
+        let snap = rx.try_recv().expect("BotConnect pushes state");
+        match snap {
+            AdminServerMsg::State(state) => assert_eq!(state.bots.len(), 1),
+            other => panic!("expected State, got {other:?}"),
+        }
     }
 }

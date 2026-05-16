@@ -1,5 +1,6 @@
 <script lang="ts">
   import { connection, view } from '../stores';
+  import AdminPanel from './AdminPanel.svelte';
 
   function toggleView(): void {
     view.update((v) => (v === 'split' ? 'full' : 'split'));
@@ -14,6 +15,7 @@
   <span class="topbar-title">Naval Battle</span>
   <div id="status" class="status {statusClass}">{$connection.message}</div>
   <span class="topbar-spacer"></span>
+  <AdminPanel />
   <div class="topbar-controls">
     <button
       id="view-toggle"

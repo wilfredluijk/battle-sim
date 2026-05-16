@@ -7,6 +7,7 @@
   import { MAX_AMMO, MAX_FORWARD_SPEED, MAX_HP, MAX_REVERSE_SPEED } from '../lib/constants';
   import MeterRow from './MeterRow.svelte';
   import SliderRow from './SliderRow.svelte';
+  import { adminConn, adminRoom, adminSendKick } from '../stores/admin';
 
   interface Props {
     card: BotCardState;
@@ -34,6 +35,18 @@
   const speedRatio = $derived(
     ship.speed >= 0 ? ship.speed / MAX_FORWARD_SPEED : ship.speed / MAX_REVERSE_SPEED,
   );
+
+  // Match the spectator ship id (e.g. "s_3") to the admin room's bot list so we can issue
+  // a kick by bot_id. Hidden when no admin connection or no matching bot.
+  const adminBotId = $derived.by(() => {
+    if ($adminConn.kind !== 'authed') return null;
+    const match = $adminRoom?.bots.find((b) => b.ship_id === ship.id);
+    return match?.bot_id ?? null;
+  });
+
+  function handleKick(): void {
+    if (adminBotId) adminSendKick(adminBotId);
+  }
 </script>
 
 <li class="bot" class:dead={!ship.alive} class:disconnected={!card.connected}>
@@ -41,6 +54,13 @@
     <span class="bot-swatch" style="background: {swatch};"></span>
     <span class="bot-name" title="{ship.bot_name} ({ship.id})">{ship.bot_name}</span>
     <span class="bot-status {status.cls}">{status.label}</span>
+    {#if adminBotId}
+      <button
+        class="bot-kick"
+        type="button"
+        title="Disconnect {ship.bot_name} ({adminBotId})"
+        onclick={handleKick}>Kick</button>
+    {/if}
   </div>
 
   <div class="bot-meters">

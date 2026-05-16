@@ -29,7 +29,13 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
     // never reaches the room. A leaked sender keeps the channel open.
     let (room_tx, _room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
-    tokio::spawn(net::run(config, room_tx, spec_tx, shutdown_rx));
+    tokio::spawn(net::run(
+        config,
+        std::sync::Arc::new("test-admin-token".to_string()),
+        room_tx,
+        spec_tx,
+        shutdown_rx,
+    ));
 
     // Give the listener a moment to bind on the freed port.
     tokio::time::sleep(Duration::from_millis(150)).await;

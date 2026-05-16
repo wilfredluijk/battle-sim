@@ -84,12 +84,30 @@ public abstract class Bot {
     public abstract Command onTick(WorldView view);
 
     /**
-     * Fires once, just before the SDK closes the connection.
+     * Fires when the server announces a match result.
      *
-     * <p>{@code result.winner()} holds the winning {@code bot_id}, or is empty for
-     * a draw. The replay JSONL lives at {@code replays/<replayId>.jsonl} on the server.
+     * <p>{@code result.winner()} holds the winning {@code bot_id}, or is empty for a
+     * draw / aborted match. The replay JSONL lives at {@code replays/<replayId>.jsonl}
+     * on the server.
+     *
+     * <p>Return {@code false} to close the connection and exit the run loop. Return
+     * {@code true} to stay connected and wait for the next match — the server emits a
+     * {@code lobby} frame followed by another {@code game_start} when the operator
+     * starts another match. The SDK auto-sends {@code ready} again when it sees the
+     * {@code lobby} frame, so the default is "stay around for the next round".
      */
-    public void onGameOver(GameOver result) {}
+    public boolean onGameOver(GameOver result) {
+        return true;
+    }
+
+    /**
+     * Fires when the server returns the room to the lobby after a match.
+     *
+     * <p>{@code tick} is always 0 (the next match's starting tick). The SDK auto-sends
+     * {@code ready} immediately after this callback, so most bots can ignore the hook.
+     * Override to reset per-game state (kill counters, plans).
+     */
+    public void onLobby(long tick) {}
 
     /**
      * Fires whenever the server sends a typed {@code error} frame.

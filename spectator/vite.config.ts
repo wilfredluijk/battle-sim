@@ -15,6 +15,7 @@ export default defineConfig({
     proxy: {
       '/spectate': { target: 'ws://localhost:7878', ws: true },
       '/bot': { target: 'ws://localhost:7878', ws: true },
+      '/admin': { target: 'ws://localhost:7878', ws: true },
     },
   },
   build: {

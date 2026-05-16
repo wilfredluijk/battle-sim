@@ -67,11 +67,27 @@ class Bot:
         """
         return Command(throttle=0.0, rudder=0.0, sensor_mode="active")
 
-    def on_game_over(self, result: GameOver) -> None:
-        """Fires once, just before the SDK closes the connection.
+    def on_game_over(self, result: GameOver) -> Optional[bool]:
+        """Fires when the server announces a match result.
 
-        `result.winner` is the winning `bot_id`, or `None` for a draw. The
-        replay JSONL is at `replays/<result.replay_id>.jsonl` on the server.
+        `result.winner` is the winning `bot_id`, or `None` for a draw / abort.
+        The replay JSONL is at `replays/<result.replay_id>.jsonl` on the server.
+
+        Return ``False`` to close the connection and exit the run loop. Return
+        ``True`` (or ``None``) to stay connected and wait for the next match —
+        the server will eventually emit a ``lobby`` message followed by
+        another ``game_start``. The SDK auto-sends ``ready`` again when it
+        sees the ``lobby`` frame, so the default behaviour is "stay around
+        for the next round".
+        """
+        return True
+
+    def on_lobby(self, tick: int) -> None:
+        """Fires when the server returns the room to the lobby after a match.
+
+        ``tick`` is always 0; it's the next match's starting tick. The SDK
+        auto-sends ``ready`` immediately after this callback, so most bots
+        can ignore it. Override to reset per-game state (counters, plans).
         """
 
     def on_error(self, code: str, message: str) -> None:
@@ -205,8 +221,26 @@ async def run_async(
                     except (KeyError, TypeError, ValueError) as exc:
                         log.warning("malformed game_over: %s (frame=%r)", exc, msg)
                         break
-                    _safe_callback(bot.on_game_over, result)
-                    break
+                    keep_running = _safe_callback_returning(bot.on_game_over, result)
+                    if keep_running is False:
+                        # Bot opted out — close the connection cleanly.
+                        break
+                    # Otherwise stay connected and wait for the server's `lobby`
+                    # frame, which triggers a fresh `ready` send (see below).
+                    # Reset the per-match handshake flag so the next welcome (if any)
+                    # would re-send ready, though typically only `lobby` arrives.
+                    ready_sent = False
+
+                elif msg_type == "lobby":
+                    try:
+                        lobby_tick = int(msg.get("tick", 0))
+                    except (TypeError, ValueError) as exc:
+                        log.warning("malformed lobby: %s (frame=%r)", exc, msg)
+                        continue
+                    _safe_callback(bot.on_lobby, lobby_tick)
+                    if not ready_sent:
+                        await ws.send(json.dumps({"type": "ready"}))
+                        ready_sent = True
 
                 elif msg_type == "error":
                     _safe_callback(
@@ -243,3 +277,12 @@ def _safe_callback(fn, *args) -> None:
         fn(*args)
     except Exception:
         log.exception("bot callback %s raised", getattr(fn, "__name__", fn))
+
+
+def _safe_callback_returning(fn, *args):
+    """Like `_safe_callback` but returns the callback's value (or `None` on error)."""
+    try:
+        return fn(*args)
+    except Exception:
+        log.exception("bot callback %s raised", getattr(fn, "__name__", fn))
+        return None

@@ -206,21 +206,33 @@ deaths manifest as their contacts going away.
 
 ## How a match flows
 
-Every bot connection follows the same five-step sequence. The SDK drives
-all of it for you — the table below is for understanding *what your
-callbacks see and when*.
+Every bot connection follows the same lifecycle. The SDK drives all of
+it for you — the table below is for understanding *what your callbacks
+see and when*.
 
-| # | Direction | Frame        | What the SDK does                                                          |
-|---|-----------|--------------|----------------------------------------------------------------------------|
-| 1 | bot → srv | `hello`      | Sent automatically when you call the SDK's `run` entry point.              |
-| 2 | srv → bot | `welcome`    | SDK parses it, stores it on the bot, fires the welcome callback, sends `ready`. |
-| 3 | srv → bot | `game_start` | SDK fires the game-start callback.                                         |
-| 4 | srv → bot | `tick` …     | SDK fires the tick callback and sends your returned `Command` back.        |
-| 5 | srv → bot | `game_over`  | SDK fires the game-over callback once, then closes the connection.         |
+| # | Direction | Frame        | What the SDK does                                                                 |
+|---|-----------|--------------|-----------------------------------------------------------------------------------|
+| 1 | bot → srv | `hello`      | Sent automatically when you call the SDK's `run` entry point.                     |
+| 2 | srv → bot | `welcome`    | SDK parses it, stores it on the bot, fires the welcome callback, sends `ready`.   |
+| 3 | srv → bot | `game_start` | SDK fires the game-start callback.                                                |
+| 4 | srv → bot | `tick` …     | SDK fires the tick callback and sends your returned `Command` back.               |
+| 5 | srv → bot | `game_over`  | SDK fires the game-over callback. By default the bot stays connected.             |
+| 6 | srv → bot | `lobby`      | Sent ~2s later, after the post-game pause. SDK fires the lobby hook, sends `ready` again. |
+| 7 | →          | (loop)       | Steps 3–6 repeat for every match the operator starts.                             |
 
 Between (2) and (3) the server is in **lobby**: it waits for *all*
 connected bots to be ready before starting. Your bot can connect any
 time and will simply idle until `game_start` fires.
+
+**Bots persist across matches on a single connection.** `bot_id` and
+`ship_id` are stable for the lifetime of the WebSocket. After
+`game_over` the SDK does **not** close the connection by default — it
+waits for the server's `lobby` frame, auto-sends `ready`, and your bot
+participates in the next match.
+
+If you want one-game-per-process behaviour instead, return `False` (or
+`false` in Java) from the game-over callback. The SDK will close the
+connection cleanly and your `run` call will return.
 
 The server is authoritative on every aspect of the simulation. Your
 `Command` is a *request* — throttle and rudder get clamped to `[-1, 1]`,

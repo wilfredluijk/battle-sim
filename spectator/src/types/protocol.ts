@@ -39,3 +39,36 @@ export interface WorldFrame {
   shells: ShellSnapshot[];
   events: TickEvent[];
 }
+
+// ---------------------------------------------------------------------------
+// Admin endpoint — matches server/src/admin.rs (AdminMsg / AdminServerMsg).
+// ---------------------------------------------------------------------------
+
+export type AdminRoomState = 'lobby' | 'running' | 'ended';
+
+export interface AdminBotInfo {
+  bot_id: string;
+  name: string;
+  ship_id: string;
+  ready: boolean;
+  alive: boolean;
+}
+
+export interface AdminStatePayload {
+  room: string;
+  state: AdminRoomState;
+  tick: number;
+  last_winner?: string | null;
+  bots: AdminBotInfo[];
+}
+
+export type AdminServerMsg =
+  | { type: 'state'; room: string; state: AdminRoomState; tick: number; last_winner?: string | null; bots: AdminBotInfo[] }
+  | { type: 'ack'; command: string }
+  | { type: 'error'; code: string; message: string };
+
+export type AdminMsg =
+  | { type: 'start' }
+  | { type: 'abort' }
+  | { type: 'reset' }
+  | { type: 'kick'; bot_id: string };

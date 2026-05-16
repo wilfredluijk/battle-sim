@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
+use crate::admin::{self, admin_error_code, AdminMsg, AdminServerMsg};
 use crate::config::Config;
 use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
 use crate::room::{BotRegistration, PendingCommand, RoomEvent, SpectatorFrame};
@@ -95,6 +96,7 @@ static INDEX_CSS: &str = include_str!("../../spectator/dist/index.css");
 enum Endpoint {
     Bot,
     Spectator,
+    Admin,
 }
 
 type Ws = WebSocketStream<PrefixedStream>;
@@ -103,6 +105,7 @@ type WsStream = SplitStream<Ws>;
 
 pub async fn run(
     config: Config,
+    admin_token: Arc<String>,
     room_tx: mpsc::Sender<RoomEvent>,
     spec_tx: broadcast::Sender<SpectatorFrame>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -120,7 +123,7 @@ pub async fn run(
         max_conn_per_ip = config.max_connections_per_ip,
         handshake_timeout_secs = config.handshake_timeout_secs,
         tournament = config.tournament,
-        "listener bound (HTTP /, WS /bot, WS /spectate)"
+        "listener bound (HTTP /, WS /bot, WS /spectate, WS /admin)"
     );
 
     let ip_conns: IpConnTable = Arc::new(Mutex::new(HashMap::new()));
@@ -148,9 +151,11 @@ pub async fn run(
                         let conn_shutdown = shutdown_rx.resubscribe();
                         let room_tx = room_tx.clone();
                         let spec_tx = spec_tx.clone();
+                        let admin_token = admin_token.clone();
                         tokio::spawn(handle_connection(
                             stream,
                             peer,
+                            admin_token,
                             room_tx,
                             spec_tx,
                             conn_shutdown,
@@ -174,6 +179,7 @@ pub async fn run(
 async fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
+    admin_token: Arc<String>,
     room_tx: mpsc::Sender<RoomEvent>,
     spec_tx: broadcast::Sender<SpectatorFrame>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -218,9 +224,11 @@ async fn handle_connection(
     };
 
     if parsed.is_websocket_upgrade {
-        let endpoint = match parsed.path.as_str() {
+        let path_only = parsed.path.split('?').next().unwrap_or(&parsed.path);
+        let endpoint = match path_only {
             "/bot" => Endpoint::Bot,
             "/spectate" => Endpoint::Spectator,
+            "/admin" => Endpoint::Admin,
             other => {
                 warn!(%peer, path = other, "unknown websocket path; closing");
                 let _ = write_http_response(
@@ -250,6 +258,24 @@ async fn handle_connection(
             return;
         }
 
+        // Admin auth: rotating token in `?token=...`. Mismatch returns HTTP 401 before
+        // the WS upgrade, which the browser surfaces as a clean handshake failure.
+        if endpoint == Endpoint::Admin {
+            let provided = extract_query_value(&parsed.path, "token").unwrap_or("");
+            if !admin::constant_time_eq(provided, &admin_token) {
+                warn!(%peer, "refusing /admin: invalid token");
+                let _ = write_http_response(
+                    &mut stream,
+                    401,
+                    "Unauthorized",
+                    "text/plain; charset=utf-8",
+                    b"invalid admin token",
+                )
+                .await;
+                return;
+            }
+        }
+
         let prefixed = PrefixedStream::new(head_bytes, stream);
         let ws_config = WebSocketConfig {
             max_message_size: Some(MAX_WS_MESSAGE_BYTES),
@@ -277,6 +303,7 @@ async fn handle_connection(
         match endpoint {
             Endpoint::Bot => handle_bot(peer, ws, room_tx, shutdown_rx, handshake_timeout).await,
             Endpoint::Spectator => handle_spectator(peer, ws, spec_tx, shutdown_rx).await,
+            Endpoint::Admin => handle_admin(peer, ws, room_tx, shutdown_rx).await,
         }
         info!(%peer, ?endpoint, "connection ended");
     } else {
@@ -721,6 +748,291 @@ async fn handle_spectator(
     }
 }
 
+/// Drive a `/admin` WebSocket. Authentication has already happened (the token in the
+/// request-line query was validated before the upgrade). Subscribes to the room's admin
+/// broadcast so the client gets a state snapshot on connect plus a push on every
+/// lifecycle transition.
+async fn handle_admin(
+    peer: SocketAddr,
+    ws: Ws,
+    room_tx: mpsc::Sender<RoomEvent>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let (mut sink, mut stream) = ws.split();
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    if room_tx
+        .send(RoomEvent::AdminSubscribe { reply: sub_tx })
+        .await
+        .is_err()
+    {
+        warn!(%peer, "room channel closed; closing admin connection");
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    }
+    let mut admin_rx = match sub_rx.await {
+        Ok(rx) => rx,
+        Err(_) => {
+            warn!(%peer, "room dropped admin subscription reply");
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    info!(%peer, "admin connected");
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!(%peer, "closing admin connection (shutdown)");
+                let _ = sink.send(Message::Close(None)).await;
+                break;
+            }
+            recv = admin_rx.recv() => {
+                match recv {
+                    Ok(msg) => {
+                        if !send_admin_msg(&mut sink, &msg).await {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(%peer, skipped, "admin lagging; dropped state frames");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!(%peer, "admin broadcast closed");
+                        break;
+                    }
+                }
+            }
+            frame = stream.next() => {
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<AdminMsg>(&text) {
+                            Ok(msg) => {
+                                if !handle_admin_command(&room_tx, &mut sink, msg).await {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let code = if matches!(
+                                    e.classify(),
+                                    serde_json::error::Category::Syntax
+                                ) {
+                                    admin_error_code::MALFORMED_JSON
+                                } else {
+                                    admin_error_code::INVALID_MESSAGE
+                                };
+                                let err = AdminServerMsg::Error {
+                                    code: code.into(),
+                                    message: e.to_string(),
+                                };
+                                let _ = send_admin_msg(&mut sink, &err).await;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        let err = AdminServerMsg::Error {
+                            code: admin_error_code::INVALID_MESSAGE.into(),
+                            message: "binary frames are not accepted on /admin".into(),
+                        };
+                        let _ = send_admin_msg(&mut sink, &err).await;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = sink.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(frame))) => {
+                        info!(%peer, ?frame, "admin closed");
+                        break;
+                    }
+                    Some(Ok(Message::Frame(_))) => {}
+                    Some(Err(e)) => {
+                        warn!(%peer, error = %e, "admin ws read error");
+                        break;
+                    }
+                    None => {
+                        info!(%peer, "admin stream ended");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Send a serialized `AdminServerMsg` to the admin WS sink. Returns false on socket
+/// failure (which the caller treats as terminal).
+async fn send_admin_msg(sink: &mut WsSink, msg: &AdminServerMsg) -> bool {
+    let payload = match serde_json::to_string(msg) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize admin frame");
+            return true;
+        }
+    };
+    sink.send(Message::Text(payload)).await.is_ok()
+}
+
+/// Translate a single `AdminMsg` into a `RoomEvent`, await the room's reply, and surface
+/// success / failure to the admin client. Returns false to terminate the connection.
+async fn handle_admin_command(
+    room_tx: &mpsc::Sender<RoomEvent>,
+    sink: &mut WsSink,
+    msg: AdminMsg,
+) -> bool {
+    match msg {
+        AdminMsg::Start => {
+            let (tx, rx) = oneshot::channel();
+            if room_tx
+                .send(RoomEvent::OperatorStart {
+                    room: "main".into(),
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match rx.await {
+                Ok(Ok(())) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Ack {
+                            command: "start".into(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Error {
+                            code: "start_refused".into(),
+                            message: e.as_str().into(),
+                        },
+                    )
+                    .await;
+                }
+                Err(_) => return false,
+            }
+        }
+        AdminMsg::Abort => {
+            let (tx, rx) = oneshot::channel();
+            if room_tx
+                .send(RoomEvent::OperatorAbort { reply: tx })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match rx.await {
+                Ok(Ok(())) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Ack {
+                            command: "abort".into(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Error {
+                            code: admin_error_code::NOT_RUNNING.into(),
+                            message: e.as_str().into(),
+                        },
+                    )
+                    .await;
+                }
+                Err(_) => return false,
+            }
+        }
+        AdminMsg::Reset => {
+            let (tx, rx) = oneshot::channel();
+            if room_tx
+                .send(RoomEvent::OperatorReset { reply: tx })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match rx.await {
+                Ok(Ok(())) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Ack {
+                            command: "reset".into(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Error {
+                            code: admin_error_code::NOT_ENDED.into(),
+                            message: e.as_str().into(),
+                        },
+                    )
+                    .await;
+                }
+                Err(_) => return false,
+            }
+        }
+        AdminMsg::Kick { bot_id } => {
+            let (tx, rx) = oneshot::channel();
+            if room_tx
+                .send(RoomEvent::OperatorKick {
+                    bot_id: bot_id.clone(),
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match rx.await {
+                Ok(Ok(())) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Ack {
+                            command: "kick".into(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = send_admin_msg(
+                        sink,
+                        &AdminServerMsg::Error {
+                            code: admin_error_code::UNKNOWN_BOT.into(),
+                            message: e.as_str().into(),
+                        },
+                    )
+                    .await;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Extract a query value for `key` from a request-line path of the form `/p?a=b&c=d`.
+/// Returns `None` if there's no query string or `key` is absent. No URL decoding —
+/// admin tokens are alphanumeric.
+fn extract_query_value<'a>(path_with_query: &'a str, key: &str) -> Option<&'a str> {
+    let query = path_with_query.split_once('?').map(|(_, q)| q)?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Reject `command` frames containing `NaN` / `Inf`. Without this, NaN propagates into
 /// `physics::step_world` (NaN positions, broken distance checks) and is a determinism
 /// hazard as well as a DoS sink for the JSON parser if combined with huge payloads.
@@ -850,10 +1162,7 @@ fn resolve_static(path: &str) -> Option<(&'static str, &'static [u8])> {
     let path_only = path.split('?').next().unwrap_or(path);
     match path_only {
         "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML.as_bytes())),
-        "/index.js" => Some((
-            "application/javascript; charset=utf-8",
-            INDEX_JS.as_bytes(),
-        )),
+        "/index.js" => Some(("application/javascript; charset=utf-8", INDEX_JS.as_bytes())),
         "/index.css" => Some(("text/css; charset=utf-8", INDEX_CSS.as_bytes())),
         _ => None,
     }

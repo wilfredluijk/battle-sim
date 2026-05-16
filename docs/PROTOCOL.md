@@ -7,6 +7,7 @@ Public contract between the naval-battle server and bot / spectator clients. Thi
 - **Endpoints:**
   - `ws://<host>:<port>/bot` — bidirectional, untrusted.
   - `ws://<host>:<port>/spectate` — server-to-client only.
+  - `ws://<host>:<port>/admin?token=<TOKEN>` — bidirectional, gated by a rotating token (printed at INFO on server start, overridable with `--admin-token`).
 - **Discriminator:** every message has a `"type"` field (snake_case).
 - **Coordinates:** `[x, y]` arrays of `f32`. Origin top-left, `+x` right, `+y` down. Bearings are in absolute compass degrees (0° = `+y`-axis is unspecified by the design; treat bearings consistently between `fire` and contacts — see PR-relative discussion in `system-design.md` §5.4).
 - **Numbers:** all coordinates, speeds, headings, and ranges are `f32`. Tick numbers, HP, and ammo are unsigned integers.
@@ -144,7 +145,7 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
 `events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range.
 
 #### `game_over`
-Final message on the bot connection. `winner` is `null` for a draw.
+Sent when a match ends — either naturally (last ship standing / match timeout) or because the operator aborted. `winner` is `null` for a draw **or an aborted match**.
 
 ```json
 {
@@ -153,6 +154,15 @@ Final message on the bot connection. `winner` is `null` for a draw.
   "final_tick": 1843,
   "replay_id": "match_20260508_171203"
 }
+```
+
+The connection stays open after `game_over`. A few seconds later (~`POST_GAME_LOBBY_TICKS / tick_hz`) the server emits a `lobby` frame and the bot can re-send `ready` to participate in the next match. Bots that want to exit can simply close the WebSocket from their end.
+
+#### `lobby`
+Sent when the room returns to the lobby after a match. SDKs should treat this as the signal to re-send `ready` if they want to play the next match. `tick` is always 0.
+
+```json
+{ "type": "lobby", "tick": 0 }
 ```
 
 #### `error`
@@ -165,6 +175,20 @@ Sent in response to a malformed or otherwise-rejected bot frame. See [§3 Error 
 ### 1.3 Late and missing commands
 
 If a `command` arrives after the per-tick deadline, the server replies with `error` (`code: "late_command"`) and applies the previous tick's `throttle` / `rudder` / `sensor_mode`. No shot is fired that tick. The bot is **not** disconnected for missing or late commands — only for repeated protocol violations.
+
+### 1.4 Match lifecycle
+
+Bots persist across matches on a single WebSocket connection:
+
+```
+hello → welcome → (ready) → game_start → tick* → game_over →
+                  (lobby) → (ready) → game_start → tick* → game_over → …
+```
+
+- `welcome` is sent exactly once per connection.
+- `bot_id` and `ship_id` are stable for the lifetime of the connection.
+- After every `game_over`, the server returns the room to the lobby and emits `lobby`. SDKs auto-send `ready` on receipt and wait for the next `game_start`. Bot authors who want to exit can close the connection from their side after `game_over`.
+- An operator-issued `abort` is delivered to bots as a `game_over` with `winner: null`. An operator-issued `reset` cuts the post-game pause short; the bot still sees `game_over` (already delivered) followed by `lobby` immediately afterwards.
 
 ---
 
@@ -223,6 +247,69 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
 
 ---
 
+## 2.5 Admin endpoint — `/admin`
+
+Bidirectional control channel for an operator UI. Authentication: every connection MUST carry the current admin token as a query parameter — e.g. `ws://host:port/admin?token=AbCd...`. The server validates the token before completing the WebSocket upgrade; a missing or wrong token returns HTTP 401.
+
+The token is generated at startup and printed to the log at `INFO` (look for the `admin token` line) unless `--admin-token <TOKEN>` overrides it. Tokens rotate on every server restart.
+
+### 2.5.1 Server → Admin
+
+#### `state`
+Pushed immediately on subscribe and on every lifecycle transition (bot connect/disconnect/ready, match start, match end, lobby return).
+
+```json
+{
+  "type": "state",
+  "room": "main",
+  "state": "lobby",
+  "tick": 0,
+  "last_winner": null,
+  "bots": [
+    { "bot_id": "b_1", "name": "alice", "ship_id": "s_1", "ready": true, "alive": true }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `"lobby"` \| `"running"` \| `"ended"` | Room state machine. `ended` is the post-game pause; the room returns to `lobby` automatically after ~2s. |
+| `tick` | u64 | Current `world.tick`. |
+| `last_winner` | string \| null | `bot_id` of the most recent winner, or `null` for a draw / abort / fresh match. |
+| `bots[].alive` | bool | Tracks the ship's `alive` flag for the running match; `true` in lobby. |
+
+#### `ack`
+Optional acknowledgement for a command. Use `state` pushes for authoritative truth.
+
+```json
+{ "type": "ack", "command": "start" }
+```
+
+#### `error`
+Returned when the server rejects a command. Codes: `start_refused`, `not_running`, `not_ended`, `unknown_bot`, `malformed_json`, `invalid_message`.
+
+```json
+{ "type": "error", "code": "not_running", "message": "room is not running" }
+```
+
+### 2.5.2 Admin → Server
+
+```json
+{ "type": "start" }
+{ "type": "abort" }
+{ "type": "reset" }
+{ "type": "kick", "bot_id": "b_3" }
+```
+
+| Command | Effect |
+|---|---|
+| `start` | Lobby → Running. Refused if not in Lobby, no bots, or not all ready. |
+| `abort` | Force-end the running match (`game_over` with `winner: null`). |
+| `reset` | Ended → Lobby immediately, skipping the post-game pause. Refused outside Ended. |
+| `kick` | Disconnect a single bot by `bot_id`. |
+
+---
+
 ## 3. Error codes
 
 Codes are strings; the human-readable detail goes in `message`. Bot authors should switch on `code` for behaviour and surface `message` for diagnostics.
@@ -261,6 +348,14 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-05-16 — admin lifecycle plane + bots survive `game_over`
+
+- Added `/admin` WebSocket endpoint gated by a rotating token (logged at startup, overridable with `--admin-token`). Client → server: `start`, `abort`, `reset`, `kick`. Server → client: `state` snapshots on every transition, plus `ack` / `error`.
+- Added server → bot `lobby` message. After every `game_over` the room auto-returns to `Lobby` (~2 s post-game pause), reseeds the RNG from `--seed`, and emits `lobby` to every connected bot. Bots stay connected across matches; `bot_id` and `ship_id` are stable per connection.
+- Python SDK: `Bot.on_game_over` now returns `Optional[bool]` (return `False` to disconnect, default `True`). New `Bot.on_lobby` hook. SDK auto-sends `ready` on `lobby`.
+- Java SDK: `Bot.onGameOver` now returns `boolean`. New `Bot.onLobby` hook. SDK auto-sends `ready` on `lobby`.
+- Backwards compatible for bots that subclass with defaults — they automatically participate in subsequent matches.
 
 ## 2026-05-12 — richer spectator world frames
 

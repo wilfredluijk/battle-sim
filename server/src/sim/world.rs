@@ -51,6 +51,21 @@ impl Ship {
             alive: true,
         }
     }
+
+    /// Reset all mutable state to fresh-spawn values without changing `id` / `bot_id`.
+    /// Used by the room to recycle a ship between back-to-back matches on the same
+    /// connection: the bot keeps its identity, the hull is brand new.
+    pub fn reset_for_round(&mut self, pos: Vec2, heading_deg: f32) {
+        self.pos = pos;
+        self.heading_deg = heading_deg;
+        self.speed = 0.0;
+        self.hp = constants::HULL_HP;
+        self.ammo = constants::MAX_AMMO;
+        self.throttle = 0.0;
+        self.rudder = 0.0;
+        self.gun_cooldown = 0;
+        self.alive = true;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

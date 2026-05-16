@@ -48,7 +48,13 @@ async fn start_server() -> ServerHandle {
     );
     tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe()));
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
-    tokio::spawn(net::run(config, room_tx.clone(), spec_tx, shutdown_rx_net));
+    tokio::spawn(net::run(
+        config,
+        std::sync::Arc::new("test-admin-token".to_string()),
+        room_tx.clone(),
+        spec_tx,
+        shutdown_rx_net,
+    ));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     ServerHandle {

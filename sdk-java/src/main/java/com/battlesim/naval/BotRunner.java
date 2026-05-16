@@ -128,12 +128,29 @@ public final class BotRunner {
                         sendJson(client, cmd.toJson(view.tick()));
                     }
                     case "game_over" -> {
+                        boolean keepRunning = true;
                         try {
                             result = GameOver.from(msg);
                             final GameOver finalResult = result;
-                            safe(() -> bot.onGameOver(finalResult));
+                            keepRunning = safeBool(() -> bot.onGameOver(finalResult), true);
                         } catch (Exception ex) {
                             LOG.log(Level.WARNING, "malformed game_over: " + msg, ex);
+                        }
+                        if (!keepRunning) {
+                            // Bot opted out — close the connection cleanly.
+                            return Optional.ofNullable(result);
+                        }
+                        // Otherwise wait for the server's `lobby` frame, which triggers
+                        // a fresh `ready` send so we participate in the next match.
+                        readySent = false;
+                    }
+                    case "lobby" -> {
+                        long lobbyTick = msg.has("tick") ? msg.get("tick").asLong(0L) : 0L;
+                        final long finalTick = lobbyTick;
+                        safe(() -> bot.onLobby(finalTick));
+                        if (!readySent) {
+                            sendJson(client, readyFrame());
+                            readySent = true;
                         }
                     }
                     case "error" -> {
@@ -143,8 +160,6 @@ public final class BotRunner {
                     }
                     default -> LOG.fine("ignoring unknown message type " + type);
                 }
-
-                if ("game_over".equals(type)) break;
             }
 
             return Optional.ofNullable(result);
@@ -185,6 +200,16 @@ public final class BotRunner {
             r.run();
         } catch (Exception ex) {
             LOG.log(Level.WARNING, "bot callback raised", ex);
+        }
+    }
+
+    /** Run a {@link java.util.function.BooleanSupplier}-like callback, returning {@code fallback} on exception. */
+    private static boolean safeBool(java.util.function.BooleanSupplier s, boolean fallback) {
+        try {
+            return s.getAsBoolean();
+        } catch (Exception ex) {
+            LOG.log(Level.WARNING, "bot callback raised", ex);
+            return fallback;
         }
     }
 

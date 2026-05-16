@@ -111,7 +111,9 @@ docker compose up --build    # builds the multi-stage image and serves on :7878.
                              #   Replays land in ./replays/ via bind-mount.
 ```
 
-The server reads operator commands from stdin while running. Type `room list`, `room start main`, `quit`, etc. See `docs/system-design.md §3.3` for the full list.
+The server reads operator commands from stdin while running. Type `room list`, `room start main`, `room abort`, `room reset`, `room kick <bot_id>`, `quit`, etc. See `docs/system-design.md §3.3` for the full list.
+
+The same lifecycle actions (`start`, `abort`, `reset`, `kick`) are exposed over the `/admin` WebSocket — gated by a rotating token printed at INFO on startup (override with `--admin-token`). The spectator web UI uses this to manage matches from the browser. See `docs/PROTOCOL.md §2.5`.
 
 ---
 

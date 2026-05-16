@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use clap::Parser;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use naval_server::{
+    admin::{self, AdminServerMsg},
     config::Config,
     control, net, replay,
     room::{self, Room, SpectatorFrame, ROOM_EVENT_BUFFER},
@@ -13,6 +16,10 @@ use naval_server::{
 /// briefly stall without dropping frames; lagged clients log a `Lagged` warning rather
 /// than disconnect.
 const SPECTATOR_BROADCAST_BUFFER: usize = 64;
+
+/// Admin state updates are infrequent (one per lifecycle transition); a small buffer is
+/// plenty and lets a momentarily slow admin client catch up without losing context.
+const ADMIN_BROADCAST_BUFFER: usize = 16;
 
 const BANNER: &str = r#"
 ========================================
@@ -24,8 +31,7 @@ const BANNER: &str = r#"
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -43,9 +49,22 @@ async fn main() {
         "starting naval-server"
     );
 
+    // Resolve the admin token: explicit CLI override wins, otherwise generate one.
+    let admin_token: Arc<String> = Arc::new(
+        config
+            .admin_token
+            .clone()
+            .unwrap_or_else(admin::generate_admin_token),
+    );
+    info!(
+        admin_token = %admin_token,
+        "admin token (use on /admin?token=... — rotates each server start unless --admin-token is set)"
+    );
+
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(8);
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
     let (spec_tx, _) = broadcast::channel::<SpectatorFrame>(SPECTATOR_BROADCAST_BUFFER);
+    let (admin_tx, _) = broadcast::channel::<AdminServerMsg>(ADMIN_BROADCAST_BUFFER);
 
     let replay_path = config.replay.clone();
 
@@ -75,12 +94,14 @@ async fn main() {
             config.max_bots,
         );
         main_room.set_spectator_broadcast(spec_tx.clone());
+        main_room.set_admin_broadcast(admin_tx.clone());
         main_room.set_replay_dir(config.replay_dir.clone());
         tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()))
     };
 
     let net_handle = tokio::spawn(net::run(
         config.clone(),
+        admin_token.clone(),
         room_tx.clone(),
         spec_tx.clone(),
         shutdown_tx.subscribe(),
