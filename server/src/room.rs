@@ -886,11 +886,29 @@ impl Room {
     /// into a 32-slot outbound buffer, pushing real `tick` frames over the edge.
     fn send_fire_error(&mut self, bot_id: &BotId, err: FireError) {
         let (code, msg): (&str, String) = match err {
-            FireError::CooldownActive => (
-                error_code::COOLDOWN_ACTIVE,
-                format!("gun is on cooldown for tick {}", self.world.tick),
+            FireError::CooldownActive => {
+                // Look up the ship's remaining cooldown so the bot knows how long to wait.
+                let cooldown_remaining = self
+                    .bots
+                    .get(bot_id)
+                    .and_then(|entry| self.world.ships.get(&entry.ship_id))
+                    .map(|ship| ship.gun_cooldown)
+                    .unwrap_or(0);
+                (
+                    error_code::COOLDOWN_ACTIVE,
+                    format!(
+                        "gun on cooldown at tick {}: {} tick(s) remaining",
+                        self.world.tick, cooldown_remaining,
+                    ),
+                )
+            }
+            FireError::NoAmmo => (
+                error_code::NO_AMMO,
+                format!(
+                    "ship is out of ammo (no resupply during a match); rejected at tick {}",
+                    self.world.tick,
+                ),
             ),
-            FireError::NoAmmo => (error_code::NO_AMMO, "ship is out of ammo".to_string()),
             FireError::ShipDead | FireError::UnknownShip => return,
         };
         let world_tick = self.world.tick;

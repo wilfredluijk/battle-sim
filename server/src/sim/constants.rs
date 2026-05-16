@@ -1,7 +1,9 @@
-//! Simulation constants. Source of truth: `system-design.md` §5.2 (ship) and §5.4 (weapons).
+//! Simulation constants — the single source of truth for ship and weapon balance.
 //!
-//! Values must stay in sync with `protocol::ShipSpecs::DEFAULT`. A future test should
-//! cross-check the two; for now they are duplicated by inspection.
+//! `protocol::ShipSpecs::DEFAULT` is derived directly from these constants, so the
+//! `welcome` payload always reflects what the simulator actually does. The
+//! `system-design.md` ship/weapon tables track these values, but the runtime authority
+//! lives here.
 
 /// Fixed simulation timestep. The wall clock is only used to *pace* the tick loop, never to
 /// drive physics — see `CLAUDE.md` "Determinism in the simulation".

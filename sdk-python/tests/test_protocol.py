@@ -17,18 +17,18 @@ WELCOME_FRAME = {
     "type": "welcome",
     "bot_id": "b_1",
     "ship_id": "s_1",
-    "map": {"width": 1000, "height": 1000},
+    "map": {"width": 700, "height": 700},
     "tick_hz": 10,
     "ship_specs": {
-        "max_forward_speed": 6.0,
+        "max_forward_speed": 9.0,
         "max_reverse_speed": 2.0,
-        "acceleration": 1.5,
-        "turn_rate_deg_per_s": 15.0,
+        "acceleration": 3.5,
+        "turn_rate_deg_per_s": 20.0,
         "hull_hp": 100,
-        "max_ammo": 20,
+        "max_ammo": 250,
         "gun_cooldown_ticks": 15,
         "hit_radius": 8.0,
-        "shell_speed": 50.0,
+        "shell_speed": 70.0,
         "max_shell_range": 300.0,
         "splash_radius": 15.0,
         "max_splash_damage": 25,
@@ -76,8 +76,8 @@ TICK_FRAME = {
 def test_welcome_parses():
     w = Welcome.from_dict(WELCOME_FRAME)
     assert w.bot_id == "b_1"
-    assert w.ship_specs.shell_speed == pytest.approx(50.0)
-    assert w.map.width == 1000
+    assert w.ship_specs.shell_speed == pytest.approx(70.0)
+    assert w.map.width == 700
 
 
 def test_world_view_parses():

@@ -94,13 +94,15 @@ class PowerfulBot(Bot):
     def __init__(self) -> None:
         super().__init__()
         self.state = TacticalState()
-        self._shell_speed = 50.0
+        # Fallback defaults matching the current server (`sim::constants`); these are
+        # overwritten in `on_welcome` from the authoritative `ship_specs` payload.
+        self._shell_speed = 70.0
         self._max_shell_range = 300.0
         self._splash_radius = 15.0
         self._gun_cooldown = 15
-        self._max_ammo = 20
-        self._map_w = 1000
-        self._map_h = 1000
+        self._max_ammo = 250
+        self._map_w = 700
+        self._map_h = 700
         self._next_fire_tick = 0
 
     def on_welcome(self, welcome: Welcome) -> None:

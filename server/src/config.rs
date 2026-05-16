@@ -84,8 +84,8 @@ mod tests {
         assert_eq!(cfg.port, 7878);
         assert_eq!(cfg.tick_hz, 10);
         assert_eq!(cfg.tick_deadline_ms, 80);
-        assert_eq!(cfg.map, (1000, 1000));
-        assert_eq!(cfg.max_bots, 4);
+        assert_eq!(cfg.map, (700, 700));
+        assert_eq!(cfg.max_bots, 24);
         assert_eq!(cfg.seed, 42);
     }
 

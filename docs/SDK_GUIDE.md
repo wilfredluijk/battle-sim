@@ -110,11 +110,13 @@ other) — only walls and shell splashes deal damage.
 | Spec                  | Default | Meaning                                                       |
 |-----------------------|---------|---------------------------------------------------------------|
 | `hull_hp`             | 100     | Damage to zero is death. No regeneration.                     |
-| `max_forward_speed`   | 6.0     | Units per second at `throttle = 1`.                           |
+| `max_forward_speed`   | 9.0     | Units per second at `throttle = 1`.                           |
 | `max_reverse_speed`   | 2.0     | Units per second at `throttle = -1`.                          |
-| `acceleration`        | 1.5     | Units per second². Full-stop to full-ahead takes ≈ 4 s.       |
-| `turn_rate_deg_per_s` | 15.0    | At full rudder; scales linearly with `|speed| / max_forward`. |
-| `max_ammo`            | 20      | Shells per match. No reload.                                  |
+| `acceleration`        | 3.5     | Units per second². Full-stop to full-ahead takes ≈ 2.6 s.     |
+| `turn_rate_deg_per_s` | 20.0    | At full rudder; scales linearly with `|speed| / max_forward`. |
+| `max_ammo`            | 250     | Shells per match. No reload.                                  |
+
+Read these from the `ship_specs` block on `welcome` rather than hard-coding them; the server is authoritative and may run with different values in tournament configurations.
 
 A ship dead in the water can't turn — yaw rate scales with speed. If
 you stall, you're a duck.
@@ -123,7 +125,7 @@ you stall, you're a duck.
 
 | Spec                 | Default | Meaning                                                       |
 |----------------------|---------|---------------------------------------------------------------|
-| `shell_speed`        | 50.0    | Units per second. Roughly 8× the ship's top speed.            |
+| `shell_speed`        | 70.0    | Units per second. Roughly 8× the ship's top speed.            |
 | `max_shell_range`    | 300.0   | Server-side clamp on the `fire.range` field.                  |
 | `gun_cooldown_ticks` | 15      | 1.5 s between shots at the default tick rate.                 |
 | `splash_radius`      | 15.0    | Damage falloff distance.                                      |

@@ -235,9 +235,11 @@ ticks is your job. Passive contacts return `range = OptionalDouble.empty()`.
 ### `ShipSpecs`
 
 Static gameplay constants from `welcome`. Persist on
-`bot.welcome().shipSpecs()`. Most useful fields:
-`shellSpeed()` (50.0), `maxShellRange()` (300.0),
-`gunCooldownTicks()` (15), `hullHp()` (100), `maxAmmo()` (20).
+`bot.welcome().shipSpecs()`. Most useful fields (current defaults shown —
+always read them from `welcome().shipSpecs()` rather than hard-coding):
+`shellSpeed()` (70.0), `maxShellRange()` (300.0),
+`gunCooldownTicks()` (15), `hullHp()` (100), `maxAmmo()` (250),
+`maxForwardSpeed()` (9.0), `turnRateDegPerS()` (20.0).
 
 ### `GameOver`
 

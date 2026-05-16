@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn fire_at_bearing_90_range_200_spawns_shell_with_eastward_velocity_and_40_ticks_ttl() {
+    fn fire_at_bearing_90_range_200_spawns_shell_with_expected_velocity_and_ttl() {
         // Acceptance check from projectplan §6.1.
         let mut world = world_with(vec![ship_at("s_1", Vec2::new(500.0, 500.0))]);
         let result = fire(&mut world, &"s_1".into(), 90.0, 200.0);
@@ -176,8 +176,14 @@ mod tests {
         let s = &world.shells[0];
         assert_eq!(s.source_ship, "s_1");
         assert_eq!(s.id_index, 0);
-        assert_eq!(s.ttl_ticks, 40, "ttl = range / (speed * dt) = 200 / 5 = 40");
-        // Bearing 90° → east → vel = (50, 0).
+        let expected_ttl = (200.0_f32 / (constants::SHELL_SPEED * constants::DT)).ceil() as u32;
+        assert_eq!(
+            s.ttl_ticks,
+            expected_ttl,
+            "ttl = ceil(range / (speed * dt)) = ceil(200 / {}) = {expected_ttl}",
+            constants::SHELL_SPEED * constants::DT,
+        );
+        // Bearing 90° → east → vx = SHELL_SPEED, vy = 0.
         assert!(
             (s.vel.x - constants::SHELL_SPEED).abs() < 1e-4,
             "vx = {}",
@@ -199,8 +205,9 @@ mod tests {
         let mut world = world_with(vec![ship_at("s_1", Vec2::new(500.0, 500.0))]);
         fire(&mut world, &"s_1".into(), 0.0, 9999.0).expect("fire");
         let s = &world.shells[0];
-        // 300 / 5 = 60 ticks at the cap.
-        assert_eq!(s.ttl_ticks, 60);
+        let expected_ttl =
+            (constants::MAX_SHELL_RANGE / (constants::SHELL_SPEED * constants::DT)).ceil() as u32;
+        assert_eq!(s.ttl_ticks, expected_ttl);
     }
 
     #[test]
@@ -237,16 +244,21 @@ mod tests {
     #[test]
     fn shell_advances_each_tick_then_explodes_on_ttl_expiry() {
         // Acceptance check from projectplan §6.2: shell expires next to a stationary ship
-        // and lands the expected damage.
+        // and lands the expected damage. With a 70 unit/s shell and 0.1s dt, a requested
+        // range of 200 yields ttl = ceil(200 / 7) = 29 ticks and an actual flight of 203
+        // units. Place s_2 at the exact impact for a centre splash.
+        let range = 200.0_f32;
+        let flight = (range / (constants::SHELL_SPEED * constants::DT)).ceil()
+            * constants::SHELL_SPEED
+            * constants::DT;
         let mut world = world_with(vec![
             ship_at("s_1", Vec2::new(500.0, 500.0)),
-            ship_at("s_2", Vec2::new(700.0, 500.0)),
+            ship_at("s_2", Vec2::new(500.0 + flight, 500.0)),
         ]);
-        // Aim s_1 east; with range = 200 the shell will land exactly on s_2.
-        fire(&mut world, &"s_1".into(), 90.0, 200.0).expect("fire");
-        // Step until expiry — 40 ticks.
+        fire(&mut world, &"s_1".into(), 90.0, range).expect("fire");
+        // Step until the shell explodes; the final step's events are what we assert on.
         let mut last_events = Vec::new();
-        for _ in 0..40 {
+        while !world.shells.is_empty() {
             last_events = step_shells(&mut world);
         }
         // The world's shells list is empty after explosion.
@@ -278,22 +290,28 @@ mod tests {
 
     #[test]
     fn splash_damage_falls_off_linearly_with_distance() {
-        // Place s_2 halfway out: dmg should be ~50% of max (rounded).
+        // Place s_2 half a splash radius beyond the actual impact point so frac ≈ 0.5 →
+        // dmg ≈ MAX_SPLASH_DAMAGE / 2.
+        let range = 200.0_f32;
+        let flight = (range / (constants::SHELL_SPEED * constants::DT)).ceil()
+            * constants::SHELL_SPEED
+            * constants::DT;
+        let impact_x = 500.0 + flight;
+        let half_splash = constants::SPLASH_RADIUS * 0.5;
         let mut world = world_with(vec![
             ship_at("s_1", Vec2::new(500.0, 500.0)),
-            // 207.5 = 200 + half of splash radius (15/2 = 7.5). Means at impact distance
-            // ~7.5, frac = 0.5 → dmg ≈ 12 (round 12.5).
-            ship_at("s_2", Vec2::new(707.5, 500.0)),
+            ship_at("s_2", Vec2::new(impact_x + half_splash, 500.0)),
         ]);
-        fire(&mut world, &"s_1".into(), 90.0, 200.0).expect("fire");
-        for _ in 0..40 {
+        fire(&mut world, &"s_1".into(), 90.0, range).expect("fire");
+        while !world.shells.is_empty() {
             step_shells(&mut world);
         }
         let hp_loss = constants::HULL_HP - world.ships.get("s_2").unwrap().hp;
-        // Round of 12.5 in Rust's `f32::round` is half-away-from-zero, so 13.
+        let half = constants::MAX_SPLASH_DAMAGE / 2;
+        // Allow ±2 HP slack for f32 rounding around the half-distance boundary.
         assert!(
-            (11..=14).contains(&hp_loss),
-            "expected ~half splash damage, got {hp_loss}"
+            (half.saturating_sub(2)..=half + 2).contains(&hp_loss),
+            "expected ~half ({half}) splash damage, got {hp_loss}",
         );
     }
 
@@ -329,15 +347,19 @@ mod tests {
 
     #[test]
     fn ship_at_zero_hp_is_marked_dead_and_emits_death_event() {
+        let range = 200.0_f32;
+        let flight = (range / (constants::SHELL_SPEED * constants::DT)).ceil()
+            * constants::SHELL_SPEED
+            * constants::DT;
         let mut world = world_with(vec![
             ship_at("s_1", Vec2::new(500.0, 500.0)),
-            ship_at("s_2", Vec2::new(700.0, 500.0)),
+            ship_at("s_2", Vec2::new(500.0 + flight, 500.0)),
         ]);
         // Knock s_2 to 1 HP so a single splash kills it.
         world.ships.get_mut("s_2").unwrap().hp = 1;
-        fire(&mut world, &"s_1".into(), 90.0, 200.0).expect("fire");
+        fire(&mut world, &"s_1".into(), 90.0, range).expect("fire");
         let mut last = Vec::new();
-        for _ in 0..40 {
+        while !world.shells.is_empty() {
             last = step_shells(&mut world);
         }
         assert!(!world.ships.get("s_2").unwrap().alive);

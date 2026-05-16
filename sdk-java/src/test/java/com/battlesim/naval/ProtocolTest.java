@@ -17,18 +17,18 @@ class ProtocolTest {
               "type": "welcome",
               "bot_id": "b_1",
               "ship_id": "s_1",
-              "map": { "width": 1000, "height": 1000 },
+              "map": { "width": 700, "height": 700 },
               "tick_hz": 10,
               "ship_specs": {
-                "max_forward_speed": 6.0,
+                "max_forward_speed": 9.0,
                 "max_reverse_speed": 2.0,
-                "acceleration": 1.5,
-                "turn_rate_deg_per_s": 15.0,
+                "acceleration": 3.5,
+                "turn_rate_deg_per_s": 20.0,
                 "hull_hp": 100,
-                "max_ammo": 20,
+                "max_ammo": 250,
                 "gun_cooldown_ticks": 15,
                 "hit_radius": 8.0,
-                "shell_speed": 50.0,
+                "shell_speed": 70.0,
                 "max_shell_range": 300.0,
                 "splash_radius": 15.0,
                 "max_splash_damage": 25
@@ -68,9 +68,9 @@ class ProtocolTest {
         JsonNode n = MAPPER.readTree(WELCOME);
         Welcome w = Welcome.from(n);
         assertEquals("b_1", w.botId());
-        assertEquals(1000, w.map().width());
-        assertEquals(50.0f, w.shipSpecs().shellSpeed(), EPS);
-        assertEquals(20, w.shipSpecs().maxAmmo());
+        assertEquals(700, w.map().width());
+        assertEquals(70.0f, w.shipSpecs().shellSpeed(), EPS);
+        assertEquals(250, w.shipSpecs().maxAmmo());
     }
 
     @Test

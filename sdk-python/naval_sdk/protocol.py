@@ -246,16 +246,19 @@ class Command:
         *,
         shooter_pos: Optional[Point] = None,
         target_vel: Optional[Sequence[float]] = None,
-        shell_speed: float = 50.0,
+        shell_speed: float = 70.0,
         range: Optional[float] = None,
         lead: bool = True,
     ) -> "Command":
         """Aim a shell at `target_pos`.
 
         If `shooter_pos` is supplied and `lead=True` and `target_vel` is non-zero,
-        the SDK leads the target using `shell_speed` (default 50, matching the
-        server). When `shooter_pos` is omitted, the bearing is computed from the
-        origin — pass `shooter_pos=view.me.pos` to do it right.
+        the SDK leads the target using `shell_speed` (default 70, matching the
+        server's `ship_specs.shell_speed`). Prefer passing the value you read
+        from `welcome.ship_specs.shell_speed` so your lead math tracks any
+        future balance changes. When `shooter_pos` is omitted, the bearing is
+        computed from the origin — pass `shooter_pos=view.me.pos` to do it
+        right.
 
         `range` defaults to the distance from `shooter_pos` to the aim point,
         clamped server-side to `max_shell_range`.

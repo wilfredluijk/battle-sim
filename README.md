@@ -5,16 +5,21 @@ to a central Rust server over WebSocket, and battle in a deterministic top-down
 naval simulation. A browser spectator renders matches live, and every match is
 saved as a JSONL replay log that can be re-played at full fidelity.
 
-The full design lives in [`system-design.md`](system-design.md). The wire
-protocol that bots speak lives in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+**Pick the doc you need:**
+- **Writing a bot?** Start with the SDK guide: [`docs/SDK_GUIDE.md`](docs/SDK_GUIDE.md). Reference SDKs live in [`sdk-python/`](sdk-python/) and [`sdk-java/`](sdk-java/), with runnable examples under [`examples/`](examples/).
+- **Implementing the wire protocol directly?** Read [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — every Bot↔Server and Server→Spectator frame is documented there.
+- **Curious how the game works?** [`system-design.md`](system-design.md) covers physics, sensors, weapons, and the trust model.
 
 ## Repository layout
 
 ```
 server/         Rust binary — authoritative simulation, WebSocket server, replay log
+sdk-python/     Reference Python SDK (`pip install -e .`)
+sdk-java/       Reference Java SDK (Maven, JDK 17+)
+examples/       Runnable example bots: circle / chaser / sniper, plus Java variants
 spectator/      Svelte + TypeScript + Vite app. Bundle is built to spectator/dist/
                 and baked into the server binary via `include_str!`.
-docs/           PROTOCOL.md and friends
+docs/           PROTOCOL.md, SDK_GUIDE.md, TACTICAL_TOOLKIT.md, design-decisions/
 Dockerfile      Multi-stage build (node → rust → debian-slim) producing a
                 self-contained server image.
 docker-compose.yml  One-service compose for `docker compose up --build`.
@@ -95,8 +100,8 @@ Run `npm test` for the Vitest unit tests against `src/lib/`.
 | `--port` | `7878` | TCP port for the WebSocket / HTTP listener |
 | `--tick-hz` | `10` | Simulation tick rate |
 | `--tick-deadline-ms` | `80` | Per-tick window for bots to submit commands |
-| `--map` | `1000x1000` | Map size in `WIDTHxHEIGHT` units |
-| `--max-bots` | `4` | Maximum bots per room |
+| `--map` | `700x700` | Map size in `WIDTHxHEIGHT` units |
+| `--max-bots` | `24` | Maximum bots per room |
 | `--seed` | `42` | RNG seed (drives all simulation randomness) |
 | `--replay-dir` | `./replays` | Where match replay JSONL files are written |
 | `--replay <FILE>` | — | Replay a saved match instead of accepting bot connections |
@@ -131,8 +136,13 @@ Then in the server terminal: `room start main`. The bot will start receiving
 `tick` frames; reply with `command` messages each tick. Full message reference
 in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
-A reference Python SDK and example bots are planned (Phases 9 / 10 of
-[`projectplan.md`](projectplan.md)) but not yet shipped.
+In practice you'll use one of the reference SDKs — Python ([`sdk-python/`](sdk-python/))
+or Java ([`sdk-java/`](sdk-java/)) — and start from an example under
+[`examples/`](examples/) (`circle_bot.py`, `chaser_bot.py`, `sniper_bot.py`,
+plus Java equivalents). The SDK owns the WebSocket, the handshake, and frame
+dispatch; you only override `on_tick`. See [`docs/SDK_GUIDE.md`](docs/SDK_GUIDE.md)
+for the API surface and [`docs/TACTICAL_TOOLKIT.md`](docs/TACTICAL_TOOLKIT.md)
+for the helm / tracker / sensor helpers.
 
 ## Replays
 
@@ -162,7 +172,11 @@ cd server
 cargo test                                  # unit + integration + replay tests
 cargo clippy --all-targets -- -D warnings   # lint gate
 cargo fmt                                   # format
+
+cd ../sdk-python
+pytest                                      # Python SDK unit tests
 ```
 
-CI expects `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test` to
+The same gates run in CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, and `pytest` must
 all be green.

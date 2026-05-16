@@ -132,11 +132,12 @@ mod tests {
         s.rudder = 1.0;
         let h0 = s.heading_deg;
         step_ship(&mut s, W, H);
-        // Expected: 15°/s * 0.1s = 1.5° per tick.
+        // Expected: TURN_RATE_DEG_PER_S * DT per tick at top speed.
+        let expected = constants::TURN_RATE_DEG_PER_S * constants::DT;
         let delta = s.heading_deg - h0;
         assert!(
-            (delta - 1.5).abs() < 1e-4,
-            "heading delta = {delta}, expected 1.5"
+            (delta - expected).abs() < 1e-4,
+            "heading delta = {delta}, expected {expected}"
         );
     }
 
@@ -157,8 +158,8 @@ mod tests {
         s.speed = MAX_FORWARD_SPEED;
         s.throttle = 1.0;
         step_ship(&mut s, W, H);
-        // 6.0 * 0.1 = 0.6 units east.
-        assert!((s.pos.x - 500.6).abs() < 1e-4, "x = {}", s.pos.x);
+        let step = constants::MAX_FORWARD_SPEED * constants::DT;
+        assert!((s.pos.x - (500.0 + step)).abs() < 1e-4, "x = {}", s.pos.x);
         assert!((s.pos.y - 500.0).abs() < 1e-4, "y = {}", s.pos.y);
     }
 
@@ -168,7 +169,8 @@ mod tests {
         s.speed = MAX_FORWARD_SPEED;
         s.throttle = 1.0;
         step_ship(&mut s, W, H);
-        assert!((s.pos.y - 499.4).abs() < 1e-4, "y = {}", s.pos.y);
+        let step = constants::MAX_FORWARD_SPEED * constants::DT;
+        assert!((s.pos.y - (500.0 - step)).abs() < 1e-4, "y = {}", s.pos.y);
     }
 
     #[test]

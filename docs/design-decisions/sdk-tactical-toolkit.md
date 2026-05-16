@@ -124,7 +124,7 @@ Per tick:
 4. **Update velocity** via EMA: `v_new = α * (Δp/Δt) + (1-α) * v_old`, default `α = 0.4`. Skip the update for passive-only folds (no position fix).
 5. **Stale** any track not seen for `staleness_ticks` (default 40) — drop it.
 
-Why EMA and not Kalman? With `±2u` uniform position noise and `dt = 0.1s`, EMA's tracking error settles at well under 1 u/s — adequate for `shell_speed = 50 u/s` lead solutions. Kalman is more code, more tuning, and the same answer in this regime.
+Why EMA and not Kalman? With `±2u` uniform position noise and `dt = 0.1s`, EMA's tracking error settles at well under 1 u/s — adequate for `shell_speed = 70 u/s` lead solutions. Kalman is more code, more tuning, and the same answer in this regime.
 
 ### 4.3 Gunner
 

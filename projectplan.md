@@ -24,7 +24,7 @@ Conventions:
 | 9 | Python SDK | **complete** |
 | 9b | Java SDK | **complete** |
 | 10 | Examples and onboarding | pending |
-| 11 | Polish | pending |
+| 11 | Polish | **complete** |
 
 ---
 
@@ -258,22 +258,22 @@ hatches.
 
 ---
 
-## Phase 11 — Polish
+## Phase 11 — Polish  *(complete)*
 
-### 11.1 Two-bot integration test
+### 11.1 Two-bot integration test  *(done)*
 - **Deliverable:** `server/tests/two_bot_match.rs` spins the server in-process, connects two scripted bots, runs to completion, asserts a winner is declared.
 - **Acceptance:** `cargo test two_bot_match` passes; runs in CI.
 
-### 11.2 Lint and format gate
-- **Deliverable:** CI workflow (or a documented `just check` / `make check`) running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `pytest`.
+### 11.2 Lint and format gate  *(done)*
+- **Deliverable:** `.github/workflows/ci.yml` running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `pytest`.
 - **Acceptance:** Green run on a clean checkout.
 
-### 11.3 Error message audit
-- **Deliverable:** Walk every `error` reply path in `protocol.rs` / `net.rs` and ensure messages are actionable for bot authors (include tick number, expected vs actual where useful).
+### 11.3 Error message audit  *(done)*
+- **Deliverable:** Walked every `error` reply path in `protocol.rs` / `net.rs` / `room.rs`. `handshake_timeout` now reports the timeout duration and the expected `hello` schema; `binary_frames_unsupported` names the `/bot` endpoint; `cooldown_active` includes the remaining cooldown ticks; `no_ammo` clarifies that ammo cannot regenerate; pre-handshake errors hint at the `hello` schema. `docs/PROTOCOL.md` documents these and warns bot authors to branch on `code`, not `message`.
 - **Acceptance:** Manual review; a bot author can debug without reading server source.
 
-### 11.4 README
-- **Deliverable:** Top-level `README.md`: one-paragraph pitch, link to QUICKSTART, link to PROTOCOL, link to system-design.
+### 11.4 README  *(done)*
+- **Deliverable:** Top-level `README.md`: one-paragraph pitch with prominent links to SDK guide, PROTOCOL, and system-design; outdated SDK/example claims removed; flag-default table aligned with `config.rs`.
 - **Acceptance:** A first-time visitor lands on the right doc within one click.
 
 ---

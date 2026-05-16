@@ -109,8 +109,8 @@ async fn hello_yields_welcome_and_ready_is_silent() {
     let ship_id = parsed["ship_id"].as_str().unwrap().to_string();
     assert!(bot_id.starts_with("b_"), "bot_id={bot_id}");
     assert!(ship_id.starts_with("s_"), "ship_id={ship_id}");
-    assert_eq!(parsed["map"]["width"], 1000);
-    assert_eq!(parsed["map"]["height"], 1000);
+    assert_eq!(parsed["map"]["width"], 700);
+    assert_eq!(parsed["map"]["height"], 700);
     assert_eq!(parsed["tick_hz"], 50);
 
     // After ready, the server should stay silent until game_start (Phase 4.2).

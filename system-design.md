@@ -111,8 +111,8 @@ naval-server \
   --port 7878 \
   --tick-hz 10 \
   --tick-deadline-ms 80 \
-  --map 1000x1000 \
-  --max-bots 4 \
+  --map 700x700 \
+  --max-bots 24 \
   --seed 42 \
   --replay-dir ./replays
 ```
@@ -295,7 +295,7 @@ The MVP picks the **smallest set of mechanics that produce real tactical depth**
 
 ### 5.1 The World
 
-- **2D plane**, 1000 × 1000 units (you can think of units as meters). No terrain, no obstacles in MVP.
+- **2D plane**, configurable via `--map WIDTHxHEIGHT` (default 700 × 700 units; you can think of units as meters). No terrain, no obstacles in MVP.
 - **Wrapping**: hard walls. Ships hitting walls take a small bump damage and stop.
 - **Coordinates**: origin top-left, +x right, +y down (matches canvas conventions for the spectator).
 - **Tick rate**: 10 Hz. `dt = 0.1s`.
@@ -306,14 +306,16 @@ Every ship is identical (no asymmetric balance to worry about for MVP).
 
 | Property | Value |
 |---|---|
-| Max forward speed | 6.0 units/s |
+| Max forward speed | 9.0 units/s |
 | Max reverse speed | 2.0 units/s |
-| Acceleration | 1.5 units/s² |
-| Turn rate at full rudder | 15°/s (scales linearly with speed; stationary ships barely turn) |
+| Acceleration | 3.5 units/s² |
+| Turn rate at full rudder | 20°/s (scales linearly with speed; stationary ships barely turn) |
 | Hull HP | 100 |
-| Ammo | 20 shells |
+| Ammo | 250 shells |
 | Gun cooldown | 1.5s (15 ticks) |
 | Hit radius (collision/hit) | 8 units |
+
+> **Source of truth.** These numbers live in `server/src/sim/constants.rs` and are surfaced verbatim in the `welcome` payload's `ship_specs` field. If you change one, change the constant — the table tracks the code, not the other way around.
 
 Throttle and rudder are continuous in `[-1, 1]`. Inertia matters — you can't stop on a dime, and high-speed turns are wide. This is the entire skill curve of movement: learning to lead your own future position.
 
@@ -339,8 +341,8 @@ This single binary choice — "do I see clearly but advertise myself, or stay qu
 One gun, ballistic shells.
 
 - **Fire command**: bearing (absolute, not relative) and a requested range.
-- **Shell speed**: 50 units/s, constant.
-- **Shell flight time** = `range / 50` seconds, capped at 6 seconds (max range 300 units).
+- **Shell speed**: 70 units/s, constant.
+- **Shell flight time** = `range / 70` seconds, capped at ~4.3 seconds (max range 300 units).
 - During flight, shells are visible to active radar.
 - On expiry: explode. Any ship within **15 units** of the splash takes damage based on proximity (linear falloff: 25 dmg at center, 0 at the edge).
 - Gun cooldown enforced server-side; `fire` commands during cooldown are silently ignored (an `error` event is sent to the bot).

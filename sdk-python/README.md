@@ -158,7 +158,7 @@ Command(throttle=0.8, rudder=-0.3, sensor_mode="passive")
 Command().fire_at(target_pos=enemy.pos, shooter_pos=view.me.pos)
 ```
 
-#### `Command.fire_at(target_pos, *, shooter_pos=None, target_vel=None, shell_speed=50.0, range=None, lead=True)`
+#### `Command.fire_at(target_pos, *, shooter_pos=None, target_vel=None, shell_speed=70.0, range=None, lead=True)`
 
 Aim a shell at `target_pos`. If `target_vel` is non-zero and
 `lead=True`, the SDK computes the lead intercept point using
@@ -209,8 +209,11 @@ Your ship's state this tick:
 
 Static gameplay constants from `welcome`. Persist on `bot.welcome.ship_specs`.
 
-Most useful fields: `shell_speed` (50.0), `max_shell_range` (300.0),
-`gun_cooldown_ticks` (15), `hull_hp` (100), `max_ammo` (20).
+Most useful fields (current defaults shown — always read them from
+`welcome.ship_specs` rather than hard-coding): `shell_speed` (70.0),
+`max_shell_range` (300.0), `gun_cooldown_ticks` (15), `hull_hp` (100),
+`max_ammo` (250), `max_forward_speed` (9.0),
+`turn_rate_deg_per_s` (20.0).
 
 ### `GameOver`
 

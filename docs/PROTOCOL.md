@@ -71,24 +71,26 @@ Acknowledges the `hello` and assigns identifiers and gameplay constants.
   "type": "welcome",
   "bot_id": "b_3",
   "ship_id": "s_3",
-  "map": { "width": 1000, "height": 1000 },
+  "map": { "width": 700, "height": 700 },
   "tick_hz": 10,
   "ship_specs": {
-    "max_forward_speed": 6.0,
+    "max_forward_speed": 9.0,
     "max_reverse_speed": 2.0,
-    "acceleration": 1.5,
-    "turn_rate_deg_per_s": 15.0,
+    "acceleration": 3.5,
+    "turn_rate_deg_per_s": 20.0,
     "hull_hp": 100,
-    "max_ammo": 20,
+    "max_ammo": 250,
     "gun_cooldown_ticks": 15,
     "hit_radius": 8.0,
-    "shell_speed": 50.0,
+    "shell_speed": 70.0,
     "max_shell_range": 300.0,
     "splash_radius": 15.0,
     "max_splash_damage": 25
   }
 }
 ```
+
+Field values shown above are the current defaults; the live `welcome` payload always reflects whatever the server is actually running. The runtime authority for these constants is `server/src/sim/constants.rs` — `ship_specs` is derived from there.
 
 #### `game_start`
 Sent when the operator transitions the room to `running`.
@@ -169,8 +171,10 @@ Sent when the room returns to the lobby after a match. SDKs should treat this as
 Sent in response to a malformed or otherwise-rejected bot frame. See [§3 Error codes](#3-error-codes).
 
 ```json
-{ "type": "error", "code": "late_command", "message": "command for tick 142 arrived after deadline" }
+{ "type": "error", "code": "late_command", "message": "command for tick 142 arrived 95ms after frame (deadline 80ms)" }
 ```
+
+The `message` field is human-readable and intended for logs / debugger output. It is *not* a stable contract — bots should branch on `code`, never on substring matches against `message`. Where useful, the server includes context (tick number, ms over deadline, ticks of cooldown remaining, expected schema); the exact wording may evolve.
 
 ### 1.3 Late and missing commands
 
@@ -321,7 +325,7 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `binary_frames_unsupported` | The `/bot` endpoint received a binary frame. |
 | `too_many_violations` | Last warning before the connection is closed. |
 | `late_command` | Command arrived after the per-tick deadline. |
-| `cooldown_active` | `fire` was issued while the gun was still cooling down. Duplicate cooldown errors in the same tick are coalesced into a single frame. |
+| `cooldown_active` | `fire` was issued while the gun was still cooling down. The `message` field reports the current tick and the remaining cooldown ticks. Duplicate cooldown errors in the same tick are coalesced into a single frame. |
 | `no_ammo` | `fire` was issued but the ship has no ammo left. Coalesced like `cooldown_active`. |
 | `invalid_name` | `hello.name` was empty, longer than 32 bytes, or contained characters outside `[A-Za-z0-9 _-]`. The connection is closed. |
 | `stale_command` | `command.tick` was outside the accepted window (`world_tick ± 1`). |

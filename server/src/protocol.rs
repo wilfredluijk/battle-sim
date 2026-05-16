@@ -112,20 +112,22 @@ pub struct ShipSpecs {
 }
 
 impl ShipSpecs {
-    /// Spec values from `system-design.md` §5.2 and §5.4. Used in the `welcome` payload.
+    /// Spec values from `sim::constants`. Used in the `welcome` payload. Keep this struct
+    /// in lock-step with `sim::constants` — bots base their physics models on what we send
+    /// here, so any drift would silently mislead every connected client.
     pub const DEFAULT: ShipSpecs = ShipSpecs {
-        max_forward_speed: 6.0,
-        max_reverse_speed: 2.0,
-        acceleration: 1.5,
-        turn_rate_deg_per_s: 15.0,
-        hull_hp: 100,
-        max_ammo: 20,
-        gun_cooldown_ticks: 15,
-        hit_radius: 8.0,
-        shell_speed: 50.0,
-        max_shell_range: 300.0,
-        splash_radius: 15.0,
-        max_splash_damage: 25,
+        max_forward_speed: crate::sim::constants::MAX_FORWARD_SPEED,
+        max_reverse_speed: crate::sim::constants::MAX_REVERSE_SPEED,
+        acceleration: crate::sim::constants::ACCELERATION,
+        turn_rate_deg_per_s: crate::sim::constants::TURN_RATE_DEG_PER_S,
+        hull_hp: crate::sim::constants::HULL_HP,
+        max_ammo: crate::sim::constants::MAX_AMMO,
+        gun_cooldown_ticks: crate::sim::constants::GUN_COOLDOWN_TICKS,
+        hit_radius: crate::sim::constants::HIT_RADIUS,
+        shell_speed: crate::sim::constants::SHELL_SPEED,
+        max_shell_range: crate::sim::constants::MAX_SHELL_RANGE,
+        splash_radius: crate::sim::constants::SPLASH_RADIUS,
+        max_splash_damage: crate::sim::constants::MAX_SPLASH_DAMAGE,
     };
 }
 

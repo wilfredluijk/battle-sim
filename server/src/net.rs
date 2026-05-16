@@ -367,7 +367,11 @@ async fn handle_bot(
             send_error(
                 &mut sink,
                 error_code::HANDSHAKE_TIMEOUT,
-                "hello not received within handshake timeout",
+                format!(
+                    "hello not received within {}s; first frame must be \
+                     {{\"type\":\"hello\",\"name\":\"...\",\"version\":\"...\"}}",
+                    hello_timeout.as_secs()
+                ),
             )
             .await;
             let _ = sink
@@ -523,7 +527,7 @@ async fn handle_bot(
                         send_error(
                             &mut sink,
                             error_code::BINARY_FRAMES_UNSUPPORTED,
-                            "this endpoint only accepts text JSON frames",
+                            "/bot only accepts text JSON frames (binary frames are rejected)",
                         )
                         .await;
                         if violations >= MAX_VIOLATIONS {
@@ -586,7 +590,8 @@ async fn wait_for_hello(
                                 send_error(
                                     sink,
                                     error_code::INVALID_MESSAGE,
-                                    "first message must be `hello`",
+                                    "first message must be `hello`: \
+                                     {\"type\":\"hello\",\"name\":\"...\",\"version\":\"...\"}",
                                 ).await;
                                 if *violations >= MAX_VIOLATIONS {
                                     disconnect_for_violations(sink).await;
@@ -618,7 +623,7 @@ async fn wait_for_hello(
                         send_error(
                             sink,
                             error_code::BINARY_FRAMES_UNSUPPORTED,
-                            "this endpoint only accepts text JSON frames",
+                            "/bot only accepts text JSON frames (binary frames are rejected)",
                         ).await;
                         if *violations >= MAX_VIOLATIONS {
                             disconnect_for_violations(sink).await;

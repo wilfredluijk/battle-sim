@@ -35,13 +35,15 @@ public final class AcousticShadowBot extends Bot {
 
     private final List<Track> tracks = new ArrayList<>();
 
+    // Fallback defaults matching the current server (`sim::constants`); overwritten
+    // in `onWelcome` from the authoritative `ship_specs` payload.
     private int tickHz = 10;
     private int cooldownTicks = 15;
-    private float shellSpeed = 50.0f;
+    private float shellSpeed = 70.0f;
     private float maxShellRange = 300.0f;
     private float splashRadius = 15.0f;
     private int hullHp = 100;
-    private MapInfo map = new MapInfo(1000, 1000);
+    private MapInfo map = new MapInfo(700, 700);
 
     private long nextFireTick = 0;
     private long activeBurstUntilTick = -1;
