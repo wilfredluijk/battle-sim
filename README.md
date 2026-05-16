@@ -55,9 +55,20 @@ If you don't want to install Rust + Node locally, the compose file builds the
 whole stack (spectator → server) in a multi-stage image:
 
 ```bash
-docker compose up --build
+docker compose up --build -d              # build + start detached
+docker attach battle-sim                  # attach to the server's stdin/stdout
 ```
 
+The server reads operator commands from its stdin (`room list`, `room start main`,
+`quit`, …) and exits if stdin closes. The compose file sets
+`restart: unless-stopped`, so without an attached stdin the container would
+exit and immediately restart in a loop. Starting detached and then `docker
+attach`-ing gives the server the stdin/stdout it needs and lets you drive the
+room from the terminal. The compose service is declared with `stdin_open: true`
+and `tty: true` so that `docker attach` can connect — without these flags
+`docker attach` fails with `unable to upgrade to tcp, received 409`.
+
+Detach without stopping the container with the `Ctrl-P Ctrl-Q` escape sequence.
 Server listens on `127.0.0.1:7878`; replays land in `./replays/` via a
 bind-mount. Stop with `docker compose down`.
 

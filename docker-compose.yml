@@ -3,6 +3,8 @@ services:
     build: .
     image: battle-sim:local
     container_name: battle-sim
+    stdin_open: true
+    tty: true
     ports:
       - "7878:7878"
     volumes:
