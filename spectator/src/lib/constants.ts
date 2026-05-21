@@ -1,7 +1,6 @@
-// Visual + simulation constants. The "MAX_*" gameplay values match `ShipSpecs::DEFAULT`
-// in the server (`server/src/protocol.rs`). They're duplicated here so the spectator can
-// scale meters without first seeing a `welcome` frame; a future spectator that wires up
-// the bot welcome could read these from the server instead.
+// Visual + simulation constants. The "MAX_*" gameplay values match the `SimConfig`
+// defaults in the server (`server/src/sim/config.rs`). They are fallbacks only — once
+// `GET /api/room` lands, the spectator scales meters from the match's actual config.
 
 export const MAP_WIDTH = 1000;
 export const MAP_HEIGHT = 1000;

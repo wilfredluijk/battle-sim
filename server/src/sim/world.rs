@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use glam::Vec2;
 
+use super::config::SimConfig;
 use super::constants;
 
 /// Stable bot identifier, e.g. `"b_3"`. Assigned by the room on `hello`.
@@ -54,13 +55,14 @@ impl Ship {
 
     /// Reset all mutable state to fresh-spawn values without changing `id` / `bot_id`.
     /// Used by the room to recycle a ship between back-to-back matches on the same
-    /// connection: the bot keeps its identity, the hull is brand new.
-    pub fn reset_for_round(&mut self, pos: Vec2, heading_deg: f32) {
+    /// connection: the bot keeps its identity, the hull is brand new. `hp` / `ammo` are
+    /// taken from `config` so a rebalanced match starts with the configured values.
+    pub fn reset_for_round(&mut self, pos: Vec2, heading_deg: f32, config: &SimConfig) {
         self.pos = pos;
         self.heading_deg = heading_deg;
         self.speed = 0.0;
-        self.hp = constants::HULL_HP;
-        self.ammo = constants::MAX_AMMO;
+        self.hp = config.hull_hp;
+        self.ammo = config.max_ammo;
         self.throttle = 0.0;
         self.rudder = 0.0;
         self.gun_cooldown = 0;
@@ -87,10 +89,13 @@ pub struct World {
     pub ships: BTreeMap<ShipId, Ship>,
     pub shells: Vec<Shell>,
     pub next_shell_index: u32,
+    /// Balance parameters for the current match. Frozen when the match starts; the
+    /// simulation reads ship / weapon / sensor tunables from here.
+    pub config: SimConfig,
 }
 
 impl World {
-    pub fn new(width: f32, height: f32) -> Self {
+    pub fn new(width: f32, height: f32, config: SimConfig) -> Self {
         Self {
             tick: 0,
             width,
@@ -98,6 +103,7 @@ impl World {
             ships: BTreeMap::new(),
             shells: Vec::new(),
             next_shell_index: 0,
+            config,
         }
     }
 
@@ -117,7 +123,7 @@ mod tests {
 
     #[test]
     fn can_construct_world_with_two_ships_and_read_back_state() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(Ship::new_at(
             "s_1".into(),
             "b_1".into(),
@@ -150,7 +156,7 @@ mod tests {
     #[test]
     fn btreemap_iteration_is_stable() {
         // Determinism check: ships always iterate in BotId order regardless of insert order.
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         for id in ["s_3", "s_1", "s_2"] {
             world.insert_ship(Ship::new_at(id.into(), "b".into(), Vec2::ZERO, 0.0));
         }

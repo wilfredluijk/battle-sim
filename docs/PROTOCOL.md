@@ -2,12 +2,12 @@
 
 Public contract between the naval-battle server and bot / spectator clients. This doc and `server/src/protocol.rs` are mirrors — when one changes, the other changes in the same commit.
 
-- **Transport:** WebSocket over TCP.
+- **Transport:** WebSocket over TCP for the streaming surfaces; plain HTTP for the control plane.
 - **Encoding:** UTF-8 JSON, one object per text frame, no batching, no binary frames.
 - **Endpoints:**
-  - `ws://<host>:<port>/bot` — bidirectional, untrusted.
-  - `ws://<host>:<port>/spectate` — server-to-client only.
-  - `ws://<host>:<port>/admin?token=<TOKEN>` — bidirectional, gated by a rotating token (printed at INFO on server start, overridable with `--admin-token`).
+  - `ws://<host>:<port>/bot` — bidirectional WebSocket, untrusted.
+  - `ws://<host>:<port>/spectate` — server-to-client WebSocket only.
+  - `http://<host>:<port>/api/*` — REST control plane for the operator UI (admin login + room lifecycle). See §2.5.
 - **Discriminator:** every message has a `"type"` field (snake_case).
 - **Coordinates:** `[x, y]` arrays of `f32`. Origin top-left, `+x` right, `+y` down. Bearings are in absolute compass degrees (0° = `+y`-axis is unspecified by the design; treat bearings consistently between `fire` and contacts — see PR-relative discussion in `system-design.md` §5.4).
 - **Numbers:** all coordinates, speeds, headings, and ranges are `f32`. Tick numbers, HP, and ammo are unsigned integers.
@@ -251,27 +251,49 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
 
 ---
 
-## 2.5 Admin endpoint — `/admin`
+## 2.5 Admin control plane — `/api/*` (REST)
 
-Bidirectional control channel for an operator UI. Authentication: every connection MUST carry the current admin token as a query parameter — e.g. `ws://host:port/admin?token=AbCd...`. The server validates the token before completing the WebSocket upgrade; a missing or wrong token returns HTTP 401.
+Operator control is a plain HTTP/JSON REST API, not a WebSocket. The spectator web UI uses it to inspect and drive the room; there is no stdin command interface.
 
-The token is generated at startup and printed to the log at `INFO` (look for the `admin token` line) unless `--admin-token <TOKEN>` overrides it. Tokens rotate on every server restart.
+**Authentication.** Mutating routes require a JSON Web Token. Obtain one with `POST /api/login`, then send it as `Authorization: Bearer <jwt>` on every mutating request. The admin password is set with `--admin-password` (or the `BATTLE_ADMIN_PASSWORD` env var); when neither is provided the server generates a random password and logs it once at `INFO` on startup. Tokens expire after `--token-ttl-hours` hours (default 12).
 
-### 2.5.1 Server → Admin
+**Errors.** Any non-2xx response carries a JSON body `{ "code": "...", "message": "..." }`. Successful mutations return `204 No Content`.
 
-#### `state`
-Pushed immediately on subscribe and on every lifecycle transition (bot connect/disconnect/ready, match start, match end, lobby return).
+### 2.5.1 Endpoints
+
+| Method & path | Auth | Success | Purpose |
+|---|---|---|---|
+| `POST /api/login` | — | `200` | Exchange the admin password for a JWT. |
+| `GET /api/room` | public | `200` | Current room state plus the active balance parameters. |
+| `GET /api/room/report` | public | `200` / `404` | Most recent match report (`404` until a match has finished). |
+| `GET /api/config/schema` | public | `200` | Metadata for the pre-match parameter form. |
+| `PUT /api/room/config` | admin | `204` | Replace the match parameters. Only valid in the lobby. |
+| `POST /api/room/start` | admin | `204` | Lobby → Running. Refused if not in lobby, no bots, or not all ready. |
+| `POST /api/room/abort` | admin | `204` | Force-end the running match (`game_over` with `winner: null`). |
+| `POST /api/room/reset` | admin | `204` | Ended → Lobby immediately, skipping the post-game pause. |
+| `POST /api/room/kick` | admin | `204` | Disconnect a single bot by `bot_id`. |
+
+### 2.5.2 `POST /api/login`
+
+```json
+// request                          // response (200)
+{ "password": "hunter2" }           { "token": "eyJhbGc...", "expires_at": 1779400000 }
+```
+
+A wrong password returns `401` with code `invalid_credentials`.
+
+### 2.5.3 `GET /api/room`
 
 ```json
 {
-  "type": "state",
   "room": "main",
   "state": "lobby",
   "tick": 0,
   "last_winner": null,
   "bots": [
     { "bot_id": "b_1", "name": "alice", "ship_id": "s_1", "ready": true, "alive": true }
-  ]
+  ],
+  "config": { "hull_hp": 100, "shell_speed": 70.0, "...": "..." }
 }
 ```
 
@@ -280,37 +302,65 @@ Pushed immediately on subscribe and on every lifecycle transition (bot connect/d
 | `state` | `"lobby"` \| `"running"` \| `"ended"` | Room state machine. `ended` is the post-game pause; the room returns to `lobby` automatically after ~2s. |
 | `tick` | u64 | Current `world.tick`. |
 | `last_winner` | string \| null | `bot_id` of the most recent winner, or `null` for a draw / abort / fresh match. |
-| `bots[].alive` | bool | Tracks the ship's `alive` flag for the running match; `true` in lobby. |
+| `config` | object | The active `SimConfig` — a flat map of every balance tunable to its current value. |
 
-#### `ack`
-Optional acknowledgement for a command. Use `state` pushes for authoritative truth.
+### 2.5.4 `GET /api/config/schema`
 
-```json
-{ "type": "ack", "command": "start" }
-```
-
-#### `error`
-Returned when the server rejects a command. Codes: `start_refused`, `not_running`, `not_ended`, `unknown_bot`, `malformed_json`, `invalid_message`.
+Describes each tunable so a UI can render a form. `integer` fields must be sent as whole numbers in `PUT /api/room/config`.
 
 ```json
-{ "type": "error", "code": "not_running", "message": "room is not running" }
+{
+  "fields": [
+    { "key": "hull_hp", "label": "Hull HP", "group": "ship",
+      "default": 100, "min": 1, "max": 100000, "integer": true }
+  ]
+}
 ```
 
-### 2.5.2 Admin → Server
+### 2.5.5 `PUT /api/room/config`
+
+Body is a complete `SimConfig` object (every key from the schema). Parameters are frozen when the match starts and recorded in the replay header.
+
+- `204` — applied.
+- `400` `invalid_parameter` — a value failed validation (non-finite, out of bounds).
+- `409` `not_in_lobby` — the room is running or ended; parameters cannot change mid-match.
+- `401` `unauthorized` — missing or invalid bearer token.
+
+### 2.5.6 `GET /api/room/report`
+
+The post-match summary. `404` with code `no_report` until the first match has finished; the report then persists until the next match starts.
 
 ```json
-{ "type": "start" }
-{ "type": "abort" }
-{ "type": "reset" }
-{ "type": "kick", "bot_id": "b_3" }
+{
+  "room": "main",
+  "replay_id": "match_main_1779400000",
+  "outcome": "winner",
+  "winner": "b_1",
+  "winner_name": "alice",
+  "duration_ticks": 412,
+  "duration_seconds": 41.2,
+  "bots": [
+    { "bot_id": "b_1", "name": "alice", "shots_fired": 18, "hits_landed": 7,
+      "accuracy": 0.388, "damage_dealt": 140, "damage_taken": 55,
+      "kills": 1, "final_hp": 45, "survived": true }
+  ]
+}
 ```
 
-| Command | Effect |
-|---|---|
-| `start` | Lobby → Running. Refused if not in Lobby, no bots, or not all ready. |
-| `abort` | Force-end the running match (`game_over` with `winner: null`). |
-| `reset` | Ended → Lobby immediately, skipping the post-game pause. Refused outside Ended. |
-| `kick` | Disconnect a single bot by `bot_id`. |
+| Field | Type | Notes |
+|---|---|---|
+| `outcome` | `"winner"` \| `"draw"` \| `"aborted"` | How the match ended. |
+| `winner` / `winner_name` | string \| null | The winning `bot_id` and name; `null` for a draw or abort. |
+| `duration_ticks` / `duration_seconds` | u64 / f32 | Match length. |
+| `bots[].accuracy` | f32 | `hits_landed / shots_fired`, in `[0, 1]`; `0` when the bot never fired. |
+
+### 2.5.7 `POST /api/room/kick`
+
+```json
+{ "bot_id": "b_3" }
+```
+
+Returns `404` with code `unknown_bot` when no bot holds that id.
 
 ---
 
@@ -352,6 +402,16 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-05-21 — REST control plane + configurable match parameters
+
+- Replaced the `/admin` WebSocket with a REST control plane under `/api/*`. Admin auth is now `POST /api/login` (password → JWT); mutating routes require an `Authorization: Bearer <jwt>` header. Lifecycle actions moved to `POST /api/room/{start,abort,reset,kick}`; room state is `GET /api/room` (public). See §2.5.
+- Removed the server's stdin command interface — every operator action goes through `/api/*`.
+- Added per-match balance parameters (`SimConfig`): ship / weapon / sensor tunables are editable in the lobby via `PUT /api/room/config` and described by `GET /api/config/schema`. `GET /api/room` now includes the active `config`.
+- Added `GET /api/room/report` — a post-match summary (winner, duration, per-bot shots / hits / damage / kills). `404` until the first match finishes.
+- Replay log format bumped to **v2**: the header now records the match's `sim_config` so a replay rebuilds with the exact parameters. v1 logs are no longer readable.
+- The admin password is set with `--admin-password` / `BATTLE_ADMIN_PASSWORD` (random per start if unset, logged once at `INFO`); token lifetime via `--token-ttl-hours` (default 12). The `--admin-token` flag is gone.
+- The `/bot` and `/spectate` WebSocket protocols are unchanged — existing bots need no update.
 
 ## 2026-05-16 — admin lifecycle plane + bots survive `game_over`
 

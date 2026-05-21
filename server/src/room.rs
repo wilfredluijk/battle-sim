@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use glam::Vec2;
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
+use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -29,9 +30,8 @@ use crate::replay::{
     ReplayWriter, REPLAY_FORMAT_VERSION,
 };
 use crate::sim::combat::{self, CombatEvent, FireError};
-use crate::sim::constants::{ACTIVE_RADAR_RANGE, PASSIVE_HEAR_NEARBY_RANGE};
 use crate::sim::sensors::{self, Contact as SimContact, ContactKind as SimContactKind};
-use crate::sim::{physics, BotId, Ship, ShipId, World};
+use crate::sim::{physics, BotId, Ship, ShipId, SimConfig, World};
 
 /// A pre-serialized spectator frame, broadcast once per tick to every `/spectate`
 /// connection. Wrapped in `Arc` so subscribers share the underlying allocation rather
@@ -196,6 +196,24 @@ impl KickError {
     }
 }
 
+/// Reasons an `OperatorConfigure` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigureError {
+    /// Parameters can only be changed while the room is in `Lobby`.
+    NotInLobby,
+    /// A parameter failed validation; the string is a human-readable reason.
+    Invalid(String),
+}
+
+impl ConfigureError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ConfigureError::NotInLobby => "parameters can only be changed before the match starts",
+            ConfigureError::Invalid(reason) => reason,
+        }
+    }
+}
+
 /// Events the room consumes from connection tasks and the operator. The room is
 /// single-threaded with respect to its own state; this channel serializes all mutations.
 #[derive(Debug)]
@@ -244,6 +262,74 @@ pub enum RoomEvent {
     AdminSubscribe {
         reply: oneshot::Sender<broadcast::Receiver<AdminServerMsg>>,
     },
+    /// Admin REST request for a one-shot snapshot of the current room state. Used by
+    /// `GET /api/room` — no subscription, just the current `AdminState`.
+    QueryState {
+        reply: oneshot::Sender<RoomSnapshot>,
+    },
+    /// Admin REST request for the most recent [`MatchReport`]. Used by
+    /// `GET /api/room/report`. `None` until the first match has finished.
+    QueryReport {
+        reply: oneshot::Sender<Option<MatchReport>>,
+    },
+    /// Operator-issued parameter change from `PUT /api/room/config`. Only valid in
+    /// `Lobby`; replaces the match's `SimConfig` after validation.
+    OperatorConfigure {
+        config: SimConfig,
+        reply: oneshot::Sender<Result<(), ConfigureError>>,
+    },
+}
+
+/// One-shot snapshot returned by `RoomEvent::QueryState`: the admin-facing room state plus
+/// the current balance parameters so the pre-match UI can populate its form.
+#[derive(Debug, Clone)]
+pub struct RoomSnapshot {
+    pub state: AdminState,
+    pub config: SimConfig,
+}
+
+/// Per-bot statistics accumulated over a single match. Reset at `start_match`, frozen into
+/// a [`MatchReport`] when the match ends. Counters are bumped inside `step_tick`, so they
+/// are deterministic — a replay rebuilds identical figures.
+#[derive(Debug, Clone, Default)]
+struct BotStats {
+    shots_fired: u32,
+    hits_landed: u32,
+    damage_dealt: u32,
+    damage_taken: u32,
+    kills: u32,
+}
+
+/// Post-match summary surfaced to the spectator UI via `GET /api/room/report`. Built once
+/// when a match ends (naturally or by abort) and kept until the next match starts.
+#[derive(Debug, Clone, Serialize)]
+pub struct MatchReport {
+    pub room: String,
+    /// Identifier of the replay log for this match, if one was written.
+    pub replay_id: Option<String>,
+    /// `"winner"`, `"draw"`, or `"aborted"`.
+    pub outcome: String,
+    pub winner: Option<BotId>,
+    pub winner_name: Option<String>,
+    pub duration_ticks: u64,
+    pub duration_seconds: f32,
+    pub bots: Vec<BotReport>,
+}
+
+/// One bot's row in a [`MatchReport`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BotReport {
+    pub bot_id: BotId,
+    pub name: String,
+    pub shots_fired: u32,
+    pub hits_landed: u32,
+    /// `hits_landed / shots_fired`, in `[0, 1]`; `0.0` when the bot never fired.
+    pub accuracy: f32,
+    pub damage_dealt: u32,
+    pub damage_taken: u32,
+    pub kills: u32,
+    pub final_hp: u32,
+    pub survived: bool,
 }
 
 #[derive(Debug)]
@@ -299,6 +385,13 @@ pub struct Room {
     /// runtime in `main.rs` wires a real channel. Receivers are added via
     /// `RoomEvent::AdminSubscribe`.
     admin_tx: Option<broadcast::Sender<AdminServerMsg>>,
+    /// Per-bot statistics for the in-progress match, keyed by `BotId`. Reset to a fresh
+    /// entry per bot at `start_match`; folded into `last_report` when the match ends.
+    match_stats: BTreeMap<BotId, BotStats>,
+    /// Report from the most recently finished match. Survives the `Ended → Lobby`
+    /// transition so the post-battle screen can show it; replaced at the next
+    /// `start_match`. `None` until the first match has finished.
+    last_report: Option<MatchReport>,
 }
 
 impl Room {
@@ -313,7 +406,7 @@ impl Room {
     ) -> Self {
         Self {
             name,
-            world: World::new(width, height),
+            world: World::new(width, height, crate::sim::SimConfig::default()),
             state: RoomState::Lobby,
             rng: Pcg64::seed_from_u64(seed),
             seed,
@@ -332,6 +425,8 @@ impl Room {
             end_tick: None,
             last_winner: None,
             admin_tx: None,
+            match_stats: BTreeMap::new(),
+            last_report: None,
         }
     }
 
@@ -451,13 +546,18 @@ impl Room {
                 ship.rudder = cmd.rudder.clamp(-1.0, 1.0);
             }
             if let Some(fire_cmd) = cmd.fire {
-                if let Err(err) = combat::fire(
+                match combat::fire(
                     &mut self.world,
                     &ship_id,
                     fire_cmd.bearing_deg,
                     fire_cmd.range,
                 ) {
-                    self.send_fire_error(bot_id, err);
+                    Ok(()) => {
+                        if let Some(stats) = self.match_stats.get_mut(bot_id) {
+                            stats.shots_fired += 1;
+                        }
+                    }
+                    Err(err) => self.send_fire_error(bot_id, err),
                 }
             }
             // Record the raw command (un-clamped) so a replay re-applies the exact same
@@ -490,6 +590,10 @@ impl Room {
         // end-of-match check so the deciding tick (with its death events) is visible.
         self.broadcast_spectator_world(&combat_events);
 
+        // Fold this tick's combat into the per-bot match statistics. Runs before the
+        // end-of-match check so the deciding tick's hits and kills are counted.
+        self.accumulate_combat_stats(&combat_events);
+
         // 5. End-of-match check. Broadcasting `game_over` and returning early means dead
         //    and surviving bots all hear about the outcome via the same message; no final
         //    `tick` frame is sent for the deciding tick.
@@ -497,6 +601,7 @@ impl Room {
             self.state = RoomState::Ended;
             self.end_tick = Some(self.world.tick);
             self.last_winner = winner.clone();
+            self.last_report = Some(self.build_match_report(winner.clone(), false));
             self.broadcast_game_over(winner);
             self.publish_admin_state();
             return;
@@ -533,7 +638,13 @@ impl Room {
                 .enumerate()
                 .map(|(i, c)| translate_contact(i, c))
                 .collect();
-            let events = filter_events_for_bot(&ship_id, viewer_pos, sensor_mode, &combat_events);
+            let events = filter_events_for_bot(
+                &ship_id,
+                viewer_pos,
+                sensor_mode,
+                &self.world.config,
+                &combat_events,
+            );
 
             let entry = self.bots.get(bot_id).expect("bot still present");
             let ship = self.world.ships.get(&ship_id).expect("ship still present");
@@ -600,6 +711,108 @@ impl Room {
             return Some(winner);
         }
         None
+    }
+
+    /// Resolve a `ShipId` to its owning `BotId` via the ship registry. Dead ships stay in
+    /// `world.ships`, so this works for the firer of a lethal shot too.
+    fn bot_for_ship(&self, ship_id: &ShipId) -> Option<BotId> {
+        self.world.ships.get(ship_id).map(|s| s.bot_id.clone())
+    }
+
+    /// Fold one tick's combat events into `match_stats`. Damage taken is credited to the
+    /// victim; damage dealt, hits and kills to the firing ship's bot (friendly fire and
+    /// self-kills included — the report shows raw figures, not adjusted scores).
+    fn accumulate_combat_stats(&mut self, events: &[CombatEvent]) {
+        for event in events {
+            match event {
+                CombatEvent::Hit {
+                    ship_id,
+                    amount,
+                    source,
+                    ..
+                } => {
+                    if let Some(victim) = self.bot_for_ship(ship_id) {
+                        if let Some(stats) = self.match_stats.get_mut(&victim) {
+                            stats.damage_taken += *amount;
+                        }
+                    }
+                    if let Some(shooter) = self.bot_for_ship(source) {
+                        if let Some(stats) = self.match_stats.get_mut(&shooter) {
+                            stats.damage_dealt += *amount;
+                            stats.hits_landed += 1;
+                        }
+                    }
+                }
+                CombatEvent::Death { source, .. } => {
+                    if let Some(shooter) = self.bot_for_ship(source) {
+                        if let Some(stats) = self.match_stats.get_mut(&shooter) {
+                            stats.kills += 1;
+                        }
+                    }
+                }
+                CombatEvent::Splash { .. } => {}
+            }
+        }
+    }
+
+    /// Freeze the current match into a [`MatchReport`]. `aborted` distinguishes an
+    /// operator abort (no winner) from a natural draw.
+    fn build_match_report(&self, winner: Option<BotId>, aborted: bool) -> MatchReport {
+        let outcome = if aborted {
+            "aborted"
+        } else if winner.is_some() {
+            "winner"
+        } else {
+            "draw"
+        };
+        let winner_name = winner
+            .as_ref()
+            .and_then(|w| self.bots.get(w).map(|b| b.name.clone()));
+        let duration_ticks = self.world.tick;
+        let duration_seconds = if self.tick_hz > 0 {
+            duration_ticks as f32 / self.tick_hz as f32
+        } else {
+            0.0
+        };
+        let bots = self
+            .bots
+            .values()
+            .map(|entry| {
+                let stats = self
+                    .match_stats
+                    .get(&entry.bot_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let ship = self.world.ships.get(&entry.ship_id);
+                let accuracy = if stats.shots_fired > 0 {
+                    stats.hits_landed as f32 / stats.shots_fired as f32
+                } else {
+                    0.0
+                };
+                BotReport {
+                    bot_id: entry.bot_id.clone(),
+                    name: entry.name.clone(),
+                    shots_fired: stats.shots_fired,
+                    hits_landed: stats.hits_landed,
+                    accuracy,
+                    damage_dealt: stats.damage_dealt,
+                    damage_taken: stats.damage_taken,
+                    kills: stats.kills,
+                    final_hp: ship.map(|s| s.hp).unwrap_or(0),
+                    survived: ship.map(|s| s.alive).unwrap_or(false),
+                }
+            })
+            .collect();
+        MatchReport {
+            room: self.name.clone(),
+            replay_id: self.replay_id.clone(),
+            outcome: outcome.into(),
+            winner,
+            winner_name,
+            duration_ticks,
+            duration_seconds,
+            bots,
+        }
     }
 
     /// Build a `SpectatorMsg::World` from the current world state and push it onto the
@@ -673,7 +886,7 @@ impl Room {
                 CombatEvent::Splash { pos } => SpectatorEvent::ShellSplash {
                     pos: [pos.x, pos.y],
                 },
-                CombatEvent::Death { ship_id } => SpectatorEvent::Death {
+                CombatEvent::Death { ship_id, .. } => SpectatorEvent::Death {
                     ship_id: ship_id.clone(),
                 },
             })
@@ -708,6 +921,7 @@ impl Room {
         self.state = RoomState::Ended;
         self.end_tick = Some(self.world.tick);
         self.last_winner = None;
+        self.last_report = Some(self.build_match_report(None, true));
         self.broadcast_game_over(None);
         Ok(())
     }
@@ -730,12 +944,13 @@ impl Room {
     fn transition_to_lobby(&mut self) {
         info!(room = %self.name, "returning to lobby for next match");
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
+        let config = self.world.config;
         self.world.tick = 0;
         self.world.shells.clear();
         self.world.next_shell_index = 0;
         for entry in self.bots.values_mut() {
             if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
-                ship.reset_for_round(center, 0.0);
+                ship.reset_for_round(center, 0.0, &config);
             }
             entry.ready = false;
             entry.pending_command = None;
@@ -1017,7 +1232,36 @@ impl Room {
                 }
                 // No-op when no admin channel is wired (unit tests).
             }
+            RoomEvent::QueryState { reply } => {
+                let _ = reply.send(RoomSnapshot {
+                    state: self.admin_state_snapshot(),
+                    config: self.world.config,
+                });
+            }
+            RoomEvent::QueryReport { reply } => {
+                let _ = reply.send(self.last_report.clone());
+            }
+            RoomEvent::OperatorConfigure { config, reply } => {
+                let result = self.configure(config);
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, reason = e.as_str(), "operator configure refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
         }
+    }
+
+    /// Apply an operator-supplied [`SimConfig`]. Only valid in `Lobby`; the parameters are
+    /// validated before they replace the match config.
+    fn configure(&mut self, config: SimConfig) -> Result<(), ConfigureError> {
+        if self.state != RoomState::Lobby {
+            return Err(ConfigureError::NotInLobby);
+        }
+        config.validate().map_err(ConfigureError::Invalid)?;
+        self.world.config = config;
+        info!(room = %self.name, "match parameters updated");
+        Ok(())
     }
 
     /// Queue a command for the next tick or reject it as `late_command` per §1.3 of the
@@ -1128,6 +1372,9 @@ impl Room {
 
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
         let n = self.bots.len() as f32;
+        // Freeze the balance parameters for the whole match: ship hull / ammo and every
+        // physics tunable are read from this snapshot from here on.
+        let config = self.world.config;
         // Snapshot bot ids so we can mutate `self.world` and read `self.bots` without
         // simultaneous &mut+&. Iteration order is BotId-stable (BTreeMap).
         let ordered_ids: Vec<BotId> = self.bots.keys().cloned().collect();
@@ -1144,11 +1391,8 @@ impl Room {
                 entry.ship_id.clone()
             };
             if let Some(ship) = self.world.ships.get_mut(&ship_id) {
-                ship.pos = pos;
-                ship.heading_deg = heading_deg;
-                ship.speed = 0.0;
-                ship.throttle = 0.0;
-                ship.rudder = 0.0;
+                // A fresh hull for the match, sized by the configured parameters.
+                ship.reset_for_round(pos, heading_deg, &config);
             }
 
             let entry = self.bots.get(bot_id).expect("snapshot still in map");
@@ -1173,6 +1417,14 @@ impl Room {
         // clients see this through the next `AdminServerMsg::State` push.
         self.last_winner = None;
         self.end_tick = None;
+        // Fresh statistics: one zeroed entry per starting bot. The previous match's report
+        // is dropped — `GET /api/room/report` 404s until this match finishes.
+        self.match_stats = self
+            .bots
+            .keys()
+            .map(|id| (id.clone(), BotStats::default()))
+            .collect();
+        self.last_report = None;
         info!(room = %self.name, bots = self.bots.len(), "match started");
 
         // Open a new replay log (unless a writer was injected externally — e.g. by tests)
@@ -1236,6 +1488,7 @@ impl Room {
                 height: self.world.height as u32,
             },
             max_bots: self.max_bots,
+            sim_config: self.world.config,
             bots: self
                 .bots
                 .values()
@@ -1309,7 +1562,7 @@ impl Room {
                 height: self.world.height as u32,
             },
             tick_hz: self.tick_hz,
-            ship_specs: ShipSpecs::DEFAULT,
+            ship_specs: ShipSpecs::from_config(&self.world.config),
         };
         // The receiver was just created and has buffer >= 1, so this never fails.
         out_tx
@@ -1374,11 +1627,12 @@ fn filter_events_for_bot(
     own_ship: &ShipId,
     viewer_pos: Vec2,
     sensor_mode: SensorMode,
+    config: &SimConfig,
     events: &[CombatEvent],
 ) -> Vec<TickEvent> {
     let splash_range = match sensor_mode {
-        SensorMode::Active => ACTIVE_RADAR_RANGE,
-        SensorMode::Passive => PASSIVE_HEAR_NEARBY_RANGE,
+        SensorMode::Active => config.active_radar_range,
+        SensorMode::Passive => config.passive_hear_nearby_range,
     };
     let mut out = Vec::new();
     for event in events {
@@ -2353,6 +2607,91 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn match_report_captures_combat_stats() {
+        let (mut room, mut r1, mut r2) = started_two_bot_room();
+        // No report exists until a match finishes.
+        assert!(room.last_report.is_none(), "no report before match ends");
+
+        room.world.ships.get_mut(&r1.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().pos = Vec2::new(700.0, 500.0);
+        room.world.ships.get_mut(&r2.ship_id).unwrap().hp = 1;
+
+        // r1 fires one shot that kills r2.
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd_fire(
+                room.world.tick,
+                0.0,
+                FireCommand {
+                    bearing_deg: 90.0,
+                    range: 200.0,
+                },
+                SensorMode::Passive,
+            ),
+        });
+        for _ in 0..40 {
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r2.bot_id.clone(),
+                command: cmd_with_mode(room.world.tick, 0.0, 0.0, SensorMode::Passive),
+            });
+            room.step_tick();
+            let _ = drain(&mut r1);
+            let _ = drain(&mut r2);
+            if room.state == RoomState::Ended {
+                break;
+            }
+        }
+        assert_eq!(room.state, RoomState::Ended);
+
+        let report = room.last_report.clone().expect("report after match end");
+        assert_eq!(report.outcome, "winner");
+        assert_eq!(report.winner.as_deref(), Some(r1.bot_id.as_str()));
+        assert_eq!(report.winner_name.as_deref(), Some("a"));
+        assert!(report.duration_ticks > 0);
+        assert_eq!(report.bots.len(), 2);
+
+        let r1_row = report
+            .bots
+            .iter()
+            .find(|b| b.bot_id == r1.bot_id)
+            .expect("r1 row");
+        assert_eq!(r1_row.shots_fired, 1);
+        assert_eq!(r1_row.hits_landed, 1);
+        assert_eq!(r1_row.kills, 1);
+        assert!(r1_row.damage_dealt > 0);
+        assert!((r1_row.accuracy - 1.0).abs() < 1e-4);
+        assert!(r1_row.survived);
+
+        let r2_row = report
+            .bots
+            .iter()
+            .find(|b| b.bot_id == r2.bot_id)
+            .expect("r2 row");
+        assert_eq!(r2_row.shots_fired, 0);
+        assert_eq!(r2_row.accuracy, 0.0);
+        assert!(r2_row.damage_taken > 0);
+        assert!(!r2_row.survived);
+        assert_eq!(r2_row.final_hp, 0);
+
+        // The report is queryable via the event channel and survives into Lobby.
+        let (tx, mut rx) = oneshot::channel();
+        room.handle_event(RoomEvent::QueryReport { reply: tx });
+        assert!(rx.try_recv().expect("reply").is_some());
+    }
+
+    #[test]
+    fn aborted_match_reports_aborted_outcome() {
+        let (mut room, _r1, _r2) = started_two_bot_room();
+        room.step_tick();
+        let (tx, mut rx) = oneshot::channel();
+        room.handle_event(RoomEvent::OperatorAbort { reply: tx });
+        rx.try_recv().expect("reply").expect("abort ok");
+        let report = room.last_report.clone().expect("report after abort");
+        assert_eq!(report.outcome, "aborted");
+        assert!(report.winner.is_none());
     }
 
     #[test]

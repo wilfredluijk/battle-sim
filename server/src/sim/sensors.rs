@@ -13,10 +13,7 @@ use glam::Vec2;
 use rand::Rng;
 use rand_pcg::Pcg64;
 
-use super::constants::{
-    ACTIVE_RADAR_NOISE, ACTIVE_RADAR_RANGE, PASSIVE_BEARING_NOISE_DEG,
-    PASSIVE_CONTACT_PLACEHOLDER_DISTANCE, PASSIVE_HEAR_ACTIVE_RANGE, PASSIVE_HEAR_NEARBY_RANGE,
-};
+use super::constants::PASSIVE_CONTACT_PLACEHOLDER_DISTANCE;
 use super::world::{ShipId, World};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +48,8 @@ pub fn active_contacts(
     world: &World,
     rng: &mut Pcg64,
 ) -> Vec<Contact> {
+    let radar_range = world.config.active_radar_range;
+    let radar_noise = world.config.active_radar_noise;
     let mut out = Vec::new();
     for (id, ship) in &world.ships {
         if id == viewer_id || !ship.alive {
@@ -58,11 +57,11 @@ pub fn active_contacts(
         }
         let to = ship.pos - viewer_pos;
         let dist = to.length();
-        if dist > ACTIVE_RADAR_RANGE {
+        if dist > radar_range {
             continue;
         }
-        let nx: f32 = rng.gen_range(-ACTIVE_RADAR_NOISE..=ACTIVE_RADAR_NOISE);
-        let ny: f32 = rng.gen_range(-ACTIVE_RADAR_NOISE..=ACTIVE_RADAR_NOISE);
+        let nx: f32 = rng.gen_range(-radar_noise..=radar_noise);
+        let ny: f32 = rng.gen_range(-radar_noise..=radar_noise);
         out.push(Contact {
             kind: ContactKind::Ship,
             pos: ship.pos + Vec2::new(nx, ny),
@@ -88,6 +87,9 @@ pub fn passive_contacts(
     active_pingers: &BTreeSet<ShipId>,
     rng: &mut Pcg64,
 ) -> Vec<Contact> {
+    let nearby_range = world.config.passive_hear_nearby_range;
+    let active_range = world.config.passive_hear_active_range;
+    let bearing_noise = world.config.passive_bearing_noise_deg;
     let mut out = Vec::new();
     for (id, ship) in &world.ships {
         if id == viewer_id || !ship.alive {
@@ -96,13 +98,12 @@ pub fn passive_contacts(
         let to = ship.pos - viewer_pos;
         let dist = to.length();
         let pinging = active_pingers.contains(id);
-        let detected =
-            dist <= PASSIVE_HEAR_NEARBY_RANGE || (pinging && dist <= PASSIVE_HEAR_ACTIVE_RANGE);
+        let detected = dist <= nearby_range || (pinging && dist <= active_range);
         if !detected {
             continue;
         }
         let true_bearing = compass_deg(to);
-        let noise: f32 = rng.gen_range(-PASSIVE_BEARING_NOISE_DEG..=PASSIVE_BEARING_NOISE_DEG);
+        let noise: f32 = rng.gen_range(-bearing_noise..=bearing_noise);
         let bearing = (true_bearing + noise).rem_euclid(360.0);
         let radians = bearing.to_radians();
         let placeholder = viewer_pos
@@ -131,7 +132,9 @@ fn compass_deg(v: Vec2) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::constants::{ACTIVE_RADAR_NOISE, PASSIVE_BEARING_NOISE_DEG};
     use crate::sim::world::Ship;
+    use crate::sim::SimConfig;
     use rand::SeedableRng;
 
     fn ship(id: &str, x: f32, y: f32) -> Ship {
@@ -141,7 +144,7 @@ mod tests {
     #[test]
     fn two_ships_within_350_units_each_see_one_contact_when_active() {
         // Acceptance check from projectplan §5.1.
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 700.0, 500.0)); // 200 units east
         let mut rng = Pcg64::seed_from_u64(42);
@@ -158,7 +161,7 @@ mod tests {
 
     #[test]
     fn ships_outside_radar_range_are_invisible() {
-        let mut world = World::new(2000.0, 2000.0);
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 100.0, 100.0));
         world.insert_ship(ship("s_2", 800.0, 100.0)); // 700 units away (> 350)
         let mut rng = Pcg64::seed_from_u64(42);
@@ -172,7 +175,7 @@ mod tests {
 
     #[test]
     fn dead_ships_do_not_appear_as_contacts() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         let mut s2 = ship("s_2", 600.0, 500.0);
         s2.alive = false;
@@ -185,7 +188,7 @@ mod tests {
 
     #[test]
     fn position_noise_is_bounded_by_two_units() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 600.0, 500.0));
         let mut rng = Pcg64::seed_from_u64(7);
@@ -211,7 +214,7 @@ mod tests {
 
     #[test]
     fn same_seed_produces_identical_contacts() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 600.0, 500.0));
         world.insert_ship(ship("s_3", 500.0, 700.0));
@@ -226,7 +229,7 @@ mod tests {
 
     #[test]
     fn bearing_is_compass_from_viewer_to_target() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         // Place targets in each cardinal direction from the viewer.
         world.insert_ship(ship("s_e", 600.0, 500.0)); // east → 90°
@@ -248,7 +251,7 @@ mod tests {
     fn silent_ship_at_400_units_invisible_to_passive_listener() {
         // Acceptance check from projectplan §5.2: silent ship at 400 units invisible;
         // same ship pinging is visible.
-        let mut world = World::new(2000.0, 2000.0);
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 900.0, 500.0)); // 400 units east
         let mut rng = Pcg64::seed_from_u64(11);
@@ -283,7 +286,7 @@ mod tests {
 
     #[test]
     fn nearby_silent_ship_within_150_is_audible() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 600.0, 500.0)); // 100 units east, silent
         let mut rng = Pcg64::seed_from_u64(11);
@@ -301,7 +304,7 @@ mod tests {
 
     #[test]
     fn pinging_ship_beyond_500_is_inaudible() {
-        let mut world = World::new(2000.0, 2000.0);
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 100.0, 100.0));
         world.insert_ship(ship("s_2", 800.0, 100.0)); // 700 units east, pinging
         let mut pingers = BTreeSet::<ShipId>::new();
@@ -323,7 +326,7 @@ mod tests {
 
     #[test]
     fn passive_bearing_noise_is_bounded_by_five_degrees() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 600.0, 500.0)); // east, true bearing 90°
         let silent = BTreeSet::<ShipId>::new();
@@ -350,7 +353,7 @@ mod tests {
 
     #[test]
     fn passive_contacts_are_deterministic_under_same_seed() {
-        let mut world = World::new(1000.0, 1000.0);
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         world.insert_ship(ship("s_1", 500.0, 500.0));
         world.insert_ship(ship("s_2", 600.0, 500.0));
         world.insert_ship(ship("s_3", 510.0, 600.0));

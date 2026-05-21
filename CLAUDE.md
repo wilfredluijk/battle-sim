@@ -48,12 +48,13 @@ Spectators get full ground truth. Don't conflate the two payloads.
 ```
 server/         Rust binary. Cargo workspace root is here.
   src/main.rs       CLI + runtime startup
-  src/net.rs        WebSocket accept, connection tasks
+  src/net.rs        axum HTTP/WebSocket front end: REST control plane + /bot + /spectate
   src/room.rs       Room state machine (lobby → running → ended)
+  src/auth.rs       Admin password + JWT issue/verify
   src/sim/          Deterministic simulation — handle with care
+  src/sim/config.rs Per-match balance parameters (SimConfig)
   src/protocol.rs   serde types for the wire protocol
   src/replay.rs     JSONL replay log
-  src/control.rs    stdin command parser
 
 sdk-python/     Reference Python SDK
 spectator/      Svelte + TypeScript + Vite app, built to spectator/dist/ and
@@ -111,9 +112,7 @@ docker compose up --build    # builds the multi-stage image and serves on :7878.
                              #   Replays land in ./replays/ via bind-mount.
 ```
 
-The server reads operator commands from stdin while running. Type `room list`, `room start main`, `room abort`, `room reset`, `room kick <bot_id>`, `quit`, etc. See `docs/system-design.md §3.3` for the full list.
-
-The same lifecycle actions (`start`, `abort`, `reset`, `kick`) are exposed over the `/admin` WebSocket — gated by a rotating token printed at INFO on startup (override with `--admin-token`). The spectator web UI uses this to manage matches from the browser. See `docs/PROTOCOL.md §2.5`.
+The room is driven over a REST control plane (`/api/*`), not stdin — there is no operator command interface. Lifecycle actions (`start`, `abort`, `reset`, `kick`) and parameter changes (`PUT /api/room/config`) are HTTP routes gated by a JWT. Get a token from `POST /api/login` with the admin password (`--admin-password` / `BATTLE_ADMIN_PASSWORD`, random per start if unset and logged once at INFO). The spectator web UI uses these routes to manage matches from the browser. See `docs/PROTOCOL.md §2.5`.
 
 ---
 
@@ -184,9 +183,9 @@ These are choices that look like implementation details but have design implicat
 
 This is built for a hackathon, not production. Some deliberate omissions, listed so they're not "fixed" by accident:
 
-- No auth, no TLS, no rate limiting on the WebSocket endpoints. Local play only.
+- The admin REST plane (`/api/*`) is gated by a JWT, but the `/bot` and `/spectate` WebSocket endpoints are intentionally unauthenticated. No TLS, no rate limiting. Local play only.
 - No persistence besides replay JSONL files. Rooms vanish when the server stops.
-- No matchmaking. The operator starts rooms manually via stdin.
-- One server process, ideally one room at a time. Multi-room is supported but untested at scale.
+- No matchmaking. The operator starts the match via the REST API / web UI.
+- One server process, one configurable room.
 
-If you're tempted to add an auth layer or a database, stop and check whether the scope has actually changed. For the hackathon target, simpler is the goal.
+If you're tempted to add a database, TLS, or auth to the `/bot` / `/spectate` endpoints, stop and check whether the scope has actually changed. For the hackathon target, simpler is the goal.

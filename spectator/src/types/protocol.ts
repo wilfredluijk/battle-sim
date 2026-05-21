@@ -1,6 +1,11 @@
-// Wire types for the `/spectate` endpoint. Mirrors `docs/PROTOCOL.md` §2 and the structs
-// in `server/src/protocol.rs` (SpectatorMsg::World et al.). Keep field names in lock-step
-// with the wire format — these objects come straight out of JSON.parse.
+// Wire types for the spectator app.
+//
+// - The `/spectate` WebSocket types mirror `docs/PROTOCOL.md` §2 and `SpectatorMsg` in
+//   `server/src/protocol.rs`.
+// - The REST types mirror the `/api/*` control plane in `server/src/net.rs`.
+//
+// Keep field names in lock-step with the wire format — these objects come straight out of
+// JSON.parse.
 
 export type SensorMode = 'active' | 'passive';
 
@@ -41,10 +46,10 @@ export interface WorldFrame {
 }
 
 // ---------------------------------------------------------------------------
-// Admin endpoint — matches server/src/admin.rs (AdminMsg / AdminServerMsg).
+// REST control plane — matches the `/api/*` routes in `server/src/net.rs`.
 // ---------------------------------------------------------------------------
 
-export type AdminRoomState = 'lobby' | 'running' | 'ended';
+export type RoomState = 'lobby' | 'running' | 'ended';
 
 export interface AdminBotInfo {
   bot_id: string;
@@ -54,21 +59,52 @@ export interface AdminBotInfo {
   alive: boolean;
 }
 
-export interface AdminStatePayload {
+/** Balance parameters — a flat map of `SimConfig` keys to numbers. */
+export type SimConfig = Record<string, number>;
+
+/** Response shape of `GET /api/room`: room lifecycle state plus the active parameters. */
+export interface RoomInfo {
   room: string;
-  state: AdminRoomState;
+  state: RoomState;
   tick: number;
   last_winner?: string | null;
   bots: AdminBotInfo[];
+  config: SimConfig;
 }
 
-export type AdminServerMsg =
-  | { type: 'state'; room: string; state: AdminRoomState; tick: number; last_winner?: string | null; bots: AdminBotInfo[] }
-  | { type: 'ack'; command: string }
-  | { type: 'error'; code: string; message: string };
+/** One tunable's metadata from `GET /api/config/schema`. */
+export interface ConfigField {
+  key: string;
+  label: string;
+  group: string;
+  default: number;
+  min: number;
+  max: number;
+  integer: boolean;
+}
 
-export type AdminMsg =
-  | { type: 'start' }
-  | { type: 'abort' }
-  | { type: 'reset' }
-  | { type: 'kick'; bot_id: string };
+/** One bot's row in a `MatchReport`. */
+export interface BotReport {
+  bot_id: string;
+  name: string;
+  shots_fired: number;
+  hits_landed: number;
+  accuracy: number;
+  damage_dealt: number;
+  damage_taken: number;
+  kills: number;
+  final_hp: number;
+  survived: boolean;
+}
+
+/** Response shape of `GET /api/room/report`. */
+export interface MatchReport {
+  room: string;
+  replay_id: string | null;
+  outcome: 'winner' | 'draw' | 'aborted';
+  winner: string | null;
+  winner_name: string | null;
+  duration_ticks: number;
+  duration_seconds: number;
+  bots: BotReport[];
+}

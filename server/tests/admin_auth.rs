@@ -1,22 +1,21 @@
-//! End-to-end auth tests for the `/admin` WebSocket: bad tokens get HTTP 401, good
-//! tokens get past the upgrade and receive an initial state snapshot.
+//! End-to-end auth tests for the REST control plane: `POST /api/login` mints a JWT only
+//! for the correct password, and mutating `/api/*` routes require that token.
 
 use std::time::Duration;
 
 use clap::Parser;
-use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
-use tokio_tungstenite::tungstenite::Message;
 
 use naval_server::{
+    auth::AuthState,
     config::Config,
     net,
     room::{run_room, Room, SpectatorFrame, ROOM_EVENT_BUFFER},
 };
 
-const ADMIN_TOKEN: &str = "test-admin-token-xyz";
+const ADMIN_PASSWORD: &str = "test-password";
 
 struct ServerHandle {
     port: u16,
@@ -32,10 +31,10 @@ async fn start_server() -> ServerHandle {
     config.port = port;
     config.tick_hz = 50;
 
-    let (shutdown_tx, shutdown_rx_net) = broadcast::channel::<()>(4);
+    let (shutdown_tx, _) = broadcast::channel::<()>(4);
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
 
-    let mut room = Room::new(
+    let room = Room::new(
         "main".into(),
         config.map.0 as f32,
         config.map.1 as f32,
@@ -44,17 +43,17 @@ async fn start_server() -> ServerHandle {
         config.tick_deadline_ms,
         config.max_bots,
     );
-    let (admin_tx, _admin_rx) = broadcast::channel(8);
-    room.set_admin_broadcast(admin_tx.clone());
     tokio::spawn(run_room(room, room_rx, shutdown_tx.subscribe()));
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
 
+    let auth = AuthState::new(ADMIN_PASSWORD.to_string(), 3600);
     tokio::spawn(net::run(
         config,
-        std::sync::Arc::new(ADMIN_TOKEN.to_string()),
+        "main".to_string(),
+        auth,
         room_tx,
         spec_tx,
-        shutdown_rx_net,
+        shutdown_tx.clone(),
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
     ServerHandle {
@@ -63,27 +62,36 @@ async fn start_server() -> ServerHandle {
     }
 }
 
-/// Raw HTTP upgrade request — lets us inspect a 401 response that never gets to the
-/// WS handshake. The `tokio_tungstenite::connect_async` path would swallow the body.
-async fn raw_get_upgrade(port: u16, path: &str) -> (u16, String) {
+/// Minimal raw-TCP HTTP/1.1 client. Returns the response status code and body.
+async fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    json_body: Option<&str>,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("tcp connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         \r\n"
-    );
+    let body = json_body.unwrap_or("");
+    let mut req =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    if json_body.is_some() {
+        req.push_str("Content-Type: application/json\r\n");
+    }
+    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    if let Some(token) = bearer {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+
     stream
         .write_all(req.as_bytes())
         .await
         .expect("send request");
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
     let text = String::from_utf8_lossy(&buf).to_string();
     let status: u16 = text
         .lines()
@@ -91,47 +99,79 @@ async fn raw_get_upgrade(port: u16, path: &str) -> (u16, String) {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    (status, text)
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// Log in and return the bearer token.
+async fn login(port: u16) -> String {
+    let (status, body) = http_request(
+        port,
+        "POST",
+        "/api/login",
+        None,
+        Some(&format!(r#"{{"password":"{ADMIN_PASSWORD}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, 200, "login should succeed, body: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("login json");
+    parsed["token"].as_str().expect("token field").to_string()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_endpoint_rejects_missing_token() {
+async fn login_rejects_wrong_password() {
     let ServerHandle { port, shutdown } = start_server().await;
-    let (status, body) = raw_get_upgrade(port, "/admin").await;
-    assert_eq!(status, 401, "missing token must 401, got: {body}");
+    let (status, body) = http_request(
+        port,
+        "POST",
+        "/api/login",
+        None,
+        Some(r#"{"password":"nope"}"#),
+    )
+    .await;
+    assert_eq!(status, 401, "wrong password must 401, got: {body}");
     let _ = shutdown.send(());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_endpoint_rejects_wrong_token() {
+async fn login_accepts_correct_password_and_returns_token() {
     let ServerHandle { port, shutdown } = start_server().await;
-    let (status, body) = raw_get_upgrade(port, "/admin?token=wrong").await;
-    assert_eq!(status, 401, "bad token must 401, got: {body}");
+    let token = login(port).await;
+    assert!(!token.is_empty(), "token should not be empty");
     let _ = shutdown.send(());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_endpoint_accepts_good_token_and_pushes_state() {
+async fn mutating_route_requires_token() {
     let ServerHandle { port, shutdown } = start_server().await;
-    let url = format!("ws://127.0.0.1:{port}/admin?token={ADMIN_TOKEN}");
-    let (mut ws, response) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("ws connect");
-    assert_eq!(response.status(), 101, "websocket upgrade succeeded");
+    let (status, body) = http_request(port, "POST", "/api/room/start", None, None).await;
+    assert_eq!(status, 401, "start without a token must 401, got: {body}");
+    let _ = shutdown.send(());
+}
 
-    // First frame must be a state snapshot of the room.
-    let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
-        .await
-        .expect("timeout")
-        .expect("stream ended")
-        .expect("ws read error");
-    let text = match frame {
-        Message::Text(t) => t,
-        other => panic!("expected text frame, got {other:?}"),
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
-    assert_eq!(parsed["type"], "state");
-    assert_eq!(parsed["room"], "main");
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutating_route_accepts_valid_token() {
+    let ServerHandle { port, shutdown } = start_server().await;
+    let token = login(port).await;
+    let (status, body) = http_request(port, "POST", "/api/room/start", Some(&token), None).await;
+    // A valid token gets past auth; with no bots connected the room refuses the start
+    // with 409 — the point is it is no longer a 401.
+    assert_ne!(status, 401, "valid token must not be rejected, got: {body}");
+    assert_eq!(status, 409, "empty room should refuse start, got: {body}");
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_state_is_public() {
+    let ServerHandle { port, shutdown } = start_server().await;
+    let (status, body) = http_request(port, "GET", "/api/room", None, None).await;
+    assert_eq!(status, 200, "GET /api/room should be public, got: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("room json");
     assert_eq!(parsed["state"], "lobby");
+    assert_eq!(parsed["room"], "main");
+    assert!(parsed["config"].is_object(), "config block present");
     let _ = shutdown.send(());
 }

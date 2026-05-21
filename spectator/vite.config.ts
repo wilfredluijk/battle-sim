@@ -10,12 +10,13 @@ export default defineConfig({
   plugins: [svelte()],
   server: {
     port: 5173,
-    // Forward WS endpoints to the Rust server during `vite dev`. The browser opens
-    // `ws://localhost:5173/spectate`; Vite proxies it to localhost:7878.
+    // Forward server endpoints to the Rust server during `vite dev`. The browser opens
+    // `ws://localhost:5173/spectate` and `http://localhost:5173/api/...`; Vite proxies
+    // them to localhost:7878.
     proxy: {
       '/spectate': { target: 'ws://localhost:7878', ws: true },
       '/bot': { target: 'ws://localhost:7878', ws: true },
-      '/admin': { target: 'ws://localhost:7878', ws: true },
+      '/api': { target: 'http://localhost:7878' },
     },
   },
   build: {

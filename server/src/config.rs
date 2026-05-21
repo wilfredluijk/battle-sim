@@ -53,11 +53,16 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub tournament: bool,
 
-    /// Admin token required to authenticate to the `/admin` WebSocket. When omitted, the
-    /// server generates a fresh random token at startup and logs it once at INFO. Provide
-    /// a fixed value for tests / scripted runs.
-    #[arg(long, value_name = "TOKEN")]
-    pub admin_token: Option<String>,
+    /// Admin password for the REST control plane. `POST /api/login` checks this value and
+    /// issues a JWT. When omitted, the server generates a fresh random password at startup
+    /// and logs it once at INFO. Provide a fixed value for tests / scripted runs. Can also
+    /// be supplied via the `BATTLE_ADMIN_PASSWORD` environment variable.
+    #[arg(long, env = "BATTLE_ADMIN_PASSWORD", value_name = "PASSWORD")]
+    pub admin_password: Option<String>,
+
+    /// Lifetime of an issued admin JWT, in hours.
+    #[arg(long, default_value_t = 12)]
+    pub token_ttl_hours: u64,
 }
 
 fn parse_map_size(s: &str) -> Result<(u32, u32), String> {
