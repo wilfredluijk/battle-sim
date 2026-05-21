@@ -13,6 +13,7 @@ Language-specific bot examples live in subfolders:
     components (`Tracker`, `Gunner`, `Helm`, `Evader`, `SensorPolicy`).
   - `StrategistBot` — Layer 3 `TacticalBot` with a single `decide()` method.
   - `AcousticShadowBot` — bespoke sound-first ambusher (bare protocol).
+  - `ApexDuelistBot` - one-on-one hybrid duelist tuned against stealth-first opponents.
 
 See [`../docs/TACTICAL_TOOLKIT.md`](../docs/TACTICAL_TOOLKIT.md) for the
 layered SDK overview, which applies to both languages.
