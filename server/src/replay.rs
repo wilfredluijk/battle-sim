@@ -12,6 +12,7 @@
 //! the recorded commands back through `Room::step_tick`. State is reconstructed, never
 //! deserialized.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -20,11 +21,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
-use crate::protocol::{FireCommand, MapInfo, SensorMode};
+use crate::protocol::{
+    Contact, FireCommand, MapInfo, SensorMode, ServerMsg, SpectatorMsg, TickEvent,
+};
 use crate::room::{PendingCommand, Room, RoomEvent, SpectatorFrame};
 use crate::sim::SimConfig;
 
@@ -89,6 +92,56 @@ pub struct ReplayCommand {
 pub struct ReplayEnd {
     pub tick: u64,
     pub winner: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Replay viewer: directory listing + offline re-run capture
+// ---------------------------------------------------------------------------
+
+/// One entry in the replay directory listing (`GET /api/replays`). Built from a log's
+/// header and (when present) its `end` record without re-running the simulation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplaySummary {
+    pub replay_id: String,
+    pub room: String,
+    pub seed: u64,
+    pub tick_hz: u32,
+    pub map: MapInfo,
+    pub sim_config: SimConfig,
+    /// Bot display names, in registration order.
+    pub bots: Vec<String>,
+    /// Final tick, if the log carries an `end` record (a match that ran to completion).
+    pub final_tick: Option<u64>,
+    /// Winning bot's display name. `None` for a draw, an aborted match, or a log with no
+    /// `end` record.
+    pub winner_name: Option<String>,
+}
+
+/// A full offline re-run of a replay: the header plus the ground-truth spectator frame at
+/// every tick. `frames[t]` is the world at tick `t`, so the slider in the viewer indexes
+/// straight into this vec.
+#[derive(Serialize, Debug)]
+pub struct CapturedReplay {
+    pub header: ReplayHeader,
+    pub frames: Vec<SpectatorMsg>,
+    pub end: Option<ReplayEnd>,
+}
+
+/// One bot's sensor-filtered view at a single tick.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PerspectiveFrame {
+    pub tick: u64,
+    pub contacts: Vec<Contact>,
+    pub events: Vec<TickEvent>,
+}
+
+/// A replay re-run captured from one bot's sensors
+/// (`GET /api/replays/{id}/perspective/{bot_id}`). `frames[t]` is the bot's filtered view
+/// at tick `t`; ticks with no `tick` message (tick 0 and the deciding tick) are empty.
+#[derive(Serialize, Debug)]
+pub struct CapturedPerspective {
+    pub bot_id: String,
+    pub frames: Vec<PerspectiveFrame>,
 }
 
 /// Sink for replay records. Either appends to a file on disk or to a shared in-memory
@@ -232,11 +285,20 @@ pub fn make_replay_id(room: &str) -> String {
     format!("match_{room}_{secs}")
 }
 
-/// Reconstruct a `Room` from a `ReplayHeader`. Used by both the live replay player
-/// (`run_replay`) and the determinism test. The bots are pre-registered with the same
-/// ids the live run assigned, then marked ready and started — so the resulting Room is
-/// in `Running` state at tick 0, ready to accept injected commands.
-pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayError> {
+/// A bot's id paired with the receiver for the frames the room sends it.
+type BotOutbound = (String, mpsc::Receiver<ServerMsg>);
+
+/// Reconstruct a `Room` from a `ReplayHeader`, returning each bot's outbound receiver
+/// alongside it. The bots are pre-registered with the same ids the live run assigned, then
+/// marked ready and started — so the resulting Room is in `Running` state at tick 0, ready
+/// to accept injected commands.
+///
+/// The receivers carry the `welcome` / `game_start` / `tick` frames the room sends to
+/// bots. Perspective capture drains them to recover each bot's sensor view; `run_replay`
+/// and the determinism test discard them via [`rebuild_room_from_header`].
+fn rebuild_room_with_outbound(
+    header: &ReplayHeader,
+) -> Result<(Room, Vec<BotOutbound>), ReplayError> {
     let mut room = Room::new(
         header.room.clone(),
         header.map.width as f32,
@@ -250,6 +312,7 @@ pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayErr
     // so `welcome` payloads and physics use the exact values the live run did.
     room.world.config = header.sim_config;
 
+    let mut outbound = Vec::with_capacity(header.bots.len());
     for bot in &header.bots {
         let (reply_tx, mut reply_rx) = oneshot::channel();
         room.handle_event(RoomEvent::BotConnect {
@@ -276,10 +339,7 @@ pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayErr
                 bot.ship_id, reg.ship_id
             )));
         }
-        // The receiver will never be drained — drop it. `try_send`s into the sender will
-        // either succeed silently into the buffer or fail once it fills. Both are fine in
-        // replay mode.
-        drop(reg.outbound);
+        outbound.push((reg.bot_id.clone(), reg.outbound));
         room.handle_event(RoomEvent::BotReady { bot_id: reg.bot_id });
     }
 
@@ -293,7 +353,16 @@ pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayErr
         .map_err(|_| ReplayError::Header("room dropped start reply".into()))?
         .map_err(|e| ReplayError::Header(format!("start refused: {}", e.as_str())))?;
 
-    Ok(room)
+    Ok((room, outbound))
+}
+
+/// Reconstruct a `Room` from a `ReplayHeader`. Used by the live replay player
+/// (`run_replay`), `capture_replay`, and the determinism test.
+///
+/// The per-bot outbound receivers are dropped: those callers never read the bot frames.
+/// The senders' `try_send`s then either buffer or fail silently, both fine in replay mode.
+pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayError> {
+    rebuild_room_with_outbound(header).map(|(room, _outbound)| room)
 }
 
 /// Errors that can stop a replay run before it finishes.
@@ -304,6 +373,8 @@ pub enum ReplayError {
     /// reproduce.
     Header(String),
     Version(u32),
+    /// A perspective capture named a bot id absent from the replay header.
+    UnknownBot(String),
 }
 
 impl std::fmt::Display for ReplayError {
@@ -316,6 +387,9 @@ impl std::fmt::Display for ReplayError {
                 "unsupported replay format version {v}; expected {}",
                 REPLAY_FORMAT_VERSION
             ),
+            ReplayError::UnknownBot(id) => {
+                write!(f, "replay has no bot with id `{id}`")
+            }
         }
     }
 }
@@ -414,6 +488,299 @@ pub async fn run_replay(
         }
     }
     Ok(())
+}
+
+/// Re-run a replay end to end, capturing the ground-truth spectator frame at every tick.
+/// `records` must begin with a `Header`. Backs `GET /api/replays/{id}`.
+///
+/// Determinism: this drives the exact `inject_replay_command` + `step_tick` path the
+/// determinism test covers, so the captured frames are bit-faithful to the live run.
+pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, ReplayError> {
+    let mut iter = records.into_iter();
+    let header = match iter.next() {
+        Some(ReplayRecord::Header(h)) => h,
+        Some(_) => {
+            return Err(ReplayError::Header(
+                "replay log does not begin with a header record".into(),
+            ))
+        }
+        None => return Err(ReplayError::Header("replay log is empty".into())),
+    };
+    if header.version != REPLAY_FORMAT_VERSION {
+        return Err(ReplayError::Version(header.version));
+    }
+
+    let mut room = rebuild_room_from_header(&header)?;
+    // A single local receiver keeps `broadcast_spectator_world` from skipping serialization
+    // (it no-ops when nobody is subscribed). One frame is produced per `step_tick`; we
+    // drain it immediately so the buffer never backs up.
+    let (spec_tx, mut spec_rx) = broadcast::channel::<SpectatorFrame>(16);
+    room.set_spectator_broadcast(spec_tx);
+
+    let mut frames: Vec<SpectatorMsg> = Vec::new();
+    // Tick 0: the starting layout, before any command is applied.
+    frames.push(room.spectator_world_snapshot());
+
+    let mut end: Option<ReplayEnd> = None;
+    for record in iter {
+        match record {
+            ReplayRecord::Tick(rec) => {
+                for cmd in rec.commands {
+                    room.inject_replay_command(
+                        &cmd.bot_id,
+                        PendingCommand {
+                            tick: rec.tick,
+                            throttle: cmd.throttle,
+                            rudder: cmd.rudder,
+                            fire: cmd.fire,
+                            sensor_mode: cmd.sensor_mode,
+                        },
+                    );
+                }
+                while room.world.tick < rec.tick {
+                    room.step_tick();
+                    drain_spectator_frames(&mut spec_rx, &mut frames);
+                }
+            }
+            ReplayRecord::End(rec) => {
+                while room.world.tick < rec.tick {
+                    room.step_tick();
+                    drain_spectator_frames(&mut spec_rx, &mut frames);
+                }
+                end = Some(rec);
+                break;
+            }
+            ReplayRecord::Header(_) => {
+                warn!("replay capture: stray header record mid-stream, ignored");
+            }
+        }
+    }
+
+    Ok(CapturedReplay {
+        header,
+        frames,
+        end,
+    })
+}
+
+/// Drain every pending broadcast frame into `frames`, parsing each JSON string back into a
+/// typed `SpectatorMsg`.
+fn drain_spectator_frames(
+    rx: &mut broadcast::Receiver<SpectatorFrame>,
+    frames: &mut Vec<SpectatorMsg>,
+) {
+    while let Ok(frame) = rx.try_recv() {
+        match serde_json::from_str::<SpectatorMsg>(frame.as_str()) {
+            Ok(msg) => frames.push(msg),
+            Err(e) => warn!(error = %e, "replay capture: failed to parse spectator frame"),
+        }
+    }
+}
+
+/// Re-run a replay capturing one bot's sensor-filtered view at every tick. `bot_id` must
+/// name a bot present in the header. Backs `GET /api/replays/{id}/perspective/{bot_id}`.
+pub fn capture_perspective(
+    records: Vec<ReplayRecord>,
+    bot_id: &str,
+) -> Result<CapturedPerspective, ReplayError> {
+    let mut iter = records.into_iter();
+    let header = match iter.next() {
+        Some(ReplayRecord::Header(h)) => h,
+        Some(_) => {
+            return Err(ReplayError::Header(
+                "replay log does not begin with a header record".into(),
+            ))
+        }
+        None => return Err(ReplayError::Header("replay log is empty".into())),
+    };
+    if header.version != REPLAY_FORMAT_VERSION {
+        return Err(ReplayError::Version(header.version));
+    }
+    if !header.bots.iter().any(|b| b.bot_id == bot_id) {
+        return Err(ReplayError::UnknownBot(bot_id.to_string()));
+    }
+
+    let (mut room, mut outbound) = rebuild_room_with_outbound(&header)?;
+
+    // Per-tick filtered views keyed by tick. The registration `welcome` / `game_start`
+    // frames already queued on the channels are drained and discarded here.
+    let mut views: BTreeMap<u64, PerspectiveFrame> = BTreeMap::new();
+    drain_perspective(&mut outbound, bot_id, &mut views);
+
+    for record in iter {
+        match record {
+            ReplayRecord::Tick(rec) => {
+                for cmd in rec.commands {
+                    room.inject_replay_command(
+                        &cmd.bot_id,
+                        PendingCommand {
+                            tick: rec.tick,
+                            throttle: cmd.throttle,
+                            rudder: cmd.rudder,
+                            fire: cmd.fire,
+                            sensor_mode: cmd.sensor_mode,
+                        },
+                    );
+                }
+                while room.world.tick < rec.tick {
+                    room.step_tick();
+                    drain_perspective(&mut outbound, bot_id, &mut views);
+                }
+            }
+            ReplayRecord::End(rec) => {
+                while room.world.tick < rec.tick {
+                    room.step_tick();
+                    drain_perspective(&mut outbound, bot_id, &mut views);
+                }
+                break;
+            }
+            ReplayRecord::Header(_) => {
+                warn!("perspective capture: stray header record mid-stream, ignored");
+            }
+        }
+    }
+
+    // Densify: one frame per tick 0..=final_tick. Ticks where the bot received no `tick`
+    // message (tick 0, and the deciding tick) get empty contacts/events.
+    let final_tick = room.world.tick;
+    let frames: Vec<PerspectiveFrame> = (0..=final_tick)
+        .map(|t| {
+            views.remove(&t).unwrap_or(PerspectiveFrame {
+                tick: t,
+                contacts: Vec::new(),
+                events: Vec::new(),
+            })
+        })
+        .collect();
+
+    Ok(CapturedPerspective {
+        bot_id: bot_id.to_string(),
+        frames,
+    })
+}
+
+/// Drain each bot's outbound channel, recording the target bot's `tick` frames into
+/// `views`. Other bots' frames are discarded — draining still keeps their buffers from
+/// filling and dropping frames mid-run.
+fn drain_perspective(
+    outbound: &mut [BotOutbound],
+    bot_id: &str,
+    views: &mut BTreeMap<u64, PerspectiveFrame>,
+) {
+    for (id, rx) in outbound.iter_mut() {
+        while let Ok(msg) = rx.try_recv() {
+            if id != bot_id {
+                continue;
+            }
+            if let ServerMsg::Tick {
+                tick,
+                contacts,
+                events,
+                ..
+            } = msg
+            {
+                views.insert(
+                    tick,
+                    PerspectiveFrame {
+                        tick,
+                        contacts,
+                        events,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// List every readable replay in `dir`, newest first. A missing directory yields an empty
+/// list; individual unreadable files are skipped with a warning rather than failing the
+/// whole listing. Backs `GET /api/replays`.
+pub fn list_replays(dir: &Path) -> io::Result<Vec<ReplaySummary>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        match read_replay_summary(&path) {
+            Ok(summary) => out.push(summary),
+            Err(e) => warn!(path = %path.display(), error = %e, "skipping unreadable replay"),
+        }
+    }
+    // Replay ids embed a unix timestamp (`match_<room>_<secs>`), so a descending sort by
+    // id puts the most recent match first.
+    out.sort_by(|a, b| b.replay_id.cmp(&a.replay_id));
+    Ok(out)
+}
+
+/// Build a [`ReplaySummary`] from a log's header and last record without re-running the
+/// simulation — only the first and last lines are parsed.
+fn read_replay_summary(path: &Path) -> io::Result<ReplaySummary> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut header: Option<ReplayHeader> = None;
+    let mut last_line: Option<String> = None;
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if header.is_none() {
+            match serde_json::from_str::<ReplayRecord>(trimmed) {
+                Ok(ReplayRecord::Header(h)) => header = Some(h),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "replay log does not begin with a header record",
+                    ))
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed replay header: {e}"),
+                    ))
+                }
+            }
+        } else {
+            last_line = Some(trimmed.to_string());
+        }
+    }
+    let header =
+        header.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "replay log is empty"))?;
+
+    let end: Option<ReplayEnd> =
+        last_line.and_then(|l| match serde_json::from_str::<ReplayRecord>(&l) {
+            Ok(ReplayRecord::End(e)) => Some(e),
+            _ => None,
+        });
+    let winner_name = end
+        .as_ref()
+        .and_then(|e| e.winner.as_ref())
+        .and_then(|wid| {
+            header
+                .bots
+                .iter()
+                .find(|b| &b.bot_id == wid)
+                .map(|b| b.name.clone())
+        });
+
+    Ok(ReplaySummary {
+        replay_id: header.replay_id.clone(),
+        room: header.room.clone(),
+        seed: header.seed,
+        tick_hz: header.tick_hz,
+        map: header.map,
+        sim_config: header.sim_config,
+        bots: header.bots.iter().map(|b| b.name.clone()).collect(),
+        final_tick: end.as_ref().map(|e| e.tick),
+        winner_name,
+    })
 }
 
 #[cfg(test)]
@@ -548,5 +915,64 @@ mod tests {
     fn make_replay_id_starts_with_match_room() {
         let id = make_replay_id("main");
         assert!(id.starts_with("match_main_"), "got {id}");
+    }
+
+    #[test]
+    fn capture_replay_yields_one_frame_per_tick() {
+        let records = vec![
+            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Tick(sample_tick()),
+            ReplayRecord::End(ReplayEnd {
+                tick: 10,
+                winner: None,
+            }),
+        ];
+        let captured = capture_replay(records).expect("capture");
+
+        // Tick 0 (starting layout) through tick 10 inclusive → 11 frames.
+        assert_eq!(captured.frames.len(), 11);
+        for (i, frame) in captured.frames.iter().enumerate() {
+            let SpectatorMsg::World { tick, .. } = frame;
+            assert_eq!(*tick, i as u64, "frame {i} carries the wrong tick");
+        }
+        assert_eq!(captured.end.expect("end record").tick, 10);
+    }
+
+    #[test]
+    fn capture_perspective_densifies_to_one_frame_per_tick() {
+        let records = vec![
+            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Tick(sample_tick()),
+            ReplayRecord::End(ReplayEnd {
+                tick: 10,
+                winner: None,
+            }),
+        ];
+        let captured = capture_perspective(records, "b_1").expect("capture");
+
+        assert_eq!(captured.bot_id, "b_1");
+        assert_eq!(captured.frames.len(), 11);
+        for (i, frame) in captured.frames.iter().enumerate() {
+            assert_eq!(frame.tick, i as u64, "frame {i} carries the wrong tick");
+        }
+    }
+
+    #[test]
+    fn capture_perspective_rejects_unknown_bot() {
+        let records = vec![
+            ReplayRecord::Header(sample_header()),
+            ReplayRecord::End(ReplayEnd {
+                tick: 1,
+                winner: None,
+            }),
+        ];
+        let err = capture_perspective(records, "b_404").expect_err("unknown bot");
+        assert!(matches!(err, ReplayError::UnknownBot(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn list_replays_missing_dir_is_empty() {
+        let listed = list_replays(Path::new("/nonexistent-replay-dir-xyz")).expect("list");
+        assert!(listed.is_empty());
     }
 }

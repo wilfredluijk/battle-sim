@@ -108,3 +108,81 @@ export interface MatchReport {
   duration_seconds: number;
   bots: BotReport[];
 }
+
+// ---------------------------------------------------------------------------
+// Replay viewer — matches `/api/replays/*` in `server/src/replay.rs`.
+// ---------------------------------------------------------------------------
+
+export type ContactKind = 'ship' | 'shell' | 'unknown';
+
+/** One sensor contact in a bot's filtered view (`tick.contacts` in `docs/PROTOCOL.md`). */
+export interface Contact {
+  id: string;
+  kind: ContactKind;
+  pos: [number, number];
+  bearing_deg: number;
+  /** Absent for passive bearing-only contacts. */
+  range?: number | null;
+  confidence: number;
+}
+
+/** A bot-facing combat event — the filtered form, distinct from the spectator `TickEvent`. */
+export type BotTickEvent =
+  | { type: 'hit'; amount: number }
+  | { type: 'shell_splash'; pos: [number, number] };
+
+/** One bot in a replay header. */
+export interface ReplayBotInfo {
+  bot_id: string;
+  ship_id: string;
+  name: string;
+}
+
+/** The replay log header, echoed by `GET /api/replays/{id}`. */
+export interface ReplayHeaderInfo {
+  version: number;
+  replay_id: string;
+  room: string;
+  seed: number;
+  tick_hz: number;
+  tick_deadline_ms: number;
+  map: { width: number; height: number };
+  max_bots: number;
+  sim_config: SimConfig;
+  bots: ReplayBotInfo[];
+}
+
+/** One entry from `GET /api/replays`. */
+export interface ReplaySummary {
+  replay_id: string;
+  room: string;
+  seed: number;
+  tick_hz: number;
+  map: { width: number; height: number };
+  sim_config: SimConfig;
+  bots: string[];
+  final_tick: number | null;
+  winner_name: string | null;
+}
+
+/** Response shape of `GET /api/replays/{id}` — the ground-truth timeline. */
+export interface CapturedReplay {
+  header: ReplayHeaderInfo;
+  /** `frames[t]` is the world at tick `t`. */
+  frames: WorldFrame[];
+  end: { tick: number; winner: string | null } | null;
+}
+
+/** One bot's sensor-filtered view at a single tick. */
+export interface PerspectiveFrame {
+  tick: number;
+  contacts: Contact[];
+  events: BotTickEvent[];
+}
+
+/** Response shape of `GET /api/replays/{id}/perspective/{bot_id}`. */
+export interface CapturedPerspective {
+  bot_id: string;
+  /** Dense and aligned to the ground-truth timeline; `frames[t]` is tick `t`. */
+  frames: PerspectiveFrame[];
+}
