@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { connection, view } from '../stores';
+  import { appMode, connection, view } from '../stores';
   import { room, adminToken, abortMatch } from '../stores/admin';
   import LoginBox from './LoginBox.svelte';
 
@@ -38,6 +38,13 @@
   <span class="topbar-spacer"></span>
   <LoginBox />
   <div class="topbar-controls">
+    {#if $appMode === 'live'}
+      <button
+        class="topbar-btn"
+        type="button"
+        title="Browse and watch recorded matches"
+        onclick={() => appMode.set('replay-browser')}>Replays</button>
+    {/if}
     {#if isRunning && $adminToken}
       <button
         class="topbar-btn admin-disconnect"
