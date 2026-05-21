@@ -29,9 +29,8 @@ use crate::replay::{
     ReplayWriter, REPLAY_FORMAT_VERSION,
 };
 use crate::sim::combat::{self, CombatEvent, FireError};
-use crate::sim::constants::{ACTIVE_RADAR_RANGE, PASSIVE_HEAR_NEARBY_RANGE};
 use crate::sim::sensors::{self, Contact as SimContact, ContactKind as SimContactKind};
-use crate::sim::{physics, BotId, Ship, ShipId, World};
+use crate::sim::{physics, BotId, Ship, ShipId, SimConfig, World};
 
 /// A pre-serialized spectator frame, broadcast once per tick to every `/spectate`
 /// connection. Wrapped in `Arc` so subscribers share the underlying allocation rather
@@ -196,6 +195,24 @@ impl KickError {
     }
 }
 
+/// Reasons an `OperatorConfigure` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigureError {
+    /// Parameters can only be changed while the room is in `Lobby`.
+    NotInLobby,
+    /// A parameter failed validation; the string is a human-readable reason.
+    Invalid(String),
+}
+
+impl ConfigureError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ConfigureError::NotInLobby => "parameters can only be changed before the match starts",
+            ConfigureError::Invalid(reason) => reason,
+        }
+    }
+}
+
 /// Events the room consumes from connection tasks and the operator. The room is
 /// single-threaded with respect to its own state; this channel serializes all mutations.
 #[derive(Debug)]
@@ -244,6 +261,25 @@ pub enum RoomEvent {
     AdminSubscribe {
         reply: oneshot::Sender<broadcast::Receiver<AdminServerMsg>>,
     },
+    /// Admin REST request for a one-shot snapshot of the current room state. Used by
+    /// `GET /api/room` — no subscription, just the current `AdminState`.
+    QueryState {
+        reply: oneshot::Sender<RoomSnapshot>,
+    },
+    /// Operator-issued parameter change from `PUT /api/room/config`. Only valid in
+    /// `Lobby`; replaces the match's `SimConfig` after validation.
+    OperatorConfigure {
+        config: SimConfig,
+        reply: oneshot::Sender<Result<(), ConfigureError>>,
+    },
+}
+
+/// One-shot snapshot returned by `RoomEvent::QueryState`: the admin-facing room state plus
+/// the current balance parameters so the pre-match UI can populate its form.
+#[derive(Debug, Clone)]
+pub struct RoomSnapshot {
+    pub state: AdminState,
+    pub config: SimConfig,
 }
 
 #[derive(Debug)]
@@ -313,7 +349,7 @@ impl Room {
     ) -> Self {
         Self {
             name,
-            world: World::new(width, height),
+            world: World::new(width, height, crate::sim::SimConfig::default()),
             state: RoomState::Lobby,
             rng: Pcg64::seed_from_u64(seed),
             seed,
@@ -533,7 +569,13 @@ impl Room {
                 .enumerate()
                 .map(|(i, c)| translate_contact(i, c))
                 .collect();
-            let events = filter_events_for_bot(&ship_id, viewer_pos, sensor_mode, &combat_events);
+            let events = filter_events_for_bot(
+                &ship_id,
+                viewer_pos,
+                sensor_mode,
+                &self.world.config,
+                &combat_events,
+            );
 
             let entry = self.bots.get(bot_id).expect("bot still present");
             let ship = self.world.ships.get(&ship_id).expect("ship still present");
@@ -730,12 +772,13 @@ impl Room {
     fn transition_to_lobby(&mut self) {
         info!(room = %self.name, "returning to lobby for next match");
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
+        let config = self.world.config;
         self.world.tick = 0;
         self.world.shells.clear();
         self.world.next_shell_index = 0;
         for entry in self.bots.values_mut() {
             if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
-                ship.reset_for_round(center, 0.0);
+                ship.reset_for_round(center, 0.0, &config);
             }
             entry.ready = false;
             entry.pending_command = None;
@@ -1017,7 +1060,33 @@ impl Room {
                 }
                 // No-op when no admin channel is wired (unit tests).
             }
+            RoomEvent::QueryState { reply } => {
+                let _ = reply.send(RoomSnapshot {
+                    state: self.admin_state_snapshot(),
+                    config: self.world.config,
+                });
+            }
+            RoomEvent::OperatorConfigure { config, reply } => {
+                let result = self.configure(config);
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, reason = e.as_str(), "operator configure refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
         }
+    }
+
+    /// Apply an operator-supplied [`SimConfig`]. Only valid in `Lobby`; the parameters are
+    /// validated before they replace the match config.
+    fn configure(&mut self, config: SimConfig) -> Result<(), ConfigureError> {
+        if self.state != RoomState::Lobby {
+            return Err(ConfigureError::NotInLobby);
+        }
+        config.validate().map_err(ConfigureError::Invalid)?;
+        self.world.config = config;
+        info!(room = %self.name, "match parameters updated");
+        Ok(())
     }
 
     /// Queue a command for the next tick or reject it as `late_command` per §1.3 of the
@@ -1128,6 +1197,9 @@ impl Room {
 
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
         let n = self.bots.len() as f32;
+        // Freeze the balance parameters for the whole match: ship hull / ammo and every
+        // physics tunable are read from this snapshot from here on.
+        let config = self.world.config;
         // Snapshot bot ids so we can mutate `self.world` and read `self.bots` without
         // simultaneous &mut+&. Iteration order is BotId-stable (BTreeMap).
         let ordered_ids: Vec<BotId> = self.bots.keys().cloned().collect();
@@ -1144,11 +1216,8 @@ impl Room {
                 entry.ship_id.clone()
             };
             if let Some(ship) = self.world.ships.get_mut(&ship_id) {
-                ship.pos = pos;
-                ship.heading_deg = heading_deg;
-                ship.speed = 0.0;
-                ship.throttle = 0.0;
-                ship.rudder = 0.0;
+                // A fresh hull for the match, sized by the configured parameters.
+                ship.reset_for_round(pos, heading_deg, &config);
             }
 
             let entry = self.bots.get(bot_id).expect("snapshot still in map");
@@ -1236,6 +1305,7 @@ impl Room {
                 height: self.world.height as u32,
             },
             max_bots: self.max_bots,
+            sim_config: self.world.config,
             bots: self
                 .bots
                 .values()
@@ -1309,7 +1379,7 @@ impl Room {
                 height: self.world.height as u32,
             },
             tick_hz: self.tick_hz,
-            ship_specs: ShipSpecs::DEFAULT,
+            ship_specs: ShipSpecs::from_config(&self.world.config),
         };
         // The receiver was just created and has buffer >= 1, so this never fails.
         out_tx
@@ -1374,11 +1444,12 @@ fn filter_events_for_bot(
     own_ship: &ShipId,
     viewer_pos: Vec2,
     sensor_mode: SensorMode,
+    config: &SimConfig,
     events: &[CombatEvent],
 ) -> Vec<TickEvent> {
     let splash_range = match sensor_mode {
-        SensorMode::Active => ACTIVE_RADAR_RANGE,
-        SensorMode::Passive => PASSIVE_HEAR_NEARBY_RANGE,
+        SensorMode::Active => config.active_radar_range,
+        SensorMode::Passive => config.passive_hear_nearby_range,
     };
     let mut out = Vec::new();
     for event in events {

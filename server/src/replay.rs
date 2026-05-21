@@ -26,10 +26,14 @@ use tracing::{info, warn};
 
 use crate::protocol::{FireCommand, MapInfo, SensorMode};
 use crate::room::{PendingCommand, Room, RoomEvent, SpectatorFrame};
+use crate::sim::SimConfig;
 
 /// Bumped on any breaking change to the on-disk format. Readers reject mismatched versions
 /// rather than silently misinterpreting old logs.
-pub const REPLAY_FORMAT_VERSION: u32 = 1;
+///
+/// v2 added the `sim_config` field to the header so a replay rebuilds the simulation with
+/// the exact balance parameters the live run used. v1 logs are no longer readable.
+pub const REPLAY_FORMAT_VERSION: u32 = 2;
 
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
@@ -52,6 +56,9 @@ pub struct ReplayHeader {
     pub tick_deadline_ms: u64,
     pub map: MapInfo,
     pub max_bots: u32,
+    /// Balance parameters the live run used. Replaying re-applies these so the simulation
+    /// is bit-identical even when the match used non-default ship/weapon/sensor values.
+    pub sim_config: SimConfig,
     pub bots: Vec<ReplayBot>,
 }
 
@@ -239,6 +246,9 @@ pub fn rebuild_room_from_header(header: &ReplayHeader) -> Result<Room, ReplayErr
         header.tick_deadline_ms,
         header.max_bots.max(header.bots.len() as u32),
     );
+    // Apply the recorded balance parameters before any bot registers or the match starts,
+    // so `welcome` payloads and physics use the exact values the live run did.
+    room.world.config = header.sim_config;
 
     for bot in &header.bots {
         let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -424,6 +434,7 @@ mod tests {
                 height: 1000,
             },
             max_bots: 4,
+            sim_config: SimConfig::default(),
             bots: vec![
                 ReplayBot {
                     bot_id: "b_1".into(),

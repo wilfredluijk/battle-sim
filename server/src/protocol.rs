@@ -112,23 +112,25 @@ pub struct ShipSpecs {
 }
 
 impl ShipSpecs {
-    /// Spec values from `sim::constants`. Used in the `welcome` payload. Keep this struct
-    /// in lock-step with `sim::constants` — bots base their physics models on what we send
-    /// here, so any drift would silently mislead every connected client.
-    pub const DEFAULT: ShipSpecs = ShipSpecs {
-        max_forward_speed: crate::sim::constants::MAX_FORWARD_SPEED,
-        max_reverse_speed: crate::sim::constants::MAX_REVERSE_SPEED,
-        acceleration: crate::sim::constants::ACCELERATION,
-        turn_rate_deg_per_s: crate::sim::constants::TURN_RATE_DEG_PER_S,
-        hull_hp: crate::sim::constants::HULL_HP,
-        max_ammo: crate::sim::constants::MAX_AMMO,
-        gun_cooldown_ticks: crate::sim::constants::GUN_COOLDOWN_TICKS,
-        hit_radius: crate::sim::constants::HIT_RADIUS,
-        shell_speed: crate::sim::constants::SHELL_SPEED,
-        max_shell_range: crate::sim::constants::MAX_SHELL_RANGE,
-        splash_radius: crate::sim::constants::SPLASH_RADIUS,
-        max_splash_damage: crate::sim::constants::MAX_SPLASH_DAMAGE,
-    };
+    /// Derive the `welcome`-payload spec from a match's [`SimConfig`]. Bots base their
+    /// physics models on what we send here, so this must always reflect the parameters the
+    /// simulation will actually run with.
+    pub fn from_config(config: &crate::sim::SimConfig) -> ShipSpecs {
+        ShipSpecs {
+            max_forward_speed: config.max_forward_speed,
+            max_reverse_speed: config.max_reverse_speed,
+            acceleration: config.acceleration,
+            turn_rate_deg_per_s: config.turn_rate_deg_per_s,
+            hull_hp: config.hull_hp,
+            max_ammo: config.max_ammo,
+            gun_cooldown_ticks: config.gun_cooldown_ticks,
+            hit_radius: config.hit_radius,
+            shell_speed: config.shell_speed,
+            max_shell_range: config.max_shell_range,
+            splash_radius: config.splash_radius,
+            max_splash_damage: config.max_splash_damage,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -328,7 +330,7 @@ mod tests {
                 height: 1000,
             },
             tick_hz: 10,
-            ship_specs: ShipSpecs::DEFAULT,
+            ship_specs: ShipSpecs::from_config(&crate::sim::SimConfig::default()),
         });
         roundtrip(&ServerMsg::GameStart {
             tick: 0,

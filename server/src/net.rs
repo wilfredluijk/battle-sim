@@ -1,45 +1,64 @@
+//! HTTP + WebSocket front end, built on `axum`.
+//!
+//! Three planes share one listener:
+//! - **REST control plane** (`/api/*`) — admin login + room lifecycle, gated by JWT.
+//! - **WebSocket streams** (`/bot`, `/spectate`) — the inherently streaming surfaces.
+//! - **Static assets** (`/`, `/index.*`) — the embedded spectator UI.
+//!
+//! `sim/` is never imported here except for the wire-facing `SimConfig`; the room
+//! translates between protocol messages and simulation commands.
+
 use std::collections::HashMap;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Json, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::Router;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::admin::{self, admin_error_code, AdminMsg, AdminServerMsg};
+use crate::admin::AdminState;
+use crate::auth::AuthState;
 use crate::config::Config;
 use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
-use crate::room::{BotRegistration, PendingCommand, RoomEvent, SpectatorFrame};
+use crate::room::{
+    BotRegistration, ConfigureError, PendingCommand, RoomEvent, RoomSnapshot, SpectatorFrame,
+    StartError,
+};
+use crate::sim::SimConfig;
 
 /// After this many protocol violations, the bot connection is closed.
 const MAX_VIOLATIONS: u32 = 5;
-
-/// Cap on the number of bytes we will buffer while reading the HTTP request head. Real
-/// requests fit comfortably inside 2 KiB; anything larger is almost certainly hostile.
-const MAX_HEAD_BYTES: usize = 8 * 1024;
 
 /// Cap on a single WebSocket message/frame. Bot JSON commands are well under 1 KiB; 16 KiB
 /// is generous slack without exposing the server to multi-megabyte parse DoS.
 const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
 
-/// Tracker for live TCP connections per peer IP. Wrapped in `Arc<Mutex<..>>` so the
-/// accept loop and per-connection cleanup share a view.
+/// Static spectator assets, embedded at compile time. Built from `spectator/dist/` — see
+/// `spectator/vite.config.ts`.
+static INDEX_HTML: &str = include_str!("../../spectator/dist/index.html");
+static INDEX_JS: &str = include_str!("../../spectator/dist/index.js");
+static INDEX_CSS: &str = include_str!("../../spectator/dist/index.css");
+
+// ---------------------------------------------------------------------------
+// Per-IP connection cap
+// ---------------------------------------------------------------------------
+
 type IpConnTable = Arc<Mutex<HashMap<IpAddr, u32>>>;
 
-/// RAII guard that decrements the per-IP counter on drop. Acquired right after accept;
-/// dropped when the connection task ends. Skips bookkeeping when the cap is disabled.
+/// RAII guard that decrements the per-IP counter on drop. Acquired before a WebSocket
+/// upgrade; dropped when the connection task ends. Skips bookkeeping when the cap is 0.
 struct IpConnGuard {
     table: Option<IpConnTable>,
     ip: IpAddr,
@@ -68,9 +87,8 @@ impl Drop for IpConnGuard {
         let Some(table) = self.table.as_ref() else {
             return;
         };
-        let mut guard = match table.lock() {
-            Ok(g) => g,
-            Err(_) => return,
+        let Ok(mut guard) = table.lock() else {
+            return;
         };
         if let Some(entry) = guard.get_mut(&self.ip) {
             *entry = entry.saturating_sub(1);
@@ -81,267 +99,436 @@ impl Drop for IpConnGuard {
     }
 }
 
-/// Static spectator assets, embedded at compile time so the server has no runtime path
-/// dependency on the `spectator/` directory. Reads from `spectator/dist/` — the Vite
-/// build output. Vite is configured to emit predictable filenames (`index.js`,
-/// `index.css`) so these `include_str!` paths stay stable; see `spectator/vite.config.ts`.
-/// Before the JS toolchain is wired up, `spectator/dist/` is seeded with the legacy
-/// `render.js` + `style.css`, so the existing `INDEX_JS` / `INDEX_CSS` constant names below
-/// resolve to those files until the migration's Svelte build replaces them.
-static INDEX_HTML: &str = include_str!("../../spectator/dist/index.html");
-static INDEX_JS: &str = include_str!("../../spectator/dist/index.js");
-static INDEX_CSS: &str = include_str!("../../spectator/dist/index.css");
+// ---------------------------------------------------------------------------
+// Shared state + entry point
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Endpoint {
-    Bot,
-    Spectator,
-    Admin,
-}
-
-type Ws = WebSocketStream<PrefixedStream>;
-type WsSink = SplitSink<Ws, Message>;
-type WsStream = SplitStream<Ws>;
-
-pub async fn run(
-    config: Config,
-    admin_token: Arc<String>,
+#[derive(Clone)]
+struct AppState {
     room_tx: mpsc::Sender<RoomEvent>,
     spec_tx: broadcast::Sender<SpectatorFrame>,
-    mut shutdown_rx: broadcast::Receiver<()>,
+    shutdown_tx: broadcast::Sender<()>,
+    auth: Arc<AuthState>,
+    room_name: Arc<str>,
+    ip_conns: IpConnTable,
+    per_ip_cap: u32,
+    tournament: bool,
+    hello_timeout: Duration,
+}
+
+/// Bind the listener and serve the HTTP/WebSocket app until `shutdown_tx` fires.
+pub async fn run(
+    config: Config,
+    room_name: String,
+    auth: Arc<AuthState>,
+    room_tx: mpsc::Sender<RoomEvent>,
+    spec_tx: broadcast::Sender<SpectatorFrame>,
+    shutdown_tx: broadcast::Sender<()>,
 ) {
     let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(%addr, error = %e, "failed to bind TCP listener");
+            error!(%addr, error = %e, "failed to bind TCP listener");
             return;
         }
     };
     info!(
         %addr,
         max_conn_per_ip = config.max_connections_per_ip,
-        handshake_timeout_secs = config.handshake_timeout_secs,
         tournament = config.tournament,
-        "listener bound (HTTP /, WS /bot, WS /spectate, WS /admin)"
+        "listener bound (HTTP /, REST /api, WS /bot, WS /spectate)"
     );
 
-    let ip_conns: IpConnTable = Arc::new(Mutex::new(HashMap::new()));
-    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs.max(1));
-    let per_ip_cap = config.max_connections_per_ip;
-    let tournament = config.tournament;
+    let state = AppState {
+        room_tx,
+        spec_tx,
+        shutdown_tx: shutdown_tx.clone(),
+        auth,
+        room_name: Arc::from(room_name),
+        ip_conns: Arc::new(Mutex::new(HashMap::new())),
+        per_ip_cap: config.max_connections_per_ip,
+        tournament: config.tournament,
+        hello_timeout: Duration::from_secs(config.handshake_timeout_secs.max(1)),
+    };
 
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                info!("net: shutdown signal received");
-                break;
-            }
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, peer)) => {
-                        let guard = match IpConnGuard::try_acquire(&ip_conns, peer.ip(), per_ip_cap) {
-                            Some(g) => g,
-                            None => {
-                                warn!(%peer, cap = per_ip_cap, "refusing connection: per-IP cap reached");
-                                drop(stream);
-                                continue;
-                            }
-                        };
-                        let conn_shutdown = shutdown_rx.resubscribe();
-                        let room_tx = room_tx.clone();
-                        let spec_tx = spec_tx.clone();
-                        let admin_token = admin_token.clone();
-                        tokio::spawn(handle_connection(
-                            stream,
-                            peer,
-                            admin_token,
-                            room_tx,
-                            spec_tx,
-                            conn_shutdown,
-                            handshake_timeout,
-                            tournament,
-                            guard,
-                        ));
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "accept failed");
-                    }
-                }
-            }
+    let app = router(state);
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.recv().await;
+        info!("net: shutdown signal received");
+    });
+    if let Err(e) = server.await {
+        error!(error = %e, "http server error");
+    }
+}
+
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(serve_index))
+        .route("/index.html", get(serve_index))
+        .route("/index.js", get(serve_js))
+        .route("/index.css", get(serve_css))
+        .route("/api/login", post(login))
+        .route("/api/room", get(get_room))
+        .route("/api/config/schema", get(get_config_schema))
+        .route("/api/room/config", put(put_config))
+        .route("/api/room/start", post(post_start))
+        .route("/api/room/abort", post(post_abort))
+        .route("/api/room/reset", post(post_reset))
+        .route("/api/room/kick", post(post_kick))
+        .route("/bot", get(bot_ws))
+        .route("/spectate", get(spectate_ws))
+        .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// Static assets
+// ---------------------------------------------------------------------------
+
+fn static_response(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn serve_index() -> Response {
+    static_response("text/html; charset=utf-8", INDEX_HTML)
+}
+
+async fn serve_js() -> Response {
+    static_response("application/javascript; charset=utf-8", INDEX_JS)
+}
+
+async fn serve_css() -> Response {
+    static_response("text/css; charset=utf-8", INDEX_CSS)
+}
+
+// ---------------------------------------------------------------------------
+// REST: errors + helpers
+// ---------------------------------------------------------------------------
+
+/// A REST error rendered as `{ "code": ..., "message": ... }` with an HTTP status.
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
         }
     }
 }
 
-/// Read the HTTP request head, then dispatch: WS upgrade → `/bot` or `/spectate`,
-/// plain HTTP GET → static file response.
-#[allow(clippy::too_many_arguments)]
-async fn handle_connection(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    admin_token: Arc<String>,
-    room_tx: mpsc::Sender<RoomEvent>,
-    spec_tx: broadcast::Sender<SpectatorFrame>,
-    shutdown_rx: broadcast::Receiver<()>,
-    handshake_timeout: Duration,
-    tournament: bool,
-    _ip_guard: IpConnGuard,
-) {
-    let head_bytes = match timeout(handshake_timeout, read_http_head(&mut stream)).await {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            debug!(%peer, error = %e, "failed reading HTTP head");
-            return;
-        }
-        Err(_) => {
-            warn!(%peer, "HTTP head read timed out");
-            let _ = write_http_response(
-                &mut stream,
-                408,
-                "Request Timeout",
-                "text/plain; charset=utf-8",
-                b"timeout",
-            )
-            .await;
-            return;
-        }
-    };
-
-    let parsed = match parse_request(&head_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(%peer, error = %e, "malformed HTTP request");
-            let _ = write_http_response(
-                &mut stream,
-                400,
-                "Bad Request",
-                "text/plain; charset=utf-8",
-                b"bad request",
-            )
-            .await;
-            return;
-        }
-    };
-
-    if parsed.is_websocket_upgrade {
-        let path_only = parsed.path.split('?').next().unwrap_or(&parsed.path);
-        let endpoint = match path_only {
-            "/bot" => Endpoint::Bot,
-            "/spectate" => Endpoint::Spectator,
-            "/admin" => Endpoint::Admin,
-            other => {
-                warn!(%peer, path = other, "unknown websocket path; closing");
-                let _ = write_http_response(
-                    &mut stream,
-                    404,
-                    "Not Found",
-                    "text/plain; charset=utf-8",
-                    b"unknown websocket path",
-                )
-                .await;
-                return;
-            }
-        };
-
-        // In tournament mode, `/spectate` is loopback-only. Refuse the upgrade before we
-        // burn cycles on a handshake the spec view would just leak ground truth through.
-        if tournament && endpoint == Endpoint::Spectator && !peer.ip().is_loopback() {
-            warn!(%peer, "refusing /spectate: tournament mode allows loopback only");
-            let _ = write_http_response(
-                &mut stream,
-                403,
-                "Forbidden",
-                "text/plain; charset=utf-8",
-                b"spectator endpoint disabled in tournament mode",
-            )
-            .await;
-            return;
-        }
-
-        // Admin auth: rotating token in `?token=...`. Mismatch returns HTTP 401 before
-        // the WS upgrade, which the browser surfaces as a clean handshake failure.
-        if endpoint == Endpoint::Admin {
-            let provided = extract_query_value(&parsed.path, "token").unwrap_or("");
-            if !admin::constant_time_eq(provided, &admin_token) {
-                warn!(%peer, "refusing /admin: invalid token");
-                let _ = write_http_response(
-                    &mut stream,
-                    401,
-                    "Unauthorized",
-                    "text/plain; charset=utf-8",
-                    b"invalid admin token",
-                )
-                .await;
-                return;
-            }
-        }
-
-        let prefixed = PrefixedStream::new(head_bytes, stream);
-        let ws_config = WebSocketConfig {
-            max_message_size: Some(MAX_WS_MESSAGE_BYTES),
-            max_frame_size: Some(MAX_WS_MESSAGE_BYTES),
-            ..Default::default()
-        };
-        let ws = match timeout(
-            handshake_timeout,
-            tokio_tungstenite::accept_async_with_config(prefixed, Some(ws_config)),
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({ "code": self.code, "message": self.message })),
         )
-        .await
-        {
-            Ok(Ok(ws)) => ws,
-            Ok(Err(e)) => {
-                warn!(%peer, error = %e, "websocket handshake failed");
-                return;
-            }
-            Err(_) => {
-                warn!(%peer, "websocket handshake timed out");
-                return;
-            }
-        };
-
-        info!(%peer, ?endpoint, "websocket connected");
-        match endpoint {
-            Endpoint::Bot => handle_bot(peer, ws, room_tx, shutdown_rx, handshake_timeout).await,
-            Endpoint::Spectator => handle_spectator(peer, ws, spec_tx, shutdown_rx).await,
-            Endpoint::Admin => handle_admin(peer, ws, room_tx, shutdown_rx).await,
-        }
-        info!(%peer, ?endpoint, "connection ended");
-    } else {
-        // Plain HTTP — static file serving.
-        if !parsed.method.eq_ignore_ascii_case("GET") {
-            let _ = write_http_response(
-                &mut stream,
-                405,
-                "Method Not Allowed",
-                "text/plain; charset=utf-8",
-                b"method not allowed",
-            )
-            .await;
-            return;
-        }
-        match resolve_static(&parsed.path) {
-            Some((content_type, body)) => {
-                debug!(%peer, path = %parsed.path, "serving static asset");
-                let _ = write_http_response(&mut stream, 200, "OK", content_type, body).await;
-            }
-            None => {
-                debug!(%peer, path = %parsed.path, "static asset not found");
-                let _ = write_http_response(
-                    &mut stream,
-                    404,
-                    "Not Found",
-                    "text/plain; charset=utf-8",
-                    b"not found",
-                )
-                .await;
-            }
-        }
+            .into_response()
     }
 }
+
+/// Reject the request unless it carries a valid `Authorization: Bearer <jwt>` header.
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    match token {
+        Some(t) if state.auth.verify_token(t) => Ok(()),
+        _ => Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "a valid admin token is required",
+        )),
+    }
+}
+
+/// Send a `RoomEvent` built around a fresh oneshot and await its reply.
+async fn ask_room<T>(
+    state: &AppState,
+    make: impl FnOnce(oneshot::Sender<T>) -> RoomEvent,
+) -> Result<T, ApiError> {
+    let (tx, rx) = oneshot::channel();
+    if state.room_tx.send(make(tx)).await.is_err() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "room_unavailable",
+            "the room is not running",
+        ));
+    }
+    rx.await.map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "room_unavailable",
+            "the room dropped the reply",
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// REST: auth
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    token: String,
+    expires_at: u64,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    if !state.auth.verify_password(&req.password) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "incorrect admin password",
+        ));
+    }
+    let (token, expires_at) = state.auth.issue_token().map_err(|e| {
+        warn!(error = %e, "failed to mint admin token");
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "token_error",
+            "could not issue a token",
+        )
+    })?;
+    Ok(Json(LoginResponse { token, expires_at }))
+}
+
+// ---------------------------------------------------------------------------
+// REST: room state + lifecycle
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct RoomResponse {
+    #[serde(flatten)]
+    state: AdminState,
+    config: SimConfig,
+}
+
+/// Public: current room state plus the active balance parameters. Drives both the
+/// pre-match summary screen and the post-battle report.
+async fn get_room(State(state): State<AppState>) -> Result<Json<RoomResponse>, ApiError> {
+    let snap: RoomSnapshot = ask_room(&state, |reply| RoomEvent::QueryState { reply }).await?;
+    Ok(Json(RoomResponse {
+        state: snap.state,
+        config: snap.config,
+    }))
+}
+
+async fn post_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let room = state.room_name.to_string();
+    let result: Result<(), StartError> =
+        ask_room(&state, |reply| RoomEvent::OperatorStart { room, reply }).await?;
+    result.map_err(|e| ApiError::new(StatusCode::CONFLICT, "start_refused", e.as_str()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_abort(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let result = ask_room(&state, |reply| RoomEvent::OperatorAbort { reply }).await?;
+    result.map_err(|e| ApiError::new(StatusCode::CONFLICT, "abort_refused", e.as_str()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let result = ask_room(&state, |reply| RoomEvent::OperatorReset { reply }).await?;
+    result.map_err(|e| ApiError::new(StatusCode::CONFLICT, "reset_refused", e.as_str()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct KickRequest {
+    bot_id: String,
+}
+
+async fn post_kick(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<KickRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let result = ask_room(&state, |reply| RoomEvent::OperatorKick {
+        bot_id: req.bot_id,
+        reply,
+    })
+    .await?;
+    result.map_err(|e| ApiError::new(StatusCode::NOT_FOUND, "unknown_bot", e.as_str()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn put_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(config): Json<SimConfig>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let result = ask_room(&state, |reply| RoomEvent::OperatorConfigure {
+        config,
+        reply,
+    })
+    .await?;
+    result.map_err(|e| {
+        let (status, code) = match e {
+            ConfigureError::NotInLobby => (StatusCode::CONFLICT, "not_in_lobby"),
+            ConfigureError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_parameter"),
+        };
+        ApiError::new(status, code, e.as_str().to_string())
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Public: metadata for the pre-match parameter form — every tunable with its group,
+/// default and sane bounds. The frontend renders one input per entry.
+async fn get_config_schema() -> Json<serde_json::Value> {
+    let d = SimConfig::default();
+    let num = |key: &str, label: &str, group: &str, default: f64, min: f64, max: f64, int: bool| {
+        json!({
+            "key": key, "label": label, "group": group,
+            "default": default, "min": min, "max": max, "integer": int,
+        })
+    };
+    Json(json!({
+        "fields": [
+            num("hull_hp", "Hull HP", "ship", d.hull_hp as f64, 1.0, 100000.0, true),
+            num("max_ammo", "Ammo capacity", "ship", d.max_ammo as f64, 1.0, 100000.0, true),
+            num("gun_cooldown_ticks", "Gun cooldown (ticks)", "ship", d.gun_cooldown_ticks as f64, 1.0, 100000.0, true),
+            num("max_forward_speed", "Max forward speed", "ship", d.max_forward_speed as f64, 0.1, 1000.0, false),
+            num("max_reverse_speed", "Max reverse speed", "ship", d.max_reverse_speed as f64, 0.1, 1000.0, false),
+            num("acceleration", "Acceleration", "ship", d.acceleration as f64, 0.1, 10000.0, false),
+            num("turn_rate_deg_per_s", "Turn rate (deg/s)", "ship", d.turn_rate_deg_per_s as f64, 0.1, 36000.0, false),
+            num("hit_radius", "Hit radius", "ship", d.hit_radius as f64, 0.1, 10000.0, false),
+            num("shell_speed", "Shell speed", "weapons", d.shell_speed as f64, 0.1, 100000.0, false),
+            num("max_shell_range", "Max shell range", "weapons", d.max_shell_range as f64, 0.1, 1000000.0, false),
+            num("splash_radius", "Splash radius", "weapons", d.splash_radius as f64, 0.1, 1000000.0, false),
+            num("max_splash_damage", "Max splash damage", "weapons", d.max_splash_damage as f64, 1.0, 100000.0, true),
+            num("wall_bump_damage", "Wall bump damage", "weapons", d.wall_bump_damage as f64, 0.0, 100000.0, true),
+            num("active_radar_range", "Active radar range", "sensors", d.active_radar_range as f64, 0.1, 1000000.0, false),
+            num("active_radar_noise", "Active radar noise", "sensors", d.active_radar_noise as f64, 0.0, 1000000.0, false),
+            num("passive_hear_active_range", "Passive hear-active range", "sensors", d.passive_hear_active_range as f64, 0.1, 1000000.0, false),
+            num("passive_hear_nearby_range", "Passive hear-nearby range", "sensors", d.passive_hear_nearby_range as f64, 0.1, 1000000.0, false),
+            num("passive_bearing_noise_deg", "Passive bearing noise (deg)", "sensors", d.passive_bearing_noise_deg as f64, 0.0, 180.0, false),
+        ]
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket: upgrade handlers
+// ---------------------------------------------------------------------------
+
+async fn bot_ws(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    let guard = match IpConnGuard::try_acquire(&state.ip_conns, peer.ip(), state.per_ip_cap) {
+        Some(g) => g,
+        None => {
+            warn!(%peer, "refusing /bot: per-IP connection cap reached");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "per-IP connection cap reached",
+            )
+                .into_response();
+        }
+    };
+    let hello_timeout = state.hello_timeout;
+    let shutdown_rx = state.shutdown_tx.subscribe();
+    let room_tx = state.room_tx.clone();
+    let ws = ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES);
+    ws.on_upgrade(move |socket| async move {
+        let _guard = guard;
+        info!(%peer, "bot websocket connected");
+        handle_bot(peer, socket, room_tx, shutdown_rx, hello_timeout).await;
+        info!(%peer, "bot connection ended");
+    })
+}
+
+async fn spectate_ws(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    // Tournament mode keeps ground-truth spectator state on loopback only.
+    if state.tournament && !peer.ip().is_loopback() {
+        warn!(%peer, "refusing /spectate: tournament mode allows loopback only");
+        return (
+            StatusCode::FORBIDDEN,
+            "spectator endpoint disabled in tournament mode",
+        )
+            .into_response();
+    }
+    let guard = match IpConnGuard::try_acquire(&state.ip_conns, peer.ip(), state.per_ip_cap) {
+        Some(g) => g,
+        None => {
+            warn!(%peer, "refusing /spectate: per-IP connection cap reached");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "per-IP connection cap reached",
+            )
+                .into_response();
+        }
+    };
+    let spec_tx = state.spec_tx.clone();
+    let shutdown_rx = state.shutdown_tx.subscribe();
+    let ws = ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES);
+    ws.on_upgrade(move |socket| async move {
+        let _guard = guard;
+        info!(%peer, "spectator websocket connected");
+        handle_spectator(peer, socket, spec_tx, shutdown_rx).await;
+        info!(%peer, "spectator connection ended");
+    })
+}
+
+type WsSink = SplitSink<WebSocket, Message>;
+type WsStream = SplitStream<WebSocket>;
+
+// ---------------------------------------------------------------------------
+// WebSocket: /bot
+// ---------------------------------------------------------------------------
 
 async fn handle_bot(
     peer: SocketAddr,
-    ws: Ws,
+    ws: WebSocket,
     room_tx: mpsc::Sender<RoomEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
     hello_timeout: Duration,
@@ -349,9 +536,7 @@ async fn handle_bot(
     let (mut sink, mut stream) = ws.split();
     let mut violations: u32 = 0;
 
-    // Phase 1: wait for `hello`. Reject other typed messages and malformed frames as
-    // protocol violations; disconnect after MAX_VIOLATIONS. A bot that connects but never
-    // sends `hello` is dropped after `hello_timeout`.
+    // Phase 1: wait for `hello`. A bot that never sends it is dropped after the timeout.
     let hello_fut = wait_for_hello(
         peer,
         &mut sink,
@@ -376,7 +561,7 @@ async fn handle_bot(
             .await;
             let _ = sink
                 .send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Policy,
+                    code: close_code::POLICY,
                     reason: "handshake timeout".into(),
                 })))
                 .await;
@@ -384,32 +569,28 @@ async fn handle_bot(
         }
     };
 
-    // Validate the name charset/length before we ever hand it to the room. Saves a
-    // round-trip and keeps the violation accounting consistent with malformed messages.
     if let Err(reason) = protocol::validate_bot_name(&name) {
         warn!(%peer, name = %name, %reason, "rejecting invalid bot name");
         send_error(&mut sink, error_code::INVALID_NAME, reason).await;
         let _ = sink
             .send(Message::Close(Some(CloseFrame {
-                code: CloseCode::Policy,
+                code: close_code::POLICY,
                 reason: "invalid name".into(),
             })))
             .await;
         return;
     }
 
-    // Phase 2: register with the room and grab our outbound channel.
+    // Phase 2: register with the room.
     let registration = match register(peer, &room_tx, name, version, &mut sink).await {
         Some(r) => r,
         None => return,
     };
     let bot_id = registration.bot_id.clone();
     let mut outbound_rx = registration.outbound;
-
     info!(%peer, bot_id = %bot_id, ship_id = %registration.ship_id, "bot handshake complete");
 
-    // Phase 3: main loop — forward inbound bot messages to the room and outbound server
-    // messages to the websocket.
+    // Phase 3: forward inbound bot messages to the room and outbound frames to the socket.
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -471,12 +652,8 @@ async fn handle_bot(
                                         %reason,
                                         "rejecting command with non-finite float",
                                     );
-                                    send_error(
-                                        &mut sink,
-                                        error_code::NON_FINITE_VALUE,
-                                        reason,
-                                    )
-                                    .await;
+                                    send_error(&mut sink, error_code::NON_FINITE_VALUE, reason)
+                                        .await;
                                     if violations >= MAX_VIOLATIONS {
                                         disconnect_for_violations(&mut sink).await;
                                         break;
@@ -535,15 +712,11 @@ async fn handle_bot(
                             break;
                         }
                     }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
                         info!(%peer, bot_id = %bot_id, ?frame, "bot closed");
                         break;
                     }
-                    Some(Ok(Message::Frame(_))) => {}
                     Some(Err(e)) => {
                         warn!(%peer, error = %e, "ws read error");
                         break;
@@ -557,13 +730,10 @@ async fn handle_bot(
         }
     }
 
-    // Best-effort notify the room. If the channel is gone (server shutting down) the
-    // room is already tearing down its bookkeeping.
     let _ = room_tx.send(RoomEvent::BotDisconnect { bot_id }).await;
 }
 
-/// Read frames until we get a valid `hello` or the connection ends. Pings are answered;
-/// non-hello messages and malformed frames count as protocol violations.
+/// Read frames until a valid `hello` arrives or the connection ends.
 async fn wait_for_hello(
     peer: SocketAddr,
     sink: &mut WsSink,
@@ -630,15 +800,11 @@ async fn wait_for_hello(
                             return None;
                         }
                     }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
                         info!(%peer, ?frame, "bot closed before handshake");
                         return None;
                     }
-                    Some(Ok(Message::Frame(_))) => {}
                     Some(Err(e)) => {
                         warn!(%peer, error = %e, "ws read error before handshake");
                         return None;
@@ -653,8 +819,7 @@ async fn wait_for_hello(
     }
 }
 
-/// Send `BotConnect` to the room and await registration. Reports failures back to the
-/// bot via an `error` frame.
+/// Send `BotConnect` to the room and await registration.
 async fn register(
     peer: SocketAddr,
     room_tx: &mpsc::Sender<RoomEvent>,
@@ -691,9 +856,13 @@ async fn register(
     }
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket: /spectate
+// ---------------------------------------------------------------------------
+
 async fn handle_spectator(
     peer: SocketAddr,
-    ws: Ws,
+    ws: WebSocket,
     spec_tx: broadcast::Sender<SpectatorFrame>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -711,8 +880,6 @@ async fn handle_spectator(
             recv = spec_rx.recv() => {
                 match recv {
                     Ok(frame) => {
-                        // The Arc avoids re-allocating per subscriber, but the WS sink
-                        // still needs an owned `String` per send.
                         if sink.send(Message::Text((*frame).clone())).await.is_err() {
                             debug!(%peer, "spectator sink closed");
                             break;
@@ -729,9 +896,7 @@ async fn handle_spectator(
             }
             frame = stream.next() => {
                 match frame {
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
-                    }
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
                         info!(%peer, ?frame, "spectator closed");
                         break;
@@ -753,294 +918,11 @@ async fn handle_spectator(
     }
 }
 
-/// Drive a `/admin` WebSocket. Authentication has already happened (the token in the
-/// request-line query was validated before the upgrade). Subscribes to the room's admin
-/// broadcast so the client gets a state snapshot on connect plus a push on every
-/// lifecycle transition.
-async fn handle_admin(
-    peer: SocketAddr,
-    ws: Ws,
-    room_tx: mpsc::Sender<RoomEvent>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    let (mut sink, mut stream) = ws.split();
+// ---------------------------------------------------------------------------
+// Shared frame helpers
+// ---------------------------------------------------------------------------
 
-    let (sub_tx, sub_rx) = oneshot::channel();
-    if room_tx
-        .send(RoomEvent::AdminSubscribe { reply: sub_tx })
-        .await
-        .is_err()
-    {
-        warn!(%peer, "room channel closed; closing admin connection");
-        let _ = sink.send(Message::Close(None)).await;
-        return;
-    }
-    let mut admin_rx = match sub_rx.await {
-        Ok(rx) => rx,
-        Err(_) => {
-            warn!(%peer, "room dropped admin subscription reply");
-            let _ = sink.send(Message::Close(None)).await;
-            return;
-        }
-    };
-
-    info!(%peer, "admin connected");
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                info!(%peer, "closing admin connection (shutdown)");
-                let _ = sink.send(Message::Close(None)).await;
-                break;
-            }
-            recv = admin_rx.recv() => {
-                match recv {
-                    Ok(msg) => {
-                        if !send_admin_msg(&mut sink, &msg).await {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(%peer, skipped, "admin lagging; dropped state frames");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!(%peer, "admin broadcast closed");
-                        break;
-                    }
-                }
-            }
-            frame = stream.next() => {
-                match frame {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<AdminMsg>(&text) {
-                            Ok(msg) => {
-                                if !handle_admin_command(&room_tx, &mut sink, msg).await {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                let code = if matches!(
-                                    e.classify(),
-                                    serde_json::error::Category::Syntax
-                                ) {
-                                    admin_error_code::MALFORMED_JSON
-                                } else {
-                                    admin_error_code::INVALID_MESSAGE
-                                };
-                                let err = AdminServerMsg::Error {
-                                    code: code.into(),
-                                    message: e.to_string(),
-                                };
-                                let _ = send_admin_msg(&mut sink, &err).await;
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Binary(_))) => {
-                        let err = AdminServerMsg::Error {
-                            code: admin_error_code::INVALID_MESSAGE.into(),
-                            message: "binary frames are not accepted on /admin".into(),
-                        };
-                        let _ = send_admin_msg(&mut sink, &err).await;
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(frame))) => {
-                        info!(%peer, ?frame, "admin closed");
-                        break;
-                    }
-                    Some(Ok(Message::Frame(_))) => {}
-                    Some(Err(e)) => {
-                        warn!(%peer, error = %e, "admin ws read error");
-                        break;
-                    }
-                    None => {
-                        info!(%peer, "admin stream ended");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Send a serialized `AdminServerMsg` to the admin WS sink. Returns false on socket
-/// failure (which the caller treats as terminal).
-async fn send_admin_msg(sink: &mut WsSink, msg: &AdminServerMsg) -> bool {
-    let payload = match serde_json::to_string(msg) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "failed to serialize admin frame");
-            return true;
-        }
-    };
-    sink.send(Message::Text(payload)).await.is_ok()
-}
-
-/// Translate a single `AdminMsg` into a `RoomEvent`, await the room's reply, and surface
-/// success / failure to the admin client. Returns false to terminate the connection.
-async fn handle_admin_command(
-    room_tx: &mpsc::Sender<RoomEvent>,
-    sink: &mut WsSink,
-    msg: AdminMsg,
-) -> bool {
-    match msg {
-        AdminMsg::Start => {
-            let (tx, rx) = oneshot::channel();
-            if room_tx
-                .send(RoomEvent::OperatorStart {
-                    room: "main".into(),
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            match rx.await {
-                Ok(Ok(())) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Ack {
-                            command: "start".into(),
-                        },
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Error {
-                            code: "start_refused".into(),
-                            message: e.as_str().into(),
-                        },
-                    )
-                    .await;
-                }
-                Err(_) => return false,
-            }
-        }
-        AdminMsg::Abort => {
-            let (tx, rx) = oneshot::channel();
-            if room_tx
-                .send(RoomEvent::OperatorAbort { reply: tx })
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            match rx.await {
-                Ok(Ok(())) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Ack {
-                            command: "abort".into(),
-                        },
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Error {
-                            code: admin_error_code::NOT_RUNNING.into(),
-                            message: e.as_str().into(),
-                        },
-                    )
-                    .await;
-                }
-                Err(_) => return false,
-            }
-        }
-        AdminMsg::Reset => {
-            let (tx, rx) = oneshot::channel();
-            if room_tx
-                .send(RoomEvent::OperatorReset { reply: tx })
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            match rx.await {
-                Ok(Ok(())) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Ack {
-                            command: "reset".into(),
-                        },
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Error {
-                            code: admin_error_code::NOT_ENDED.into(),
-                            message: e.as_str().into(),
-                        },
-                    )
-                    .await;
-                }
-                Err(_) => return false,
-            }
-        }
-        AdminMsg::Kick { bot_id } => {
-            let (tx, rx) = oneshot::channel();
-            if room_tx
-                .send(RoomEvent::OperatorKick {
-                    bot_id: bot_id.clone(),
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            match rx.await {
-                Ok(Ok(())) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Ack {
-                            command: "kick".into(),
-                        },
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    let _ = send_admin_msg(
-                        sink,
-                        &AdminServerMsg::Error {
-                            code: admin_error_code::UNKNOWN_BOT.into(),
-                            message: e.as_str().into(),
-                        },
-                    )
-                    .await;
-                }
-                Err(_) => return false,
-            }
-        }
-    }
-    true
-}
-
-/// Extract a query value for `key` from a request-line path of the form `/p?a=b&c=d`.
-/// Returns `None` if there's no query string or `key` is absent. No URL decoding —
-/// admin tokens are alphanumeric.
-fn extract_query_value<'a>(path_with_query: &'a str, key: &str) -> Option<&'a str> {
-    let query = path_with_query.split_once('?').map(|(_, q)| q)?;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-/// Reject `command` frames containing `NaN` / `Inf`. Without this, NaN propagates into
-/// `physics::step_world` (NaN positions, broken distance checks) and is a determinism
-/// hazard as well as a DoS sink for the JSON parser if combined with huge payloads.
+/// Reject `command` frames containing `NaN` / `Inf` before they reach the simulation.
 fn validate_command_floats(
     throttle: f32,
     rudder: f32,
@@ -1067,8 +949,7 @@ async fn send_error(sink: &mut WsSink, code: &str, message: impl Into<String>) {
     send_server_msg(sink, &protocol::error_msg(code, message)).await;
 }
 
-/// Returns `false` if the underlying socket failed; the caller should treat that as a
-/// terminal condition for the connection.
+/// Returns `false` if the socket failed; the caller should treat that as terminal.
 async fn send_server_msg(sink: &mut WsSink, msg: &ServerMsg) -> bool {
     let payload = serde_json::to_string(msg).expect("ServerMsg always serializes");
     match sink.send(Message::Text(payload)).await {
@@ -1089,205 +970,38 @@ async fn disconnect_for_violations(sink: &mut WsSink) {
     .await;
     let _ = sink
         .send(Message::Close(Some(CloseFrame {
-            code: CloseCode::Policy,
+            code: close_code::POLICY,
             reason: "too many protocol violations".into(),
         })))
         .await;
-}
-
-// ---------------------------------------------------------------------------
-// HTTP head reading and dispatch
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-struct ParsedRequest {
-    method: String,
-    path: String,
-    is_websocket_upgrade: bool,
-}
-
-/// Read raw bytes from the stream until we see `\r\n\r\n` (end of HTTP request head),
-/// then return the buffered bytes verbatim. The buffer is replayed to the WS handshake
-/// via `PrefixedStream` so tungstenite can re-parse the request itself.
-async fn read_http_head(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 512];
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before HTTP head was complete",
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(buf);
-        }
-        if buf.len() > MAX_HEAD_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HTTP head exceeded size limit",
-            ));
-        }
-    }
-}
-
-fn parse_request(buf: &[u8]) -> Result<ParsedRequest, String> {
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut req = httparse::Request::new(&mut headers);
-    match req.parse(buf).map_err(|e| e.to_string())? {
-        httparse::Status::Complete(_) => {}
-        httparse::Status::Partial => return Err("partial request".into()),
-    }
-    let method = req.method.unwrap_or("").to_string();
-    let path = req.path.unwrap_or("/").to_string();
-    let upgrade_to_ws = req.headers.iter().any(|h| {
-        h.name.eq_ignore_ascii_case("Upgrade") && h.value.eq_ignore_ascii_case(b"websocket")
-    });
-    let connection_upgrade = req.headers.iter().any(|h| {
-        if !h.name.eq_ignore_ascii_case("Connection") {
-            return false;
-        }
-        let value = std::str::from_utf8(h.value).unwrap_or("");
-        value
-            .split(',')
-            .any(|p| p.trim().eq_ignore_ascii_case("upgrade"))
-    });
-    Ok(ParsedRequest {
-        method,
-        path,
-        is_websocket_upgrade: upgrade_to_ws && connection_upgrade,
-    })
-}
-
-/// Map a request path to an embedded asset. Anything outside this small whitelist 404s,
-/// so directory traversal isn't a concern.
-fn resolve_static(path: &str) -> Option<(&'static str, &'static [u8])> {
-    let path_only = path.split('?').next().unwrap_or(path);
-    match path_only {
-        "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML.as_bytes())),
-        "/index.js" => Some(("application/javascript; charset=utf-8", INDEX_JS.as_bytes())),
-        "/index.css" => Some(("text/css; charset=utf-8", INDEX_CSS.as_bytes())),
-        _ => None,
-    }
-}
-
-async fn write_http_response(
-    stream: &mut TcpStream,
-    status: u16,
-    status_text: &str,
-    content_type: &str,
-    body: &[u8],
-) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-        len = body.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// PrefixedStream: replay the buffered HTTP head before delegating to the TCP stream
-// ---------------------------------------------------------------------------
-
-/// `AsyncRead + AsyncWrite` adapter that emits a fixed prefix of buffered bytes before
-/// reading from the wrapped `TcpStream`. We use this so the WebSocket handshake sees
-/// the same request bytes we already consumed for path-routing.
-pub struct PrefixedStream {
-    prefix: Vec<u8>,
-    cursor: usize,
-    inner: TcpStream,
-}
-
-impl PrefixedStream {
-    pub fn new(prefix: Vec<u8>, inner: TcpStream) -> Self {
-        Self {
-            prefix,
-            cursor: 0,
-            inner,
-        }
-    }
-}
-
-impl AsyncRead for PrefixedStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let me = self.get_mut();
-        if me.cursor < me.prefix.len() {
-            let remaining = &me.prefix[me.cursor..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            me.cursor += n;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut me.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for PrefixedStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn req(bytes: &[u8]) -> ParsedRequest {
-        parse_request(bytes).expect("parse")
+    #[test]
+    fn rejects_non_finite_command_floats() {
+        assert!(validate_command_floats(f32::NAN, 0.0, None).is_err());
+        assert!(validate_command_floats(0.0, f32::INFINITY, None).is_err());
+        assert!(validate_command_floats(0.5, -0.5, None).is_ok());
+        let bad_fire = FireCommand {
+            bearing_deg: f32::NAN,
+            range: 100.0,
+        };
+        assert!(validate_command_floats(0.0, 0.0, Some(&bad_fire)).is_err());
     }
 
     #[test]
-    fn parses_plain_get() {
-        let r = req(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert_eq!(r.method, "GET");
-        assert_eq!(r.path, "/");
-        assert!(!r.is_websocket_upgrade);
-    }
-
-    #[test]
-    fn detects_websocket_upgrade() {
-        let r = req(b"GET /bot HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n");
-        assert!(r.is_websocket_upgrade);
-        assert_eq!(r.path, "/bot");
-    }
-
-    #[test]
-    fn handles_compound_connection_header() {
-        // Some clients send `Connection: keep-alive, Upgrade`.
-        let r = req(b"GET /spectate HTTP/1.1\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n");
-        assert!(r.is_websocket_upgrade);
-        assert_eq!(r.path, "/spectate");
-    }
-
-    #[test]
-    fn static_routes() {
-        assert!(resolve_static("/").is_some());
-        assert!(resolve_static("/index.html").is_some());
-        assert!(resolve_static("/index.js").is_some());
-        assert!(resolve_static("/index.css").is_some());
-        assert!(resolve_static("/etc/passwd").is_none());
-        // Query strings are stripped before matching.
-        assert!(resolve_static("/?cachebust=1").is_some());
+    fn ip_conn_guard_enforces_cap() {
+        let table: IpConnTable = Arc::new(Mutex::new(HashMap::new()));
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let g1 = IpConnGuard::try_acquire(&table, ip, 2);
+        let g2 = IpConnGuard::try_acquire(&table, ip, 2);
+        assert!(g1.is_some() && g2.is_some());
+        assert!(IpConnGuard::try_acquire(&table, ip, 2).is_none());
+        drop(g1);
+        assert!(IpConnGuard::try_acquire(&table, ip, 2).is_some());
+        drop(g2);
     }
 }

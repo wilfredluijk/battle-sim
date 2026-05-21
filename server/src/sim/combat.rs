@@ -8,9 +8,7 @@
 
 use glam::Vec2;
 
-use super::constants::{
-    DT, GUN_COOLDOWN_TICKS, MAX_SHELL_RANGE, MAX_SPLASH_DAMAGE, SHELL_SPEED, SPLASH_RADIUS,
-};
+use super::constants::DT;
 use super::world::{Shell, ShipId, World};
 
 /// Why `fire` refused to spawn a shell. The room translates this into the appropriate
@@ -52,6 +50,7 @@ pub fn fire(
     bearing_deg: f32,
     range: f32,
 ) -> Result<(), FireError> {
+    let config = world.config;
     let ship = world.ships.get_mut(ship_id).ok_or(FireError::UnknownShip)?;
     if !ship.alive {
         return Err(FireError::ShipDead);
@@ -63,12 +62,12 @@ pub fn fire(
         return Err(FireError::NoAmmo);
     }
 
-    let clamped_range = range.clamp(0.0, MAX_SHELL_RANGE);
+    let clamped_range = range.clamp(0.0, config.max_shell_range);
     let dir = bearing_to_unit_vec(bearing_deg);
-    let vel = dir * SHELL_SPEED;
-    // Time to travel `clamped_range` at `SHELL_SPEED`, in fixed-DT ticks. `ceil` so a
+    let vel = dir * config.shell_speed;
+    // Time to travel `clamped_range` at `shell_speed`, in fixed-DT ticks. `ceil` so a
     // request just over a tick boundary still gets that final tick of flight.
-    let ttl_ticks = (clamped_range / (SHELL_SPEED * DT)).ceil() as u32;
+    let ttl_ticks = (clamped_range / (config.shell_speed * DT)).ceil() as u32;
 
     let shell = Shell {
         id_index: world.next_shell_index,
@@ -80,7 +79,7 @@ pub fn fire(
     world.next_shell_index = world.next_shell_index.wrapping_add(1);
     world.shells.push(shell);
 
-    ship.gun_cooldown = GUN_COOLDOWN_TICKS;
+    ship.gun_cooldown = config.gun_cooldown_ticks;
     ship.ammo -= 1;
     Ok(())
 }
@@ -93,6 +92,8 @@ pub fn fire(
 pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
     let mut events = Vec::new();
     let mut remaining = Vec::with_capacity(world.shells.len());
+    let splash_radius = world.config.splash_radius;
+    let max_splash_damage = world.config.max_splash_damage;
     let shells = std::mem::take(&mut world.shells);
 
     for mut shell in shells {
@@ -111,13 +112,13 @@ pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
                 continue;
             }
             let d = ship.pos.distance(shell.pos);
-            if d > SPLASH_RADIUS {
+            if d > splash_radius {
                 continue;
             }
             // Linear falloff: full damage at centre, zero at the edge. `round` keeps the
             // integer HP loss honest at the boundaries.
-            let frac = 1.0 - (d / SPLASH_RADIUS);
-            let dmg = (MAX_SPLASH_DAMAGE as f32 * frac).round() as u32;
+            let frac = 1.0 - (d / splash_radius);
+            let dmg = (max_splash_damage as f32 * frac).round() as u32;
             if dmg == 0 {
                 continue;
             }
@@ -154,7 +155,7 @@ mod tests {
     use crate::sim::world::Ship;
 
     fn world_with(ships: Vec<Ship>) -> World {
-        let mut w = World::new(1000.0, 1000.0);
+        let mut w = World::new(1000.0, 1000.0, crate::sim::SimConfig::default());
         for s in ships {
             w.insert_ship(s);
         }

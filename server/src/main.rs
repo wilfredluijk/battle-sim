@@ -1,14 +1,12 @@
-use std::sync::Arc;
-
 use clap::Parser;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use naval_server::{
-    admin::{self, AdminServerMsg},
+    auth::{self, AuthState},
     config::Config,
-    control, net, replay,
+    net, replay,
     room::{self, Room, SpectatorFrame, ROOM_EVENT_BUFFER},
 };
 
@@ -17,9 +15,8 @@ use naval_server::{
 /// than disconnect.
 const SPECTATOR_BROADCAST_BUFFER: usize = 64;
 
-/// Admin state updates are infrequent (one per lifecycle transition); a small buffer is
-/// plenty and lets a momentarily slow admin client catch up without losing context.
-const ADMIN_BROADCAST_BUFFER: usize = 16;
+/// The single room this server hosts. Lifecycle and parameters are driven over `/api/*`.
+const ROOM_NAME: &str = "main";
 
 const BANNER: &str = r#"
 ========================================
@@ -49,22 +46,24 @@ async fn main() {
         "starting naval-server"
     );
 
-    // Resolve the admin token: explicit CLI override wins, otherwise generate one.
-    let admin_token: Arc<String> = Arc::new(
-        config
-            .admin_token
-            .clone()
-            .unwrap_or_else(admin::generate_admin_token),
-    );
+    // Resolve the admin password: explicit override wins, otherwise generate one. The
+    // value is logged once so a local operator can copy it into the web UI's login form.
+    let admin_password = config
+        .admin_password
+        .clone()
+        .unwrap_or_else(auth::generate_admin_password);
     info!(
-        admin_token = %admin_token,
-        "admin token (use on /admin?token=... — rotates each server start unless --admin-token is set)"
+        admin_password = %admin_password,
+        "admin password (POST /api/login — random each start unless --admin-password / BATTLE_ADMIN_PASSWORD is set)"
+    );
+    let auth = AuthState::new(
+        admin_password,
+        config.token_ttl_hours.saturating_mul(3600).max(60),
     );
 
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(8);
+    let (shutdown_tx, _) = broadcast::channel::<()>(8);
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
     let (spec_tx, _) = broadcast::channel::<SpectatorFrame>(SPECTATOR_BROADCAST_BUFFER);
-    let (admin_tx, _) = broadcast::channel::<AdminServerMsg>(ADMIN_BROADCAST_BUFFER);
 
     let replay_path = config.replay.clone();
 
@@ -85,7 +84,7 @@ async fn main() {
         })
     } else {
         let mut main_room = Room::new(
-            "main".into(),
+            ROOM_NAME.into(),
             config.map.0 as f32,
             config.map.1 as f32,
             config.seed,
@@ -94,33 +93,22 @@ async fn main() {
             config.max_bots,
         );
         main_room.set_spectator_broadcast(spec_tx.clone());
-        main_room.set_admin_broadcast(admin_tx.clone());
         main_room.set_replay_dir(config.replay_dir.clone());
         tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()))
     };
 
     let net_handle = tokio::spawn(net::run(
         config.clone(),
-        admin_token.clone(),
+        ROOM_NAME.to_string(),
+        auth,
         room_tx.clone(),
         spec_tx.clone(),
-        shutdown_tx.subscribe(),
+        shutdown_tx.clone(),
     ));
-    let control_handle = tokio::spawn(control::run(shutdown_tx.clone(), room_tx.clone()));
 
-    tokio::select! {
-        res = tokio::signal::ctrl_c() => {
-            match res {
-                Ok(_) => info!("ctrl-c received, shutting down"),
-                Err(e) => tracing::error!(error = %e, "ctrl-c handler failed"),
-            }
-        }
-        res = control_handle => {
-            match res {
-                Ok(_) => info!("control task ended"),
-                Err(e) => tracing::error!(error = %e, "control task panicked"),
-            }
-        }
+    match tokio::signal::ctrl_c().await {
+        Ok(_) => info!("ctrl-c received, shutting down"),
+        Err(e) => tracing::error!(error = %e, "ctrl-c handler failed"),
     }
 
     let _ = shutdown_tx.send(());

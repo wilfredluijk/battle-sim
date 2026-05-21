@@ -24,17 +24,18 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
     let mut config = Config::parse_from(["test"]);
     config.port = port;
 
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(4);
+    let (shutdown_tx, _) = broadcast::channel::<()>(4);
     // No room is wired up — these tests only exercise pre-handshake validation, which
     // never reaches the room. A leaked sender keeps the channel open.
     let (room_tx, _room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
     tokio::spawn(net::run(
         config,
-        std::sync::Arc::new("test-admin-token".to_string()),
+        "main".to_string(),
+        naval_server::auth::AuthState::new("test-password".to_string(), 3600),
         room_tx,
         spec_tx,
-        shutdown_rx,
+        shutdown_tx.clone(),
     ));
 
     // Give the listener a moment to bind on the freed port.

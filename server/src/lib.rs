@@ -2,8 +2,8 @@
 //! the server in-process; the binary in `main.rs` just composes them.
 
 pub mod admin;
+pub mod auth;
 pub mod config;
-pub mod control;
 pub mod net;
 pub mod protocol;
 pub mod replay;

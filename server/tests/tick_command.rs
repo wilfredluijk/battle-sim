@@ -36,7 +36,7 @@ async fn start_server_with(tick_hz: u32, tick_deadline_ms: u64) -> ServerHandle 
     config.tick_hz = tick_hz;
     config.tick_deadline_ms = tick_deadline_ms;
 
-    let (shutdown_tx, shutdown_rx_net) = broadcast::channel::<()>(4);
+    let (shutdown_tx, _) = broadcast::channel::<()>(4);
     let (room_tx, room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
 
     let room = Room::new(
@@ -52,10 +52,11 @@ async fn start_server_with(tick_hz: u32, tick_deadline_ms: u64) -> ServerHandle 
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
     tokio::spawn(net::run(
         config,
-        std::sync::Arc::new("test-admin-token".to_string()),
+        "main".to_string(),
+        naval_server::auth::AuthState::new("test-password".to_string(), 3600),
         room_tx.clone(),
         spec_tx,
-        shutdown_rx_net,
+        shutdown_tx.clone(),
     ));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
