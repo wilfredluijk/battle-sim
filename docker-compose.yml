@@ -3,10 +3,12 @@ services:
     build: .
     image: battle-sim:local
     container_name: battle-sim
-    stdin_open: true
-    tty: true
     ports:
       - "7878:7878"
+    # The room is driven over the REST control plane (`/api/*`). Pin a fixed admin
+    # password here so it survives restarts instead of rotating each boot.
+    environment:
+      - BATTLE_ADMIN_PASSWORD=change-me
     volumes:
       # Persist replay JSONL logs on the host. The server writes to /app/replays inside
       # the container per `CMD` in the Dockerfile.

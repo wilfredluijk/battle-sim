@@ -7,7 +7,7 @@
   import { MAX_AMMO, MAX_FORWARD_SPEED, MAX_HP, MAX_REVERSE_SPEED } from '../lib/constants';
   import MeterRow from './MeterRow.svelte';
   import SliderRow from './SliderRow.svelte';
-  import { adminConn, adminRoom, adminSendKick } from '../stores/admin';
+  import { room, adminToken, kickBot } from '../stores/admin';
 
   interface Props {
     card: BotCardState;
@@ -17,6 +17,14 @@
 
   const ship = $derived(card.ship);
   const swatch = $derived(colorFor(ship.bot_name));
+
+  // Meter scales follow the match's configured parameters when known, falling back to the
+  // legacy defaults before the first `GET /api/room` response lands.
+  const cfg = $derived($room?.config);
+  const maxHp = $derived(cfg?.hull_hp ?? MAX_HP);
+  const maxAmmo = $derived(cfg?.max_ammo ?? MAX_AMMO);
+  const maxForward = $derived(cfg?.max_forward_speed ?? MAX_FORWARD_SPEED);
+  const maxReverse = $derived(cfg?.max_reverse_speed ?? MAX_REVERSE_SPEED);
 
   type Pill = { label: string; cls: string };
   const status: Pill = $derived.by(() => {
@@ -31,21 +39,24 @@
     return (v >= 0 ? '+' : '') + v.toFixed(2);
   }
 
-  // Speed slider goes from -MAX_REVERSE to +MAX_FORWARD; normalise both sides into [-1, 1].
+  // Speed slider goes from -maxReverse to +maxForward; normalise both sides into [-1, 1].
   const speedRatio = $derived(
-    ship.speed >= 0 ? ship.speed / MAX_FORWARD_SPEED : ship.speed / MAX_REVERSE_SPEED,
+    ship.speed >= 0 ? ship.speed / maxForward : ship.speed / maxReverse,
   );
 
-  // Match the spectator ship id (e.g. "s_3") to the admin room's bot list so we can issue
-  // a kick by bot_id. Hidden when no admin connection or no matching bot.
+  // Normalise HP to a 0–100 scale so the colour thresholds hold for any configured hull.
+  const hpFill = $derived(hpColor(maxHp > 0 ? (ship.hp / maxHp) * 100 : 0));
+
+  // Match the spectator ship id (e.g. "s_3") to the room's bot list so we can issue a kick
+  // by bot_id. Hidden when not logged in as admin or no matching bot.
   const adminBotId = $derived.by(() => {
-    if ($adminConn.kind !== 'authed') return null;
-    const match = $adminRoom?.bots.find((b) => b.ship_id === ship.id);
+    if (!$adminToken) return null;
+    const match = $room?.bots.find((b) => b.ship_id === ship.id);
     return match?.bot_id ?? null;
   });
 
   function handleKick(): void {
-    if (adminBotId) adminSendKick(adminBotId);
+    if (adminBotId) void kickBot(adminBotId);
   }
 </script>
 
@@ -64,8 +75,8 @@
   </div>
 
   <div class="bot-meters">
-    <MeterRow label="HP" value={ship.hp} max={MAX_HP} fill={hpColor(ship.hp)} valueText="{ship.hp}/{MAX_HP}" />
-    <MeterRow label="AMMO" value={ship.ammo} max={MAX_AMMO} fill="#6cb1ff" valueText="{ship.ammo}/{MAX_AMMO}" />
+    <MeterRow label="HP" value={ship.hp} max={maxHp} fill={hpFill} valueText="{ship.hp}/{maxHp}" />
+    <MeterRow label="AMMO" value={ship.ammo} max={maxAmmo} fill="#6cb1ff" valueText="{ship.ammo}/{maxAmmo}" />
   </div>
 
   <div class="bot-controls">

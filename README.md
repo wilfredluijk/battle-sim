@@ -47,12 +47,14 @@ cd ../server
 cargo run -- --port 7878 --tick-hz 10 --seed 42
 ```
 
-That boots a single room called `main` listening on `127.0.0.1:7878`. The
-server reads operator commands from stdin while running — type `help` for the
-list. The most useful one is `room start main`, which transitions the room
-from `Lobby` to `Running` once every connected bot has signaled `ready`.
+That boots a single room called `main` listening on `127.0.0.1:7878`. The room
+is driven entirely over the REST control plane (`/api/*`); the spectator web UI
+at `http://localhost:7878/` is the easy way to log in, set match parameters, and
+start the match once every connected bot has signaled `ready`.
 
-Type `quit` (or hit Ctrl-C) to shut down cleanly.
+The server prints a one-time admin password at startup (look for the
+`admin password` log line). Pin a fixed one with `--admin-password` or the
+`BATTLE_ADMIN_PASSWORD` env var. Hit Ctrl-C to shut down cleanly.
 
 ### Or use Docker
 
@@ -60,22 +62,14 @@ If you don't want to install Rust + Node locally, the compose file builds the
 whole stack (spectator → server) in a multi-stage image:
 
 ```bash
-docker compose up --build -d              # build + start detached
-docker attach battle-sim                  # attach to the server's stdin/stdout
+docker compose up --build
 ```
 
-The server reads operator commands from its stdin (`room list`, `room start main`,
-`quit`, …) and exits if stdin closes. The compose file sets
-`restart: unless-stopped`, so without an attached stdin the container would
-exit and immediately restart in a loop. Starting detached and then `docker
-attach`-ing gives the server the stdin/stdout it needs and lets you drive the
-room from the terminal. The compose service is declared with `stdin_open: true`
-and `tty: true` so that `docker attach` can connect — without these flags
-`docker attach` fails with `unable to upgrade to tcp, received 409`.
-
-Detach without stopping the container with the `Ctrl-P Ctrl-Q` escape sequence.
-Server listens on `127.0.0.1:7878`; replays land in `./replays/` via a
-bind-mount. Stop with `docker compose down`.
+The server listens on `127.0.0.1:7878` — open the spectator UI there to drive
+the room. Replays land in `./replays/` via a bind-mount. The admin password is
+printed in the container logs (`docker compose logs`); pin it by setting
+`BATTLE_ADMIN_PASSWORD` in the compose file's `environment`. Stop with
+`docker compose down`.
 
 ### Spectator dev loop
 
@@ -105,6 +99,8 @@ Run `npm test` for the Vitest unit tests against `src/lib/`.
 | `--seed` | `42` | RNG seed (drives all simulation randomness) |
 | `--replay-dir` | `./replays` | Where match replay JSONL files are written |
 | `--replay <FILE>` | — | Replay a saved match instead of accepting bot connections |
+| `--admin-password` | random | Password for `POST /api/login` (logged once at startup if unset; also `BATTLE_ADMIN_PASSWORD`) |
+| `--token-ttl-hours` | `12` | Lifetime of issued admin JWTs |
 
 `cargo run -- --help` prints the same list.
 
@@ -116,9 +112,11 @@ With the server running, open
 http://localhost:7878/
 ```
 
-The spectator UI loads automatically — ships, shells, splashes, and a sidebar
-with tick / players / events. Active-radar pings show as faint translucent
-rings.
+The spectator UI loads automatically. Before a match it shows the pre-match
+lobby — connected bots and the editable match parameters; during a match, the
+live battlefield with a sidebar of tick / players / events; afterwards, a match
+report. Log in with the admin password to edit parameters and control the room.
+Active-radar pings show as faint translucent rings.
 
 ## Connect a bot
 
@@ -132,9 +130,10 @@ wscat -c ws://localhost:7878/bot
 > {"type":"ready"}
 ```
 
-Then in the server terminal: `room start main`. The bot will start receiving
-`tick` frames; reply with `command` messages each tick. Full message reference
-in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+Then start the match from the spectator UI's pre-match lobby (log in with the
+admin password first). The bot will start receiving `tick` frames; reply with
+`command` messages each tick. Full message reference in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 In practice you'll use one of the reference SDKs — Python ([`sdk-python/`](sdk-python/))
 or Java ([`sdk-java/`](sdk-java/)) — and start from an example under

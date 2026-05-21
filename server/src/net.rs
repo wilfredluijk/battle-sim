@@ -33,8 +33,8 @@ use crate::auth::AuthState;
 use crate::config::Config;
 use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
 use crate::room::{
-    BotRegistration, ConfigureError, PendingCommand, RoomEvent, RoomSnapshot, SpectatorFrame,
-    StartError,
+    BotRegistration, ConfigureError, MatchReport, PendingCommand, RoomEvent, RoomSnapshot,
+    SpectatorFrame, StartError,
 };
 use crate::sim::SimConfig;
 
@@ -175,6 +175,7 @@ fn router(state: AppState) -> Router {
         .route("/index.css", get(serve_css))
         .route("/api/login", post(login))
         .route("/api/room", get(get_room))
+        .route("/api/room/report", get(get_report))
         .route("/api/config/schema", get(get_config_schema))
         .route("/api/room/config", put(put_config))
         .route("/api/room/start", post(post_start))
@@ -338,6 +339,19 @@ async fn get_room(State(state): State<AppState>) -> Result<Json<RoomResponse>, A
         state: snap.state,
         config: snap.config,
     }))
+}
+
+/// Public: the most recent match report. `404` until the first match has finished.
+async fn get_report(State(state): State<AppState>) -> Result<Json<MatchReport>, ApiError> {
+    let report: Option<MatchReport> =
+        ask_room(&state, |reply| RoomEvent::QueryReport { reply }).await?;
+    report.map(Json).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_report",
+            "no match has finished yet",
+        )
+    })
 }
 
 async fn post_start(

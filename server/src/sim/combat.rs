@@ -26,19 +26,23 @@ pub enum FireError {
 }
 
 /// Outcome events from a single tick of combat. Keep these sim-local; the room translates
-/// them into protocol events (filtered by sensor range for bots, full for spectators).
+/// them into protocol events (filtered by sensor range for bots, full for spectators) and
+/// folds them into per-bot match statistics.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CombatEvent {
-    /// `ship_id` took `amount` HP of splash damage at `pos` (the splash centre).
+    /// `ship_id` took `amount` HP of splash damage at `pos` (the splash centre). `source`
+    /// is the ship that fired the shell — used for damage-dealt attribution in the report.
     Hit {
         ship_id: ShipId,
         amount: u32,
         pos: Vec2,
+        source: ShipId,
     },
     /// A shell expired and exploded at `pos` (regardless of whether anyone was hit).
     Splash { pos: Vec2 },
-    /// `ship_id` dropped to 0 HP this tick.
-    Death { ship_id: ShipId },
+    /// `ship_id` dropped to 0 HP this tick. `source` is the ship whose shell landed the
+    /// killing blow — used for kill attribution in the post-match report.
+    Death { ship_id: ShipId, source: ShipId },
 }
 
 /// Spawn a shell from `ship_id` along `bearing_deg`, requested travel distance `range`.
@@ -127,11 +131,13 @@ pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
                 ship_id: id.clone(),
                 amount: dmg,
                 pos: shell.pos,
+                source: shell.source_ship.clone(),
             });
             if ship.hp == 0 {
                 ship.alive = false;
                 events.push(CombatEvent::Death {
                     ship_id: id.clone(),
+                    source: shell.source_ship.clone(),
                 });
             }
         }
@@ -367,7 +373,7 @@ mod tests {
         assert_eq!(world.ships.get("s_2").unwrap().hp, 0);
         let died = last
             .iter()
-            .any(|e| matches!(e, CombatEvent::Death { ship_id } if ship_id == "s_2"));
+            .any(|e| matches!(e, CombatEvent::Death { ship_id, .. } if ship_id == "s_2"));
         assert!(died, "death event missing: {last:?}");
     }
 

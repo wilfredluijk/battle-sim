@@ -1,18 +1,34 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import Topbar from './components/Topbar.svelte';
-  import Battlefield from './components/Battlefield.svelte';
-  import Sidebar from './components/Sidebar.svelte';
-  import { startSpectator, view } from './stores';
+  import Battle from './components/Battle.svelte';
+  import PreMatch from './components/PreMatch.svelte';
+  import Report from './components/Report.svelte';
+  import { startSpectator } from './stores';
+  import { startControlPlane, room, report, showReport } from './stores/admin';
 
-  const teardown = startSpectator();
-  onDestroy(teardown);
+  const teardownSpectator = startSpectator();
+  const teardownControl = startControlPlane();
+  onDestroy(() => {
+    teardownSpectator();
+    teardownControl();
+  });
 
-  const layoutClass = $derived($view === 'full' ? 'layout-full' : 'layout-split');
+  // Which top-level screen is visible. The battle overview is only shown while a match is
+  // actually running — otherwise the landing screen is the pre-match lobby (or the
+  // post-battle report once a match has finished).
+  const screen = $derived.by(() => {
+    if ($room?.state === 'running') return 'battle';
+    if ($showReport && $report) return 'report';
+    return 'prematch';
+  });
 </script>
 
 <Topbar />
-<main class={layoutClass}>
-  <Battlefield />
-  <Sidebar />
-</main>
+{#if screen === 'battle'}
+  <Battle />
+{:else if screen === 'report'}
+  <Report />
+{:else}
+  <PreMatch />
+{/if}
