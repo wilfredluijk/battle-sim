@@ -815,19 +815,9 @@ impl Room {
         }
     }
 
-    /// Build a `SpectatorMsg::World` from the current world state and push it onto the
-    /// spectator broadcast channel. No-op when no channel is wired (unit tests). Send
-    /// failures (no subscribers) are intentionally swallowed — the simulation never
-    /// stalls because nobody is watching.
-    fn broadcast_spectator_world(&self, events: &[CombatEvent]) {
-        let Some(tx) = self.spectator_tx.as_ref() else {
-            return;
-        };
-        if tx.receiver_count() == 0 {
-            // Nothing to do; skip the JSON serialization cost when nobody's watching.
-            return;
-        }
-
+    /// Build a `SpectatorMsg::World` from the current world state and the given combat
+    /// events. Shared by the live broadcast path and offline replay capture.
+    fn build_spectator_world(&self, events: &[CombatEvent]) -> SpectatorMsg {
         // Ships in BotId order via the bot registry, so the wire payload is stable across
         // identical runs. Falling back to `world.ships` would also be deterministic
         // (BTreeMap on ShipId), but going through `bots` keeps `bot_name` in lock-step.
@@ -892,12 +882,32 @@ impl Room {
             })
             .collect();
 
-        let msg = SpectatorMsg::World {
+        SpectatorMsg::World {
             tick: self.world.tick,
             ships,
             shells,
             events,
+        }
+    }
+
+    /// Snapshot the current world as a `SpectatorMsg::World` with no combat events.
+    /// Replay capture uses this for the tick-0 frame, which precedes any simulation step.
+    pub fn spectator_world_snapshot(&self) -> SpectatorMsg {
+        self.build_spectator_world(&[])
+    }
+
+    /// Build a `SpectatorMsg::World` and push it onto the spectator broadcast channel.
+    /// No-op when no channel is wired (unit tests). Send failures (no subscribers) are
+    /// intentionally swallowed — the simulation never stalls because nobody is watching.
+    fn broadcast_spectator_world(&self, events: &[CombatEvent]) {
+        let Some(tx) = self.spectator_tx.as_ref() else {
+            return;
         };
+        if tx.receiver_count() == 0 {
+            // Nothing to do; skip the JSON serialization cost when nobody's watching.
+            return;
+        }
+        let msg = self.build_spectator_world(events);
         let json = match serde_json::to_string(&msg) {
             Ok(s) => s,
             Err(e) => {

@@ -362,6 +362,77 @@ The post-match summary. `404` with code `no_report` until the first match has fi
 
 Returns `404` with code `unknown_bot` when no bot holds that id.
 
+## 2.6 Replay viewer — `/api/replays/*` (REST)
+
+Read-only routes that back the spectator's replay viewer. They re-run a recorded match
+server-side and return the reconstructed timeline as JSON. No JWT is required, but — like
+`/spectate` — they are restricted to loopback peers when the server runs in tournament
+mode (`403` `tournament_mode` otherwise), because replays expose ground-truth state.
+
+| Method & path | Success | Purpose |
+|---|---|---|
+| `GET /api/replays` | `200` | List the replays on disk, newest first. |
+| `GET /api/replays/{id}` | `200` | Re-run a replay; return the ground-truth timeline. |
+| `GET /api/replays/{id}/perspective/{bot_id}` | `200` | Re-run a replay from one bot's sensors. |
+
+`{id}` is a replay id (`match_<room>_<unix_secs>`); it is validated against
+`[A-Za-z0-9_-]` and rejected with `400` `invalid_replay_id` otherwise. A missing file
+returns `404` `replay_not_found`; a log older than the current replay format returns `422`
+`unsupported_replay_version`.
+
+### 2.6.1 `GET /api/replays`
+
+```json
+[
+  {
+    "replay_id": "match_main_1779367343",
+    "room": "main", "seed": 42, "tick_hz": 60,
+    "map": { "width": 700, "height": 700 },
+    "sim_config": { "hull_hp": 100, "...": "..." },
+    "bots": ["powerful", "tactician"],
+    "final_tick": 1071,
+    "winner_name": "powerful"
+  }
+]
+```
+
+`final_tick` and `winner_name` are `null` for a log with no `end` record (an incomplete
+match) or a draw / aborted match.
+
+### 2.6.2 `GET /api/replays/{id}`
+
+Re-runs the simulation from the recorded inputs and captures the ground-truth world at
+every tick.
+
+```json
+{
+  "header": { "version": 2, "replay_id": "...", "seed": 42, "map": { "...": "..." },
+              "sim_config": { "...": "..." }, "bots": [ { "bot_id": "b_1", "ship_id": "s_1", "name": "powerful" } ] },
+  "frames": [ /* one `world` payload (§2 `world`) per tick; frames[t] is the world at tick t */ ],
+  "end": { "tick": 1071, "winner": "b_1" }
+}
+```
+
+`frames` has `final_tick + 1` entries: index `0` is the starting layout, index `t` is the
+world after tick `t`. `end` is `null` for an incomplete log.
+
+### 2.6.3 `GET /api/replays/{id}/perspective/{bot_id}`
+
+Re-runs the match and captures one bot's sensor-filtered view — the same `contacts` the
+bot received in its `tick` messages (§1.2 `tick`).
+
+```json
+{
+  "bot_id": "b_1",
+  "frames": [ { "tick": 0, "contacts": [], "events": [] },
+              { "tick": 1, "contacts": [ /* §1.2 Contact */ ], "events": [ /* §1.2 TickEvent */ ] } ]
+}
+```
+
+`frames` is dense and aligned to the ground-truth timeline (`frames[t]` is tick `t`).
+Ticks where the bot received no `tick` message — tick 0 and the deciding tick — carry
+empty `contacts` and `events`. An unknown `bot_id` returns `404` `unknown_bot`.
+
 ---
 
 ## 3. Error codes
@@ -402,6 +473,13 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-05-21 — replay viewer REST routes
+
+- Added read-only `/api/replays/*` routes that re-run a recorded match server-side and
+  return the reconstructed timeline: `GET /api/replays` (listing), `GET /api/replays/{id}`
+  (ground-truth timeline), and `GET /api/replays/{id}/perspective/{bot_id}` (one bot's
+  sensor view). See §2.6. Additive — no change to the bot or spectator wire protocol.
 
 ## 2026-05-21 — REST control plane + configurable match parameters
 

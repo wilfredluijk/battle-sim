@@ -10,11 +10,12 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Json, State};
+use axum::extract::{ConnectInfo, Json, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -32,6 +33,7 @@ use crate::admin::AdminState;
 use crate::auth::AuthState;
 use crate::config::Config;
 use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
+use crate::replay;
 use crate::room::{
     BotRegistration, ConfigureError, MatchReport, PendingCommand, RoomEvent, RoomSnapshot,
     SpectatorFrame, StartError,
@@ -114,6 +116,8 @@ struct AppState {
     per_ip_cap: u32,
     tournament: bool,
     hello_timeout: Duration,
+    /// Directory replay JSONL logs are written to; the replay viewer reads them back.
+    replay_dir: Arc<Path>,
 }
 
 /// Bind the listener and serve the HTTP/WebSocket app until `shutdown_tx` fires.
@@ -150,6 +154,7 @@ pub async fn run(
         per_ip_cap: config.max_connections_per_ip,
         tournament: config.tournament,
         hello_timeout: Duration::from_secs(config.handshake_timeout_secs.max(1)),
+        replay_dir: Arc::from(config.replay_dir.clone()),
     };
 
     let app = router(state);
@@ -182,6 +187,12 @@ fn router(state: AppState) -> Router {
         .route("/api/room/abort", post(post_abort))
         .route("/api/room/reset", post(post_reset))
         .route("/api/room/kick", post(post_kick))
+        .route("/api/replays", get(list_replays))
+        .route("/api/replays/:id", get(get_replay))
+        .route(
+            "/api/replays/:id/perspective/:bot_id",
+            get(get_replay_perspective),
+        )
         .route("/bot", get(bot_ws))
         .route("/spectate", get(spectate_ws))
         .with_state(state)
@@ -459,6 +470,148 @@ async fn get_config_schema() -> Json<serde_json::Value> {
             num("passive_bearing_noise_deg", "Passive bearing noise (deg)", "sensors", d.passive_bearing_noise_deg as f64, 0.0, 180.0, false),
         ]
     }))
+}
+
+// ---------------------------------------------------------------------------
+// REST: replay viewer
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `id` is a safe replay identifier — non-empty, bounded, and built from
+/// a charset that cannot express a path separator or `..`. This blocks directory traversal
+/// before the id is ever joined onto `replay_dir`.
+fn replay_id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Reject replay access from non-loopback peers in tournament mode. Replays expose
+/// ground-truth state, exactly like the live `/spectate` stream, so they get the same gate.
+fn require_replay_access(state: &AppState, peer: SocketAddr) -> Result<(), ApiError> {
+    if state.tournament && !peer.ip().is_loopback() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tournament_mode",
+            "replay endpoints are restricted to loopback in tournament mode",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a replay id and resolve it to a path inside `replay_dir`.
+fn resolve_replay_path(state: &AppState, id: &str) -> Result<PathBuf, ApiError> {
+    if !replay_id_is_valid(id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_replay_id",
+            "replay id must be 1-128 chars of A-Z, a-z, 0-9, underscore or hyphen",
+        ));
+    }
+    Ok(state.replay_dir.join(format!("{id}.jsonl")))
+}
+
+/// Map a [`replay::ReplayError`] onto an HTTP-shaped [`ApiError`].
+fn map_replay_error(e: replay::ReplayError) -> ApiError {
+    use replay::ReplayError;
+    match e {
+        ReplayError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            ApiError::new(StatusCode::NOT_FOUND, "replay_not_found", "no such replay")
+        }
+        ReplayError::Io(io_err) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replay_io_error",
+            io_err.to_string(),
+        ),
+        ReplayError::Header(msg) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_replay", msg)
+        }
+        ReplayError::Version(v) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_replay_version",
+            format!("replay format version {v} is not supported"),
+        ),
+        ReplayError::UnknownBot(id) => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_bot",
+            format!("replay has no bot `{id}`"),
+        ),
+    }
+}
+
+/// Public (loopback-only under tournament mode): list the replays available on disk.
+async fn list_replays(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Json<Vec<replay::ReplaySummary>>, ApiError> {
+    require_replay_access(&state, peer)?;
+    let dir = state.replay_dir.clone();
+    let summaries = tokio::task::spawn_blocking(move || replay::list_replays(&dir))
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replay_io_error",
+                format!("listing task panicked: {e}"),
+            )
+        })?
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replay_io_error",
+                e.to_string(),
+            )
+        })?;
+    Ok(Json(summaries))
+}
+
+/// Public: re-run a replay and return the full ground-truth timeline.
+async fn get_replay(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<replay::CapturedReplay>, ApiError> {
+    require_replay_access(&state, peer)?;
+    let path = resolve_replay_path(&state, &id)?;
+    let captured = tokio::task::spawn_blocking(move || {
+        let records = replay::read_records(&path)?;
+        replay::capture_replay(records)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replay_io_error",
+            format!("capture task panicked: {e}"),
+        )
+    })?
+    .map_err(map_replay_error)?;
+    Ok(Json(captured))
+}
+
+/// Public: re-run a replay from one bot's sensor perspective.
+async fn get_replay_perspective(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    AxumPath((id, bot_id)): AxumPath<(String, String)>,
+) -> Result<Json<replay::CapturedPerspective>, ApiError> {
+    require_replay_access(&state, peer)?;
+    let path = resolve_replay_path(&state, &id)?;
+    let captured = tokio::task::spawn_blocking(move || {
+        let records = replay::read_records(&path)?;
+        replay::capture_perspective(records, &bot_id)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replay_io_error",
+            format!("capture task panicked: {e}"),
+        )
+    })?
+    .map_err(map_replay_error)?;
+    Ok(Json(captured))
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,5 +1170,18 @@ mod tests {
         drop(g1);
         assert!(IpConnGuard::try_acquire(&table, ip, 2).is_some());
         drop(g2);
+    }
+
+    #[test]
+    fn replay_id_validation_blocks_traversal() {
+        assert!(replay_id_is_valid("match_main_1700000000"));
+        assert!(replay_id_is_valid("abc-DEF_123"));
+        // Anything that could escape `replay_dir` or name another file is rejected.
+        assert!(!replay_id_is_valid(""));
+        assert!(!replay_id_is_valid("../etc/passwd"));
+        assert!(!replay_id_is_valid("foo/bar"));
+        assert!(!replay_id_is_valid("foo.jsonl"));
+        assert!(!replay_id_is_valid(".."));
+        assert!(!replay_id_is_valid(&"x".repeat(129)));
     }
 }
