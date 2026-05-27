@@ -214,3 +214,51 @@ export interface CapturedPerspective {
   /** Dense and aligned to the ground-truth timeline; `frames[t]` is tick `t`. */
   frames: PerspectiveFrame[];
 }
+
+// ---------------------------------------------------------------------------
+// Monte Carlo batch runner — matches `/api/montecarlo/*` in `server/src/net.rs`.
+// ---------------------------------------------------------------------------
+
+export type VarianceMode = 'fixed' | 'rotated' | 'shuffled' | 'random';
+
+/** Body of `POST /api/montecarlo/start`. */
+export interface McStartRequest {
+  n_matches: number;
+  mc_seed: number;
+  variance_mode: VarianceMode;
+  /** Per-tick timeout for the lockstep loop, in milliseconds. Optional; defaults to 1000. */
+  per_tick_timeout_ms?: number;
+  /** Spectator broadcast cadence (every Nth tick); 0 disables spectator updates. */
+  spectator_throttle?: number;
+  /** Optional SimConfig override applied once at the start of the run. */
+  sim_config?: SimConfig;
+}
+
+/** One row in `McStatus.results` — outcome of a single match in the batch. */
+export interface McMatchResult {
+  /** 1-based index of the match within the run. */
+  match_index: number;
+  seed: number;
+  winner: string | null;
+  winner_name: string | null;
+  duration_ticks: number;
+  replay_id: string | null;
+}
+
+/** Response shape of `GET /api/montecarlo/status`. */
+export interface McStatus {
+  running: boolean;
+  run_id: string;
+  completed: number;
+  total: number;
+  variance_mode: VarianceMode;
+  mc_seed: number;
+  started_at_unix: number;
+  finished_at_unix: number | null;
+  current_match_tick: number;
+  wins: Record<string, number>;
+  bot_names: Record<string, string>;
+  draws: number;
+  results: McMatchResult[];
+  ended_reason: string | null;
+}

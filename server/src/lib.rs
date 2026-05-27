@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod monte_carlo;
 pub mod net;
 pub mod protocol;
 pub mod replay;

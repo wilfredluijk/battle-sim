@@ -1,0 +1,92 @@
+# docker-compose.bots.yml — start every example bot with one command.
+#
+# Runs all 11 example bots (5 Python + 6 Java), each in its own container. This
+# file does NOT start the server — bring that up separately first:
+#
+#   docker compose up -d              # the battle-sim server (docker-compose.yml)
+#   # ...or `cargo run` in server/    # a locally-built server
+#
+# Then start every bot:
+#
+#   docker compose -f docker-compose.bots.yml up --build
+#
+# The bots reach the server at ${SERVER_HOST:-host.docker.internal}:${SERVER_PORT:-7878}.
+# `host.docker.internal` resolves to the Docker host, where the server publishes
+# port 7878. Point the bots at a server elsewhere with:
+#
+#   SERVER_HOST=192.168.1.50 docker compose -f docker-compose.bots.yml up --build
+#
+# Bots restart on exit, so they rejoin the lobby for each new match. Stop them
+# all with Ctrl-C, or `docker compose -f docker-compose.bots.yml down`.
+
+name: battle-sim-bots
+
+# ---- shared service definitions ----------------------------------------------
+x-python-bot: &python-bot
+  build:
+    context: .
+    dockerfile: bots.python.Dockerfile
+  image: battle-sim-bot-python:local
+  extra_hosts:
+    # Lets `host.docker.internal` resolve to the Docker host on Linux too
+    # (Docker Desktop on Windows/macOS already provides it).
+    - "host.docker.internal:host-gateway"
+  init: true
+  restart: unless-stopped
+
+x-java-bot: &java-bot
+  build:
+    context: .
+    dockerfile: bots.java.Dockerfile
+  image: battle-sim-bot-java:local
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  init: true
+  restart: unless-stopped
+
+services:
+  # ---- Python bots (examples/python) ----
+  bot-circler:
+    <<: *python-bot
+    command: ["bots/circle_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "circler"]
+
+  bot-warlord:
+    <<: *python-bot
+    command: ["bots/powerful_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "warlord"]
+
+  bot-strategist-py:
+    <<: *python-bot
+    command: ["bots/strategist_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "strategist-py"]
+
+  bot-tactician:
+    <<: *python-bot
+    command: ["bots/tactician_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "tactician"]
+
+  bot-tracker:
+    <<: *python-bot
+    command: ["bots/tracking_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "tracker"]
+
+  # ---- Java bots (examples/java) — args are: <host> <port> <name> ----
+  bot-simple-circle:
+    <<: *java-bot
+    command: ["com.battlesim.examples.SimpleCircleBot", "${SERVER_HOST:-host.docker.internal}", "${SERVER_PORT:-7878}", "simple-circle"]
+
+  bot-tracking-circle:
+    <<: *java-bot
+    command: ["com.battlesim.examples.TrackingCircleBot", "${SERVER_HOST:-host.docker.internal}", "${SERVER_PORT:-7878}", "tracking-circle"]
+
+  bot-strong-tactical:
+    <<: *java-bot
+    command: ["com.battlesim.examples.StrongTacticalBot", "${SERVER_HOST:-host.docker.internal}", "${SERVER_PORT:-7878}", "strong-tactical"]
+
+  bot-strategist-java:
+    <<: *java-bot
+    command: ["com.battlesim.examples.StrategistBot", "${SERVER_HOST:-host.docker.internal}", "${SERVER_PORT:-7878}", "strategist-java"]
+
+  bot-acoustic-shadow:
+    <<: *java-bot
+    command: ["com.battlesim.examples.AcousticShadowBot", "${SERVER_HOST:-host.docker.internal}", "${SERVER_PORT:-7878}", "acoustic-shadow"]
+
+  bot-apex-duelist:
+    <<: *java-bot
+    command: ["com.battlesim.examples.ApexDuelistBot", "${SERVER_HOST:-host.docker.internal}", "${SERVER_PORT:-7878}", "apex-duelist"]

@@ -112,6 +112,12 @@ npm run dev                  # http://localhost:5173 with HMR.
 # Containerised run (single command, no local Rust/Node needed)
 docker compose up --build    # builds the multi-stage image and serves on :7878.
                              #   Replays land in ./replays/ via bind-mount.
+
+# Start every example bot (5 Python + 6 Java), each in its own container.
+# Needs a server already running (the `docker compose up` above, or `cargo run`).
+docker compose -f docker-compose.bots.yml up --build
+                             #   Bots reach the server at host.docker.internal:7878.
+                             #   Override with SERVER_HOST / SERVER_PORT env vars.
 ```
 
 The room is driven over a REST control plane (`/api/*`), not stdin — there is no operator command interface. Lifecycle actions (`start`, `abort`, `reset`, `kick`) and parameter changes (`PUT /api/room/config`) are HTTP routes gated by a JWT. Get a token from `POST /api/login` with the admin password (`--admin-password` / `BATTLE_ADMIN_PASSWORD`, random per start if unset and logged once at INFO). The spectator web UI uses these routes to manage matches from the browser. See `docs/PROTOCOL.md §2.5`.

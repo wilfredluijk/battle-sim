@@ -23,8 +23,13 @@ export const latestWorld = writable<WorldFrame | null>(null);
 export const view = writable<ViewMode>('split');
 
 /** Top-level screen the app shows. `live` is the spectator/lobby/report flow; the replay
- * modes are an independent surface that does not touch the live `/spectate` connection. */
-export type AppMode = 'live' | 'replay-browser' | 'replay-viewer';
+ * modes are an independent surface that does not touch the live `/spectate` connection;
+ * `monte-carlo` opens the batch-runner panel. */
+export type AppMode =
+  | 'live'
+  | 'replay-browser'
+  | 'replay-viewer'
+  | 'monte-carlo';
 export const appMode = writable<AppMode>('live');
 
 /**

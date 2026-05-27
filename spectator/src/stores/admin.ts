@@ -8,6 +8,8 @@ import { ApiError } from '../lib/adminApi';
 import type {
   ConfigField,
   MatchReport,
+  McStartRequest,
+  McStatus,
   RoomInfo,
   SimConfig,
 } from '../types/protocol';
@@ -54,6 +56,12 @@ export const report = writable<MatchReport | null>(null);
 /** Whether the post-battle report screen should be shown. Set true when a match ends,
  *  cleared when a new match starts or the user dismisses the report. */
 export const showReport = writable<boolean>(false);
+
+/** Most recent Monte Carlo status snapshot, or null before the first poll. */
+export const mcStatus = writable<McStatus | null>(null);
+
+/** Set when starting / stopping an MC run fails — surfaced to the user inline. */
+export const mcError = writable<string | null>(null);
 
 /**
  * Begin polling the control plane. Fetches the config schema once, then polls room state
@@ -172,4 +180,81 @@ export async function resetMatch(): Promise<void> {
 export async function kickBot(botId: string): Promise<void> {
   await withToken((t) => api.kickBot(t, botId));
   await refreshRoom();
+}
+
+// ---------------------------------------------------------------------------
+// Monte Carlo helpers.
+//
+// Status is polled on a separate, faster interval than the room poll so the progress
+// bar feels responsive during a run. The poller auto-throttles itself when no run is
+// active to avoid hammering the server in idle windows.
+// ---------------------------------------------------------------------------
+
+/** How often to re-poll `GET /api/montecarlo/status` while a run is active. */
+const MC_POLL_RUNNING_MS = 500;
+/** Slower poll cadence when no run is in flight — just to keep the UI in sync after a
+ *  stopped/completed run is finalized. */
+const MC_POLL_IDLE_MS = 2500;
+
+/**
+ * Begin polling the Monte Carlo status endpoint. Mirrors `startControlPlane`'s pattern:
+ * returns a teardown that stops the loop on app unmount or HMR dispose.
+ */
+export function startMonteCarloPolling(): () => void {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const poll = async (): Promise<void> => {
+    if (stopped) return;
+    let nextDelay = MC_POLL_IDLE_MS;
+    try {
+      const status = await api.fetchMonteCarloStatus();
+      if (stopped) return;
+      mcStatus.set(status);
+      nextDelay = status.running ? MC_POLL_RUNNING_MS : MC_POLL_IDLE_MS;
+    } catch {
+      // Server unreachable; back off to the idle cadence and retry. The room store's
+      // own error handling already surfaces "server unreachable" via roomError.
+    }
+    if (!stopped) timer = setTimeout(poll, nextDelay);
+  };
+  void poll();
+
+  return () => {
+    stopped = true;
+    if (timer != null) clearTimeout(timer);
+  };
+}
+
+export async function startMonteCarlo(config: McStartRequest): Promise<void> {
+  mcError.set(null);
+  try {
+    await withToken((t) => api.startMonteCarlo(t, config));
+    // Refresh status immediately so the UI flips to "running" without waiting a poll.
+    try {
+      mcStatus.set(await api.fetchMonteCarloStatus());
+    } catch {
+      /* next poll will retry */
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'failed to start monte carlo run';
+    mcError.set(msg);
+    throw e;
+  }
+}
+
+export async function stopMonteCarlo(forceAbort = false): Promise<void> {
+  mcError.set(null);
+  try {
+    await withToken((t) => api.stopMonteCarlo(t, forceAbort));
+    try {
+      mcStatus.set(await api.fetchMonteCarloStatus());
+    } catch {
+      /* next poll will retry */
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'failed to stop monte carlo run';
+    mcError.set(msg);
+    throw e;
+  }
 }

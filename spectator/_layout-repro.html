@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="src/app.css" />
+    <script>
+      // Apply the candidate fix only when the URL hash asks for it, so the same
+      // file reproduces both the broken and fixed layout.
+      if (location.hash === '#fixed') {
+        const s = document.createElement('style');
+        s.textContent =
+          '#app{display:flex;flex-direction:column;flex:1;min-height:0;}';
+        document.head.appendChild(s);
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app">
+      <div class="topbar"><span class="topbar-title">Naval Battle</span></div>
+      <main class="replay-viewer">
+        <div class="rv-bar rv-top">
+          <button class="topbar-btn" type="button">Exit replay</button>
+          <span class="rv-title">tactician vs circler</span>
+        </div>
+        <div class="rv-stage">
+          <canvas class="replay-board" width="800" height="800"></canvas>
+        </div>
+        <div class="rv-bar rv-controls">
+          <button class="rv-play" type="button">&#9654;</button>
+          <span class="rv-readout">0 / 100</span>
+        </div>
+        <div class="rv-legend"><span>legend</span></div>
+      </main>
+    </div>
+    <p id="probe" style="font:16px monospace; color:#fff; padding:8px">pending</p>
+    <script>
+      window.addEventListener('load', () => {
+        requestAnimationFrame(() => {
+          const stage = document.querySelector('.rv-stage').getBoundingClientRect();
+          const cv = document.querySelector('.replay-board').getBoundingClientRect();
+          document.getElementById('probe').textContent =
+            'PROBE rv-stage=' + Math.round(stage.width) + 'x' + Math.round(stage.height) +
+            ' canvas=' + Math.round(cv.width) + 'x' + Math.round(cv.height);
+        });
+      });
+    </script>
+  </body>
+</html>

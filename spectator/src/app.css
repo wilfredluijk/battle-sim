@@ -29,6 +29,17 @@ body {
   flex-direction: column;
 }
 
+/* The Svelte app mounts here. It must carry the full-height flex column from <body>
+   down to <main>, otherwise <main>'s `flex: 1` has no definite height to fill and any
+   screen with an internal `flex: 1` region (e.g. the replay viewer's battlefield stage)
+   collapses or overflows. */
+#app {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
 .topbar {
   display: flex;
   align-items: center;

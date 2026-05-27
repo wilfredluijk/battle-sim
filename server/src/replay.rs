@@ -304,6 +304,17 @@ pub fn make_replay_id(room: &str) -> String {
 /// A bot's id paired with the receiver for the frames the room sends it.
 type BotOutbound = (String, mpsc::Receiver<ServerMsg>);
 
+/// Registration sequence number behind a `b_<n>` bot id. The room assigns ids
+/// monotonically as bots register, so this is the canonical ordering for replay bots — and
+/// the order the header's `bots` array is expected to be in. Ids that don't match the
+/// pattern sort last; that's defensive only — the room always emits `b_<n>`.
+pub(crate) fn bot_id_seq(bot_id: &str) -> u64 {
+    bot_id
+        .strip_prefix("b_")
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
+}
+
 /// Reconstruct a `Room` from a `ReplayHeader`, returning each bot's outbound receiver
 /// alongside it. The bots are pre-registered with the same ids the live run assigned, then
 /// marked ready and started — so the resulting Room is in `Running` state at tick 0, ready
@@ -328,8 +339,16 @@ fn rebuild_room_with_outbound(
     // so `welcome` payloads and physics use the exact values the live run did.
     room.world.config = header.sim_config;
 
+    // The header's `bots` array may be in any order: logs written before the
+    // registration-order fix serialized it lexicographically by `BotId`, which interleaves
+    // `b_10` ahead of `b_2`. The room assigns ids sequentially as bots register, so
+    // register in numeric-id order — the only order in which the ids the room assigns line
+    // up with the ones the header recorded.
+    let mut ordered: Vec<&ReplayBot> = header.bots.iter().collect();
+    ordered.sort_by_key(|b| bot_id_seq(&b.bot_id));
+
     let mut outbound = Vec::with_capacity(header.bots.len());
-    for bot in &header.bots {
+    for bot in ordered {
         let (reply_tx, mut reply_rx) = oneshot::channel();
         room.handle_event(RoomEvent::BotConnect {
             peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -804,7 +823,13 @@ fn read_replay_summary(path: &Path) -> io::Result<ReplaySummary> {
         tick_hz: header.tick_hz,
         map: header.map,
         sim_config: header.sim_config,
-        bots: header.bots.iter().map(|b| b.name.clone()).collect(),
+        bots: {
+            // Present names in registration order even for logs written before the writer
+            // emitted `bots` in that order (see `bot_id_seq`).
+            let mut bots = header.bots.clone();
+            bots.sort_by_key(|b| bot_id_seq(&b.bot_id));
+            bots.into_iter().map(|b| b.name).collect()
+        },
         final_tick: end.as_ref().map(|e| e.tick),
         winner_name,
     })
@@ -1005,5 +1030,43 @@ mod tests {
     fn list_replays_missing_dir_is_empty() {
         let listed = list_replays(Path::new("/nonexistent-replay-dir-xyz")).expect("list");
         assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn bot_id_seq_orders_numerically() {
+        // Lexicographic string order would put `b_10` before `b_2`; `bot_id_seq` must not.
+        assert!(bot_id_seq("b_2") < bot_id_seq("b_10"));
+        assert!(bot_id_seq("b_10") < bot_id_seq("b_11"));
+        // Malformed ids sort last rather than panicking.
+        assert_eq!(bot_id_seq("garbage"), u64::MAX);
+        assert_eq!(bot_id_seq("b_"), u64::MAX);
+    }
+
+    #[test]
+    fn rebuild_tolerates_lexicographic_header() {
+        // A header whose `bots` array is in lexicographic `BotId` order — exactly what
+        // logs written before the registration-order fix contain. `b_10`/`b_11`
+        // interleave ahead of `b_2`, so a naive in-order rebuild assigns mismatched ids
+        // and fails with "bot id drift on rebuild".
+        let mut header = sample_header();
+        header.max_bots = 11;
+        let mut bots: Vec<ReplayBot> = (1..=11)
+            .map(|n| ReplayBot {
+                bot_id: format!("b_{n}"),
+                ship_id: format!("s_{n}"),
+                name: format!("bot-{n}"),
+                selected_powerups: vec![],
+            })
+            .collect();
+        bots.sort_by(|a, b| a.bot_id.cmp(&b.bot_id));
+        // Sanity-check the array really is in the pathological order before rebuilding.
+        assert_eq!(
+            bots[1].bot_id, "b_10",
+            "test setup: expected lexicographic order"
+        );
+        header.bots = bots;
+
+        let room = rebuild_room_from_header(&header).expect("rebuild tolerates header order");
+        assert_eq!(room.bot_count(), 11);
     }
 }

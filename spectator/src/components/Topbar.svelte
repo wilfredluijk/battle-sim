@@ -44,6 +44,11 @@
         type="button"
         title="Browse and watch recorded matches"
         onclick={() => appMode.set('replay-browser')}>Replays</button>
+      <button
+        class="topbar-btn"
+        type="button"
+        title="Run a Monte Carlo batch of matches and rank bots by win rate"
+        onclick={() => appMode.set('monte-carlo')}>Monte Carlo</button>
     {/if}
     {#if isRunning && $adminToken}
       <button
