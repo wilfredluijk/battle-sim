@@ -32,11 +32,12 @@ use tracing::{debug, error, info, warn};
 use crate::admin::AdminState;
 use crate::auth::AuthState;
 use crate::config::Config;
+use crate::monte_carlo::{McConfig, McStatus};
 use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
 use crate::replay;
 use crate::room::{
-    BotRegistration, ConfigureError, MatchReport, PendingCommand, RoomEvent, RoomSnapshot,
-    SpectatorFrame, StartError,
+    BotRegistration, ConfigureError, MatchReport, McStartError, McStopError, PendingCommand,
+    RoomEvent, RoomSnapshot, SpectatorFrame, StartError,
 };
 use crate::sim::SimConfig;
 
@@ -193,6 +194,9 @@ fn router(state: AppState) -> Router {
             "/api/replays/:id/perspective/:bot_id",
             get(get_replay_perspective),
         )
+        .route("/api/montecarlo/start", post(post_mc_start))
+        .route("/api/montecarlo/stop", post(post_mc_stop))
+        .route("/api/montecarlo/status", get(get_mc_status))
         .route("/bot", get(bot_ws))
         .route("/spectate", get(spectate_ws))
         .with_state(state)
@@ -436,6 +440,74 @@ async fn put_config(
         ApiError::new(status, code, e.as_str().to_string())
     })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// REST: Monte Carlo batch runner
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct McStartResponse {
+    run_id: String,
+}
+
+/// Admin-only: kick off a Monte Carlo batch run. The bots must already be connected and
+/// ready; this drives them through `n_matches` matches with varied starting positions and
+/// records each one's outcome. Returns `409 Conflict` if a run is already in progress or
+/// the room isn't in lobby.
+async fn post_mc_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(config): Json<McConfig>,
+) -> Result<Json<McStartResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    let result: Result<String, McStartError> =
+        ask_room(&state, |reply| RoomEvent::StartMonteCarlo { config, reply }).await?;
+    let run_id = result.map_err(|e| {
+        let (status, code) = match e {
+            McStartError::NotInLobby | McStartError::AlreadyRunning => {
+                (StatusCode::CONFLICT, "mc_refused")
+            }
+            McStartError::InsufficientBots => (StatusCode::CONFLICT, "mc_refused"),
+            McStartError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_parameter"),
+        };
+        ApiError::new(status, code, e.as_str().to_string())
+    })?;
+    Ok(Json(McStartResponse { run_id }))
+}
+
+#[derive(Default, Deserialize)]
+struct McStopRequest {
+    /// If `true`, abort the in-flight match immediately instead of letting it finish.
+    #[serde(default)]
+    force_abort: bool,
+}
+
+/// Admin-only: stop the active Monte Carlo run. Returns `409 Conflict` if no run is
+/// in progress.
+async fn post_mc_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<McStopRequest>>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let result: Result<(), McStopError> = ask_room(&state, |reply| RoomEvent::StopMonteCarlo {
+        force_abort: req.force_abort,
+        reply,
+    })
+    .await?;
+    result.map_err(|e| ApiError::new(StatusCode::CONFLICT, "mc_stop_refused", e.as_str()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Public: snapshot of the active or most-recent Monte Carlo run. Drives the spectator
+/// UI's progress panel; bounded to a small payload (a tail of recent results, not the
+/// full timeline) so it's cheap to poll.
+async fn get_mc_status(State(state): State<AppState>) -> Result<Json<McStatus>, ApiError> {
+    let status: McStatus =
+        ask_room(&state, |reply| RoomEvent::QueryMonteCarloStatus { reply }).await?;
+    Ok(Json(status))
 }
 
 /// Public: metadata for the pre-match parameter form — every tunable with its group,

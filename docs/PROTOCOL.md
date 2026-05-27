@@ -435,6 +435,115 @@ empty `contacts` and `events`. An unknown `bot_id` returns `404` `unknown_bot`.
 
 ---
 
+## 2.7 Monte Carlo batch runner — `/api/montecarlo/*` (REST)
+
+Admin-only routes that drive a sequence of matches against the same connected bot roster,
+varying the starting positions per match and reporting which bot wins most often. The
+batch runs in **lockstep mode** — the server waits for every bot to send its command for
+the current tick, then steps immediately, instead of pacing on wall-clock. With local
+bots this typically completes ~10× faster than the equivalent number of wall-clocked
+matches. Every match's replay is preserved in the replay directory.
+
+### 2.7.1 Endpoints
+
+| Method & path | Success | Purpose |
+|---|---|---|
+| `POST /api/montecarlo/start` | `200` | Start a batch. Body: `McStartRequest` (below). |
+| `POST /api/montecarlo/stop` | `204` | Stop the active batch. Body: `{ "force_abort": bool }` (optional). |
+| `GET /api/montecarlo/status` | `200` | Snapshot of the active or most-recent run. |
+
+`start` and `stop` require `Authorization: Bearer <jwt>`. `status` is public so the
+spectator UI can poll it without holding admin credentials.
+
+Preconditions for `start`: the room must be in `lobby`, at least two bots must be
+connected, and every connected bot must be `ready`. Otherwise `409 Conflict` with `code`
+= `mc_refused`. Invalid `McStartRequest` fields return `400 Bad Request` with `code` =
+`invalid_parameter`.
+
+### 2.7.2 `McStartRequest`
+
+```json
+{
+  "n_matches": 100,
+  "mc_seed": 42,
+  "variance_mode": "shuffled",
+  "per_tick_timeout_ms": 1000,
+  "spectator_throttle": 5,
+  "sim_config": { "...": "optional SimConfig override" }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `n_matches` | Number of matches to run. Capped at 10000. |
+| `mc_seed` | Root seed; the per-match seed is `splitmix64(mc_seed ^ match_index)`. |
+| `variance_mode` | One of `fixed`, `rotated`, `shuffled`, `random`. See below. |
+| `per_tick_timeout_ms` | Optional. Lockstep deadline (default 1000). |
+| `spectator_throttle` | Optional. Broadcast every Nth tick; `0` disables (default 5). |
+| `sim_config` | Optional. Replaces the active balance parameters at run start. |
+
+Variance modes:
+
+- **`fixed`** — every match uses the standard ring layout (radius 400, evenly spaced).
+- **`rotated`** — same ring, rotated by a per-match random angle.
+- **`shuffled`** — rotate plus permute which bot lands on which slot.
+- **`random`** — sample each ship's position uniformly inside a disk, rejection-sampled
+  for a minimum separation. Initial heading is also randomized.
+
+### 2.7.3 `GET /api/montecarlo/status`
+
+```json
+{
+  "running": true,
+  "run_id": "0000000000abcdef",
+  "completed": 47,
+  "total": 100,
+  "variance_mode": "shuffled",
+  "mc_seed": 42,
+  "started_at_unix": 1779878000,
+  "finished_at_unix": null,
+  "current_match_tick": 312,
+  "wins": { "b_1": 21, "b_2": 18, "b_3": 6 },
+  "bot_names": { "b_1": "chaser", "b_2": "sniper", "b_3": "circler" },
+  "draws": 2,
+  "results": [
+    { "match_index": 47, "seed": 12345, "winner": "b_1", "winner_name": "chaser",
+      "duration_ticks": 312, "replay_id": "mc_..._match_0047_seed_..." }
+  ],
+  "ended_reason": null
+}
+```
+
+`results` is a bounded tail of the most recent matches (last 20). Older replays remain
+accessible via `GET /api/replays` and `GET /api/replays/{id}`. Once the run finishes,
+`running` flips to `false` and `ended_reason` carries `"completed"`, `"stopped"`,
+`"bot_disconnected"`, or `"error"`.
+
+Replays produced during a run follow the naming scheme
+`mc_<run_id>_match_<NNNN>_seed_<hex>` and live in the same directory as regular replays.
+
+### 2.7.4 Bot-facing behaviour during an MC run
+
+The wire protocol (`§1`) is unchanged. Bots see exactly the same sequence they'd see in
+back-to-back single matches:
+
+```
+welcome → ready → game_start → tick × N → game_over → game_start → tick × N → game_over → …
+```
+
+Between matches the server skips the usual `POST_GAME_LOBBY_TICKS` pause, so `game_over`
+is immediately followed by the next `game_start` (the `lobby` frame is **not** sent in
+MC mode — bots stay implicitly "ready" for the whole run). A bot that wants to support
+Monte Carlo runs should treat `game_start` as a one-shot reset signal and keep looping
+on `tick` frames thereafter; a bot that exits on the first `game_over` will only play
+one match per run.
+
+If any bot disconnects mid-run the controller aborts, finalizes the status snapshot
+with `ended_reason = "bot_disconnected"`, and force-ends the in-flight match with no
+winner so survivors see a clean `game_over`.
+
+---
+
 ## 3. Error codes
 
 Codes are strings; the human-readable detail goes in `message`. Bot authors should switch on `code` for behaviour and surface `message` for diagnostics.
@@ -473,6 +582,16 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-05-27 — Monte Carlo batch runner
+
+- Added admin-gated `/api/montecarlo/start`, `/api/montecarlo/stop`, and public
+  `/api/montecarlo/status` routes. See §2.7. Additive — the `/bot` wire protocol is
+  unchanged. Bots that loop on `game_start` automatically support batch runs; bots that
+  exit on the first `game_over` will play one match per run.
+- Replays produced during a Monte Carlo run use the naming scheme
+  `mc_<run_id>_match_<NNNN>_seed_<hex>` and remain accessible through the existing
+  `/api/replays` routes.
 
 ## 2026-05-21 — replay viewer REST routes
 

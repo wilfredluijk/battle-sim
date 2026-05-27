@@ -20,6 +20,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::admin::{AdminBotInfo, AdminServerMsg, AdminState};
+use crate::monte_carlo::{self, McConfig, McState, McStatus};
 use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
     MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, SpectatorEvent, SpectatorMsg,
@@ -196,6 +197,45 @@ impl KickError {
     }
 }
 
+/// Reasons a `StartMonteCarlo` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McStartError {
+    /// MC requires a Lobby state to begin (same prerequisite as a single match start).
+    NotInLobby,
+    /// At least two ready bots are required for a meaningful Monte Carlo run.
+    InsufficientBots,
+    /// Another run is already active; stop it first.
+    AlreadyRunning,
+    Invalid(String),
+}
+
+impl McStartError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            McStartError::NotInLobby => "monte carlo runs can only be started from the lobby",
+            McStartError::InsufficientBots => {
+                "at least two ready bots are required for a monte carlo run"
+            }
+            McStartError::AlreadyRunning => "a monte carlo run is already in progress",
+            McStartError::Invalid(msg) => msg,
+        }
+    }
+}
+
+/// Reasons a `StopMonteCarlo` request can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McStopError {
+    NotRunning,
+}
+
+impl McStopError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            McStopError::NotRunning => "no monte carlo run is in progress",
+        }
+    }
+}
+
 /// Reasons an `OperatorConfigure` request can be refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigureError {
@@ -277,6 +317,23 @@ pub enum RoomEvent {
     OperatorConfigure {
         config: SimConfig,
         reply: oneshot::Sender<Result<(), ConfigureError>>,
+    },
+    /// Start a Monte Carlo batch run. Validates the config, snapshots the run state, and
+    /// kicks off the first match immediately. Subsequent matches are chained from inside
+    /// `step_tick`.
+    StartMonteCarlo {
+        config: McConfig,
+        reply: oneshot::Sender<Result<String, McStartError>>,
+    },
+    /// Stop the active Monte Carlo run. The currently in-flight match finishes naturally
+    /// (or is aborted, depending on `force_abort`); no further matches are queued.
+    StopMonteCarlo {
+        force_abort: bool,
+        reply: oneshot::Sender<Result<(), McStopError>>,
+    },
+    /// Snapshot the active or most-recent MC run for `GET /api/montecarlo/status`.
+    QueryMonteCarloStatus {
+        reply: oneshot::Sender<McStatus>,
     },
 }
 
@@ -392,6 +449,13 @@ pub struct Room {
     /// transition so the post-battle screen can show it; replaced at the next
     /// `start_match`. `None` until the first match has finished.
     last_report: Option<MatchReport>,
+    /// In-flight Monte Carlo run. `Some` while a batch is running; `None` otherwise.
+    /// The fields drive lockstep pacing, spectator throttling, and the
+    /// auto-chain-to-next-match path inside `step_tick`.
+    mc_run: Option<McState>,
+    /// Status snapshot of the most recently finished Monte Carlo run, surfaced via
+    /// `GET /api/montecarlo/status` after the run ends.
+    mc_last_status: Option<McStatus>,
 }
 
 impl Room {
@@ -427,6 +491,8 @@ impl Room {
             admin_tx: None,
             match_stats: BTreeMap::new(),
             last_report: None,
+            mc_run: None,
+            mc_last_status: None,
         }
     }
 
@@ -503,8 +569,9 @@ impl Room {
         // Post-game pause: after a match ends the room stays in `Ended` for
         // `POST_GAME_LOBBY_TICKS` so the spectator UI can show the final frame and bots
         // can react to `game_over`. Once the gap elapses, transition back to `Lobby` and
-        // notify bots so they can rearm for the next match.
-        if self.state == RoomState::Ended {
+        // notify bots so they can rearm for the next match. Monte Carlo mode skips the
+        // pause entirely and immediately starts the next match below.
+        if self.state == RoomState::Ended && self.mc_run.is_none() {
             if let Some(end_tick) = self.end_tick {
                 if self.world.tick.saturating_sub(end_tick) >= POST_GAME_LOBBY_TICKS {
                     self.transition_to_lobby();
@@ -602,7 +669,16 @@ impl Room {
             self.end_tick = Some(self.world.tick);
             self.last_winner = winner.clone();
             self.last_report = Some(self.build_match_report(winner.clone(), false));
-            self.broadcast_game_over(winner);
+            let duration_ticks = self.world.tick;
+            let replay_id_for_match = self.replay_id.clone();
+            self.broadcast_game_over(winner.clone());
+            // Monte Carlo: record this match's outcome and immediately chain to the next
+            // match (or finalize the run if this was the last one). Skips the regular
+            // POST_GAME_LOBBY_TICKS pause — the batch is the whole point of this mode.
+            if self.mc_run.is_some() {
+                self.mc_record_match_end(winner, duration_ticks, replay_id_for_match);
+                self.mc_advance_after_match();
+            }
             self.publish_admin_state();
             return;
         }
@@ -899,12 +975,32 @@ impl Room {
     /// Build a `SpectatorMsg::World` and push it onto the spectator broadcast channel.
     /// No-op when no channel is wired (unit tests). Send failures (no subscribers) are
     /// intentionally swallowed — the simulation never stalls because nobody is watching.
+    ///
+    /// In Monte Carlo mode the per-tick JSON serialization would dominate runtime, so
+    /// the room throttles broadcasts to every Nth tick (configurable). `game_over` ticks
+    /// always emit a frame so the spectator UI sees the deciding frame regardless of
+    /// throttle.
     fn broadcast_spectator_world(&self, events: &[CombatEvent]) {
         let Some(tx) = self.spectator_tx.as_ref() else {
             return;
         };
         if tx.receiver_count() == 0 {
             // Nothing to do; skip the JSON serialization cost when nobody's watching.
+            return;
+        }
+        // Spectator throttling for MC mode. `0` disables non-final broadcasts entirely;
+        // any positive value gates on `tick % throttle == 0`. The deciding tick (the one
+        // accompanied by combat events that produced a death) bypasses the gate so the
+        // UI never misses the final frame.
+        let throttle = self.spectator_throttle();
+        let is_deciding_tick = events
+            .iter()
+            .any(|e| matches!(e, CombatEvent::Death { .. }));
+        if throttle == 0 && !is_deciding_tick {
+            return;
+        }
+        if throttle > 1 && !is_deciding_tick && !self.world.tick.is_multiple_of(u64::from(throttle))
+        {
             return;
         }
         let msg = self.build_spectator_world(events);
@@ -999,6 +1095,13 @@ impl Room {
                 reason,
                 "bot removed"
             );
+        }
+        // A Monte Carlo run requires a stable roster; any disconnect aborts the run.
+        // We finalize the controller state but do not force-abort the current match —
+        // it will end naturally (or by the timeout) and the chain logic will see the
+        // run state is gone and stop.
+        if self.mc_run.is_some() {
+            self.mc_abort("bot_disconnected");
         }
     }
 
@@ -1259,6 +1362,25 @@ impl Room {
                 let _ = reply.send(result);
                 self.publish_admin_state();
             }
+            RoomEvent::StartMonteCarlo { config, reply } => {
+                let result = self.start_monte_carlo(config);
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, reason = e.as_str(), "monte carlo start refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
+            RoomEvent::StopMonteCarlo { force_abort, reply } => {
+                let result = self.stop_monte_carlo(force_abort);
+                if let Err(ref e) = result {
+                    warn!(room = %self.name, reason = e.as_str(), "monte carlo stop refused");
+                }
+                let _ = reply.send(result);
+                self.publish_admin_state();
+            }
+            RoomEvent::QueryMonteCarloStatus { reply } => {
+                let _ = reply.send(self.mc_status_snapshot());
+            }
         }
     }
 
@@ -1380,19 +1502,30 @@ impl Room {
             return Err(StartError::NotAllReady);
         }
 
-        let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
-        let n = self.bots.len() as f32;
+        let n_bots = self.bots.len();
+        let layout = default_ring_layout(self.world.width, self.world.height, n_bots);
+        self.apply_match_layout(&layout);
+        Ok(())
+    }
+
+    /// Internal helper: place ships using the precomputed `layout` (one entry per bot in
+    /// `BotId` order), broadcast `game_start`, reset state and open the replay log.
+    /// Shared by [`Room::start_match`] and the Monte Carlo per-match path.
+    fn apply_match_layout(&mut self, layout: &[(Vec2, f32)]) {
         // Freeze the balance parameters for the whole match: ship hull / ammo and every
         // physics tunable are read from this snapshot from here on.
         let config = self.world.config;
         // Snapshot bot ids so we can mutate `self.world` and read `self.bots` without
         // simultaneous &mut+&. Iteration order is BotId-stable (BTreeMap).
         let ordered_ids: Vec<BotId> = self.bots.keys().cloned().collect();
+        debug_assert_eq!(
+            ordered_ids.len(),
+            layout.len(),
+            "layout must have one entry per registered bot",
+        );
+
         for (i, bot_id) in ordered_ids.iter().enumerate() {
-            let angle = std::f32::consts::TAU * (i as f32) / n;
-            let offset = Vec2::new(angle.cos(), angle.sin()) * STARTING_RING_RADIUS;
-            let pos = center + offset;
-            let heading_deg = compass_deg_facing(pos, center);
+            let (pos, heading_deg) = layout[i];
 
             let ship_id = {
                 let entry = self.bots.get_mut(bot_id).expect("snapshot still in map");
@@ -1418,6 +1551,8 @@ impl Room {
         }
 
         self.world.tick = 0;
+        self.world.shells.clear();
+        self.world.next_shell_index = 0;
         self.state = RoomState::Running;
         // Cleared on entry; the first `step_tick` will populate them after broadcasting.
         self.tick_send_time = None;
@@ -1442,7 +1577,6 @@ impl Room {
         // if we can't write the log.
         self.open_replay_writer_if_configured();
         self.write_replay_header();
-        Ok(())
     }
 
     /// If `replay_dir` was set and no writer is yet open, generate a replay id and create
@@ -1455,7 +1589,12 @@ impl Room {
         let Some(dir) = self.replay_dir.clone() else {
             return;
         };
-        let replay_id = replay::make_replay_id(&self.name);
+        // Inside a Monte Carlo run, embed the run id + match index + seed so every
+        // replay's filename uniquely identifies its position in the batch.
+        let replay_id = match self.mc_run.as_ref() {
+            Some(mc) => monte_carlo::make_mc_replay_id(&mc.run_id, mc.current_index + 1, self.seed),
+            None => replay::make_replay_id(&self.name),
+        };
         match ReplayWriter::create_file(&dir, replay_id.clone()) {
             Ok(writer) => {
                 if let Some(path) = writer.path() {
@@ -1528,6 +1667,261 @@ impl Room {
         if let Err(e) = writer.write(&record) {
             warn!(room = %self.name, error = %e, "failed to write replay tick");
         }
+    }
+
+    // ---- Monte Carlo helpers ----------------------------------------------
+    //
+    // The state machine integration: an MC run lives in `mc_run`. Starting the run kicks
+    // off the first match through `start_match_with_seeded_layout`. When `step_tick`
+    // detects a match end, it records the outcome (`mc_record_match_end`) and either
+    // chains to the next match or finalizes the run (`mc_advance_after_match`). A
+    // disconnect mid-run aborts the controller via `mc_abort`.
+
+    /// Start a Monte Carlo batch run. The room must be in `Lobby` with at least two
+    /// ready bots; the first match is started synchronously here, subsequent matches
+    /// are chained from inside `step_tick`. Returns the run id on success.
+    fn start_monte_carlo(&mut self, config: McConfig) -> Result<String, McStartError> {
+        if self.state != RoomState::Lobby {
+            return Err(McStartError::NotInLobby);
+        }
+        if self.mc_run.is_some() {
+            return Err(McStartError::AlreadyRunning);
+        }
+        config.validate().map_err(McStartError::Invalid)?;
+        let ready_count = self.bots.values().filter(|b| b.ready).count();
+        if ready_count < 2 {
+            return Err(McStartError::InsufficientBots);
+        }
+        if ready_count != self.bots.len() {
+            // Mirror the single-match precondition: all registered bots must be ready.
+            return Err(McStartError::Invalid(
+                "every connected bot must be ready before starting a monte carlo run".into(),
+            ));
+        }
+
+        // Apply the optional SimConfig override once at the start of the run.
+        if let Some(cfg) = config.sim_config {
+            cfg.validate().map_err(McStartError::Invalid)?;
+            self.world.config = cfg;
+        }
+
+        let started_at_unix = unix_secs();
+        let run_id = make_mc_run_id(started_at_unix);
+        let state = McState::new(config, run_id.clone(), started_at_unix);
+        self.mc_run = Some(state);
+        self.mc_last_status = None;
+        info!(room = %self.name, run_id = %run_id, "monte carlo run started");
+
+        // Kick off the first match. If that fails the run state is rolled back so a
+        // subsequent attempt isn't blocked by `AlreadyRunning`.
+        if let Err(e) = self.mc_begin_next_match() {
+            self.mc_run = None;
+            return Err(McStartError::Invalid(e));
+        }
+        Ok(run_id)
+    }
+
+    /// Stop the active Monte Carlo run. If `force_abort` is `true` and a match is in
+    /// flight the room calls `abort_match` first; otherwise the controller exits at the
+    /// next end-of-match boundary.
+    fn stop_monte_carlo(&mut self, force_abort: bool) -> Result<(), McStopError> {
+        if self.mc_run.is_none() {
+            return Err(McStopError::NotRunning);
+        }
+        if force_abort && self.state == RoomState::Running {
+            // Aborting the match drops to Ended, which step_tick won't auto-advance once
+            // we drop the run state below — so finalize immediately.
+            let _ = self.abort_match();
+        }
+        let mc = self.mc_run.take().expect("checked above");
+        self.mc_last_status = Some(self.build_mc_status(&mc, false, Some("stopped")));
+        info!(room = %self.name, run_id = %mc.run_id, "monte carlo run stopped");
+        Ok(())
+    }
+
+    /// Called from `step_tick` after a match's `game_over` has been broadcast. Records
+    /// the outcome on the MC state. Safe to call only while `mc_run.is_some()`.
+    fn mc_record_match_end(
+        &mut self,
+        winner: Option<BotId>,
+        duration_ticks: u64,
+        replay_id: Option<String>,
+    ) {
+        let Some(mc) = self.mc_run.as_mut() else {
+            return;
+        };
+        let winner_name = winner
+            .as_ref()
+            .and_then(|w| self.bots.get(w).map(|b| b.name.clone()));
+        let seed = mc.seed_for_next_match();
+        mc.record_result(winner, winner_name, duration_ticks, replay_id, seed);
+    }
+
+    /// Called from `step_tick` after `mc_record_match_end`. Either chains to the next
+    /// match in the batch or finalizes the run.
+    fn mc_advance_after_match(&mut self) {
+        let has_more = self
+            .mc_run
+            .as_ref()
+            .map(|m| m.has_more_matches())
+            .unwrap_or(false);
+        if has_more {
+            // Disconnects between matches would have been handled separately; here we
+            // double-check the roster is still healthy enough to keep going.
+            if self.bots.len() < 2 {
+                self.mc_finalize(false, Some("bot_disconnected"));
+                return;
+            }
+            if let Err(e) = self.mc_begin_next_match() {
+                warn!(room = %self.name, error = %e, "monte carlo: failed to start next match");
+                self.mc_finalize(false, Some("error"));
+            }
+        } else {
+            self.mc_finalize(true, Some("completed"));
+        }
+    }
+
+    /// Internal: reset the world, compute a new layout from the next match seed, and
+    /// start the next match. The room stays in `Running` from the bots' perspective —
+    /// they see `game_over` immediately followed by `game_start` for match N+1.
+    fn mc_begin_next_match(&mut self) -> Result<(), String> {
+        let (seed, variance_mode, n_bots, width, height) = {
+            let mc = self
+                .mc_run
+                .as_ref()
+                .ok_or_else(|| "no active monte carlo run".to_string())?;
+            (
+                mc.seed_for_next_match(),
+                mc.config.variance_mode,
+                self.bots.len(),
+                self.world.width,
+                self.world.height,
+            )
+        };
+
+        // Reseed the room RNG so every match starts from a known, varied position in the
+        // PCG stream — and record the new seed so the replay header reflects it. Also
+        // clear shells and per-bot match state via the same reset_for_round path the
+        // lobby transition uses, but without dropping the `ready` flag (the bot is
+        // already mid-batch).
+        self.seed = seed;
+        self.rng = Pcg64::seed_from_u64(seed);
+        for entry in self.bots.values_mut() {
+            entry.pending_command = None;
+            entry.sensor_mode = SensorMode::Passive;
+            entry.last_fire_error_tick = None;
+            entry.command_ticks.clear();
+        }
+        self.world.shells.clear();
+        self.world.next_shell_index = 0;
+        self.tick_send_time = None;
+        self.previous_active_pingers.clear();
+
+        let layout =
+            monte_carlo::place_ships_for_variance(variance_mode, seed, n_bots, width, height);
+        // `apply_match_layout` opens a fresh replay writer (which uses the MC naming
+        // scheme because `self.mc_run` is set), writes the new header, and broadcasts
+        // `game_start` to every bot.
+        self.apply_match_layout(&layout);
+        Ok(())
+    }
+
+    /// Finalize a Monte Carlo run: snapshot its status, drop the active state, and log.
+    /// `completed` is true when the run finished naturally (all matches done), false on
+    /// abort/error/stop — surfaced in the status payload via `ended_reason`.
+    fn mc_finalize(&mut self, completed: bool, reason: Option<&str>) {
+        let Some(mc) = self.mc_run.take() else {
+            return;
+        };
+        info!(
+            room = %self.name,
+            run_id = %mc.run_id,
+            completed,
+            "monte carlo run finished",
+        );
+        // Once finalized the run is no longer running — `running: false` regardless of
+        // whether it completed or was stopped.
+        self.mc_last_status = Some(self.build_mc_status(&mc, false, reason));
+    }
+
+    /// Abort the current MC run because of a fatal condition (e.g. bot disconnect during
+    /// a running match). Surfaces the reason in the last-status snapshot.
+    fn mc_abort(&mut self, reason: &'static str) {
+        if let Some(mc) = self.mc_run.take() {
+            warn!(room = %self.name, run_id = %mc.run_id, reason, "monte carlo run aborted");
+            self.mc_last_status = Some(self.build_mc_status(&mc, false, Some(reason)));
+            // If a match was in flight, end it with no winner so the bots get game_over.
+            if self.state == RoomState::Running {
+                let _ = self.abort_match();
+            }
+        }
+    }
+
+    fn build_mc_status(&self, state: &McState, running: bool, reason: Option<&str>) -> McStatus {
+        let bot_names: BTreeMap<BotId, String> = self
+            .bots
+            .values()
+            .map(|b| (b.bot_id.clone(), b.name.clone()))
+            .collect();
+        McStatus {
+            running,
+            run_id: state.run_id.clone(),
+            completed: state.current_index,
+            total: state.config.n_matches,
+            variance_mode: state.config.variance_mode,
+            mc_seed: state.config.mc_seed,
+            started_at_unix: state.started_at_unix,
+            finished_at_unix: if running { None } else { Some(unix_secs()) },
+            current_match_tick: if running { self.world.tick } else { 0 },
+            wins: state.wins.clone(),
+            bot_names,
+            draws: state.draws,
+            results: state.results.clone(),
+            ended_reason: reason.map(str::to_string),
+        }
+    }
+
+    /// Public snapshot for `GET /api/montecarlo/status`. Reports the in-flight run's
+    /// progress, or the last completed run's results, or an empty status if nothing has
+    /// ever run.
+    fn mc_status_snapshot(&self) -> McStatus {
+        if let Some(mc) = self.mc_run.as_ref() {
+            self.build_mc_status(mc, true, None)
+        } else if let Some(snap) = self.mc_last_status.clone() {
+            snap
+        } else {
+            McStatus::empty()
+        }
+    }
+
+    /// `true` if the room is currently in lockstep mode (i.e. an MC run is active and
+    /// the match is `Running`). The tick loop uses this to gate its pacing strategy.
+    pub fn in_lockstep(&self) -> bool {
+        self.mc_run.is_some() && self.state == RoomState::Running
+    }
+
+    /// `true` if every registered bot has a `pending_command` queued for the current
+    /// tick. The lockstep tick loop steps immediately once this returns `true`.
+    pub fn all_pending_commands_ready(&self) -> bool {
+        !self.bots.is_empty() && self.bots.values().all(|b| b.pending_command.is_some())
+    }
+
+    /// Per-tick timeout configured by the active MC run, or a generous default outside
+    /// MC mode. Used by `run_room` to bound how long it waits for the slowest bot.
+    pub fn lockstep_timeout(&self) -> Duration {
+        self.mc_run
+            .as_ref()
+            .map(|m| m.config.per_tick_timeout())
+            .unwrap_or(Duration::from_secs(1))
+    }
+
+    /// Spectator broadcast cadence in MC mode (every Nth tick); `1` in normal mode.
+    /// `0` means "do not broadcast at all this run".
+    pub fn spectator_throttle(&self) -> u32 {
+        self.mc_run
+            .as_ref()
+            .map(|m| m.config.effective_spectator_throttle())
+            .unwrap_or(1)
     }
 
     fn register_bot(
@@ -1694,8 +2088,52 @@ fn compass_deg_facing(from: Vec2, to: Vec2) -> f32 {
     }
 }
 
+/// Default ring layout used by [`Room::start_match`]. Mirrors the historical hardcoded
+/// placement: every bot evenly spaced on `STARTING_RING_RADIUS` around the map centre,
+/// facing inward.
+fn default_ring_layout(width: f32, height: f32, bot_count: usize) -> Vec<(Vec2, f32)> {
+    let center = Vec2::new(width * 0.5, height * 0.5);
+    let n = bot_count as f32;
+    (0..bot_count)
+        .map(|i| {
+            let angle = std::f32::consts::TAU * (i as f32) / n;
+            let offset = Vec2::new(angle.cos(), angle.sin()) * STARTING_RING_RADIUS;
+            let pos = center + offset;
+            let heading = compass_deg_facing(pos, center);
+            (pos, heading)
+        })
+        .collect()
+}
+
+/// Wall-clock Unix timestamp in seconds. Used outside the deterministic simulation —
+/// purely for human-readable timestamps in the MC run id and status payload.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Build a short, filesystem-safe identifier for a Monte Carlo run.
+fn make_mc_run_id(unix_secs_now: u64) -> String {
+    format!("{:016x}", unix_secs_now)
+}
+
 /// Drive a room's tick loop until the shutdown channel fires. Consumes `RoomEvent`s
 /// from `event_rx` between ticks; events are applied in arrival order.
+///
+/// Two pacing strategies, switched at runtime based on [`Room::in_lockstep`]:
+///
+/// - **Normal mode** (no MC run active): `tokio::time::interval` paces ticks at the
+///   configured `tick_hz`. Commands that arrive between ticks queue per-bot and are
+///   applied at the next tick boundary; bots that miss the `tick_deadline_ms` window get
+///   a `late_command` error.
+/// - **Lockstep mode** (an MC run is active and a match is running): the loop waits for
+///   every registered bot to send a command for the current tick, then steps immediately.
+///   A per-tick timeout (configurable via [`McConfig::per_tick_timeout_ms`]) backstops a
+///   stalled bot. This is what makes a 100-match batch finish in a fraction of the time
+///   the wall-clocked equivalent would take — the match goes as fast as the slowest bot
+///   can respond, instead of being capped at the wall-clock tick rate.
 pub async fn run_room(
     mut room: Room,
     mut event_rx: mpsc::Receiver<RoomEvent>,
@@ -1707,16 +2145,61 @@ pub async fn run_room(
     let name = room.name.clone();
     info!(room = %name, tick_hz = room.tick_hz, "room started");
 
+    // Deadline for the current lockstep tick, set when we first enter lockstep with no
+    // commands queued; cleared every time we step. `None` outside lockstep mode.
+    let mut lockstep_deadline: Option<tokio::time::Instant> = None;
+
     loop {
+        // Recompute lockstep status each iteration — entering/exiting an MC run can
+        // change it under us.
+        let lockstep = room.in_lockstep();
+        if lockstep {
+            // First tick in a new lockstep window: arm the deadline. Subsequent
+            // iterations preserve the existing deadline until we actually step.
+            if lockstep_deadline.is_none() {
+                lockstep_deadline = Some(tokio::time::Instant::now() + room.lockstep_timeout());
+            }
+            // If all bots have already sent commands, step immediately — no need to wait.
+            if room.all_pending_commands_ready() {
+                room.step_tick();
+                lockstep_deadline = None;
+                continue;
+            }
+        } else {
+            lockstep_deadline = None;
+        }
+
+        let deadline_future = async {
+            match lockstep_deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
+            biased;
             _ = shutdown_rx.recv() => {
                 info!(room = %name, final_tick = room.world.tick, "room: shutdown");
                 break;
             }
             Some(event) = event_rx.recv() => {
                 room.handle_event(event);
+                // Most events touch room state in a way that may end the current
+                // lockstep window (e.g. a kick reduces the roster). Re-check on the
+                // next loop iteration; no need to short-circuit here.
             }
-            _ = ticker.tick() => {
+            _ = deadline_future, if lockstep && lockstep_deadline.is_some() => {
+                // Per-tick timeout fired: step anyway with whatever commands we have.
+                // Bots that didn't respond keep their previous throttle/rudder.
+                debug!(
+                    room = %name,
+                    tick = room.world.tick,
+                    "lockstep deadline fired; stepping with partial commands",
+                );
+                room.step_tick();
+                lockstep_deadline = None;
+            }
+            _ = ticker.tick(), if !lockstep => {
                 room.step_tick();
                 debug!(room = %name, tick = room.world.tick, state = ?room.state, "tick");
             }
