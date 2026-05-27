@@ -6,6 +6,8 @@
 import type {
   ConfigField,
   MatchReport,
+  McStartRequest,
+  McStatus,
   RoomInfo,
   SimConfig,
 } from '../types/protocol';
@@ -132,4 +134,46 @@ export async function kickBot(token: string, botId: string): Promise<void> {
     body: JSON.stringify({ bot_id: botId }),
   });
   if (!res.ok) throw await toError(res);
+}
+
+// ---------------------------------------------------------------------------
+// Monte Carlo batch runner.
+// ---------------------------------------------------------------------------
+
+export interface McStartResult {
+  run_id: string;
+}
+
+/** `POST /api/montecarlo/start` — kick off a batch of matches with varied positions. */
+export async function startMonteCarlo(
+  token: string,
+  config: McStartRequest,
+): Promise<McStartResult> {
+  const res = await fetch('/api/montecarlo/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) throw await toError(res);
+  return (await res.json()) as McStartResult;
+}
+
+/** `POST /api/montecarlo/stop` — halt the active Monte Carlo run. */
+export async function stopMonteCarlo(
+  token: string,
+  forceAbort = false,
+): Promise<void> {
+  const res = await fetch('/api/montecarlo/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ force_abort: forceAbort }),
+  });
+  if (!res.ok) throw await toError(res);
+}
+
+/** `GET /api/montecarlo/status` — progress + results of the active or most-recent run. */
+export async function fetchMonteCarloStatus(): Promise<McStatus> {
+  const res = await fetch('/api/montecarlo/status');
+  if (!res.ok) throw await toError(res);
+  return (await res.json()) as McStatus;
 }
