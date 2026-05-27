@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import websockets
@@ -46,6 +46,19 @@ class Bot:
         `max_shell_range`, etc.) on `self` so `on_tick` can read them cheaply.
         Runs before the SDK sends `ready` to the server.
         """
+
+    def choose_powerups(self, welcome: Welcome) -> List[str]:
+        """Pick up to two distinct powerups for the match.
+
+        Override to return a list like ``["overdrive", "rapid_fire"]``. The SDK sends
+        `select_powerups` to the server before `ready`. Default returns an empty list,
+        i.e. play vanilla. The available ids live on `welcome.available_powerups` —
+        see ``docs/POWERUPS.md`` for what each one does.
+
+        The server enforces: exactly 2 picks, distinct, all known. An invalid loadout
+        earns an `error` frame which the SDK forwards to `on_error`.
+        """
+        return []
 
     def on_game_start(self, tick: int, starting_position, starting_heading_deg: float) -> None:
         """Fires when the operator transitions the room to `running`.
@@ -181,6 +194,16 @@ async def run_async(
                     bot.welcome = welcome
                     _safe_callback(bot.on_welcome, welcome)
                     if not ready_sent:
+                        picks = _safe_callback_returning(bot.choose_powerups, welcome)
+                        if picks:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "select_powerups",
+                                        "powerups": [str(p) for p in picks],
+                                    }
+                                )
+                            )
                         await ws.send(json.dumps({"type": "ready"}))
                         ready_sent = True
 

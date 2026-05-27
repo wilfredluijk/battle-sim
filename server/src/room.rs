@@ -23,14 +23,15 @@ use crate::admin::{AdminBotInfo, AdminServerMsg, AdminState};
 use crate::monte_carlo::{self, McConfig, McState, McStatus};
 use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
-    MapInfo, SelfState, SensorMode, ServerMsg, ShipSpecs, SpectatorEvent, SpectatorMsg,
-    SpectatorShell, SpectatorShip, TickEvent,
+    MapInfo, PowerupStatus, SelfState, SensorMode, ServerMsg, ShipSpecs, SpectatorDecoy,
+    SpectatorEvent, SpectatorMsg, SpectatorShell, SpectatorShip, SpectatorSmokeCloud, TickEvent,
 };
 use crate::replay::{
     self, ReplayBot, ReplayCommand, ReplayEnd, ReplayHeader, ReplayRecord, ReplayTick,
     ReplayWriter, REPLAY_FORMAT_VERSION,
 };
 use crate::sim::combat::{self, CombatEvent, FireError};
+use crate::sim::powerups::{self, ActivationError, PowerupId};
 use crate::sim::sensors::{self, Contact as SimContact, ContactKind as SimContactKind};
 use crate::sim::{physics, BotId, Ship, ShipId, SimConfig, World};
 
@@ -92,6 +93,10 @@ struct BotEntry {
     /// `tick_hz` ticks are trimmed at push time. Observability only — not part of any
     /// simulation state.
     command_ticks: VecDeque<u64>,
+    /// Powerups picked by this bot, in pick order (length 0..=2). Set by
+    /// `select_powerups` while in `Lobby`. Mirrored onto the bot's ship at `start_match`
+    /// so the simulation can read it without going through the room.
+    selected_powerups: Vec<PowerupId>,
 }
 
 /// A command waiting to be applied at the next tick. Lifted from `BotMsg::Command` —
@@ -104,6 +109,7 @@ pub struct PendingCommand {
     pub rudder: f32,
     pub sensor_mode: SensorMode,
     pub fire: Option<FireCommand>,
+    pub activate_powerup: Option<PowerupId>,
 }
 
 /// What the room hands back to a connection task after a successful `BotConnect`.
@@ -266,6 +272,14 @@ pub enum RoomEvent {
     },
     BotReady {
         bot_id: BotId,
+    },
+    /// Bot declared its powerup loadout for the match. Only honoured in `Lobby`. The
+    /// room validates the list (exactly 2, distinct, all known) and on success replaces
+    /// the bot's previous selection; on failure it sends a typed `error` frame to the
+    /// bot and leaves the previous selection unchanged.
+    BotSelectPowerups {
+        bot_id: BotId,
+        powerups: Vec<PowerupId>,
     },
     BotCommand {
         bot_id: BotId,
@@ -583,7 +597,7 @@ impl Room {
         if self.state != RoomState::Running {
             self.world.tick = self.world.tick.saturating_add(1);
             // Spectators still see the lobby/ended state — full ground truth, no events.
-            self.broadcast_spectator_world(&[]);
+            self.broadcast_spectator_world(&[], &[]);
             return;
         }
 
@@ -593,6 +607,9 @@ impl Room {
         // replay log after the tick counter is bumped so the on-disk tick number matches
         // the post-step world state.
         let mut applied_commands: Vec<ReplayCommand> = Vec::new();
+        // Powerup activations that succeeded this tick. Surfaced to bots / spectators
+        // via `TickEvent::PowerupActivated` / `SpectatorEvent::PowerupActivated`.
+        let mut powerup_activations: Vec<(ShipId, PowerupId)> = Vec::new();
 
         // 1. Drain pending commands and apply them in BotId order. Fire processed after
         //    throttle/rudder so a successful shot is reflected in this tick's cooldown.
@@ -627,6 +644,21 @@ impl Room {
                     Err(err) => self.send_fire_error(bot_id, err),
                 }
             }
+            if let Some(powerup) = cmd.activate_powerup {
+                match powerups::activate(&mut self.world, &ship_id, powerup) {
+                    Ok(()) => {
+                        powerup_activations.push((ship_id.clone(), powerup));
+                        info!(
+                            room = %self.name,
+                            bot = %bot_id,
+                            powerup = powerup.as_str(),
+                            tick = self.world.tick,
+                            "powerup activated",
+                        );
+                    }
+                    Err(err) => self.send_activation_error(bot_id, powerup, err),
+                }
+            }
             // Record the raw command (un-clamped) so a replay re-applies the exact same
             // input the live run saw. Clamping happens deterministically inside step_tick,
             // so the post-clamp ship state will match.
@@ -637,6 +669,7 @@ impl Room {
                     rudder: cmd.rudder,
                     sensor_mode: cmd.sensor_mode,
                     fire: cmd.fire,
+                    activate_powerup: cmd.activate_powerup,
                 });
             }
         }
@@ -644,6 +677,11 @@ impl Room {
         // 2 + 3. Movement, then shell flight & splashes.
         physics::step_world(&mut self.world);
         let combat_events = combat::step_shells(&mut self.world);
+        // 3.5: powerup maintenance — repair regen, smoke/decoy GC. Runs *before* the
+        // tick-counter bump so effects that expire at tick `t` stop applying once
+        // `world.tick == t`. (Maintenance reads `world.tick`, so doing it here is correct
+        // — the bump comes next.)
+        powerups::step_tick_maintenance(&mut self.world);
 
         // 4. Bump the tick counter so the outbound frames carry the new tick number.
         self.world.tick = self.world.tick.saturating_add(1);
@@ -653,9 +691,10 @@ impl Room {
         // tick the bots received next time around.
         self.write_replay_tick(applied_commands);
 
-        // Spectator broadcast: full ground truth + every combat event. Done before the
-        // end-of-match check so the deciding tick (with its death events) is visible.
-        self.broadcast_spectator_world(&combat_events);
+        // Spectator broadcast: full ground truth + every combat event + powerup
+        // activations. Done before the end-of-match check so the deciding tick (with its
+        // death events) is visible.
+        self.broadcast_spectator_world(&combat_events, &powerup_activations);
 
         // Fold this tick's combat into the per-bot match statistics. Runs before the
         // end-of-match check so the deciding tick's hits and kills are counted.
@@ -709,23 +748,52 @@ impl Room {
                     &mut self.rng,
                 ),
             };
-            let contacts = sim_contacts
+            // If this bot has a pending counter-battery trace, splice a synthetic precise
+            // contact in *before* the natural ones so it's near the front of the list.
+            // Done in-place rather than in `sensors::active_contacts` so the trace works
+            // regardless of the bot's current sensor mode.
+            let mut contacts: Vec<ProtocolContact> = sim_contacts
                 .into_iter()
                 .enumerate()
                 .map(|(i, c)| translate_contact(i, c))
                 .collect();
-            let events = filter_events_for_bot(
+            self.consume_counter_battery_reveal(&ship_id, viewer_pos, &mut contacts);
+
+            let mut events = filter_events_for_bot(
                 &ship_id,
                 viewer_pos,
                 sensor_mode,
                 &self.world.config,
                 &combat_events,
             );
+            // Activation events: always show your own; for others, only if the activating
+            // ship would currently be a contact for the viewer.
+            for (acting_ship_id, powerup) in &powerup_activations {
+                let visible = acting_ship_id == &ship_id
+                    || self.is_ship_visible_to(&ship_id, viewer_pos, sensor_mode, acting_ship_id);
+                if visible {
+                    events.push(TickEvent::PowerupActivated {
+                        ship_id: acting_ship_id.clone(),
+                        powerup: *powerup,
+                    });
+                }
+            }
 
             let entry = self.bots.get(bot_id).expect("bot still present");
             let ship = self.world.ships.get(&ship_id).expect("ship still present");
+            let world_tick = self.world.tick;
+            let powerup_status: Vec<PowerupStatus> = ship
+                .powerups
+                .selected
+                .iter()
+                .map(|id| PowerupStatus {
+                    id: *id,
+                    used: ship.powerups.used.contains(id),
+                    active_ticks_left: ship.powerups.ticks_remaining(*id, world_tick),
+                })
+                .collect();
             let tick_msg = ServerMsg::Tick {
-                tick: self.world.tick,
+                tick: world_tick,
                 deadline_ms: self.tick_deadline_ms,
                 self_state: SelfState {
                     pos: [ship.pos.x, ship.pos.y],
@@ -735,6 +803,8 @@ impl Room {
                     ammo: ship.ammo,
                     rudder: ship.rudder,
                     throttle: ship.throttle,
+                    selected_powerups: ship.powerups.selected.clone(),
+                    powerup_status,
                 },
                 contacts,
                 events,
@@ -893,7 +963,11 @@ impl Room {
 
     /// Build a `SpectatorMsg::World` from the current world state and the given combat
     /// events. Shared by the live broadcast path and offline replay capture.
-    fn build_spectator_world(&self, events: &[CombatEvent]) -> SpectatorMsg {
+    fn build_spectator_world(
+        &self,
+        events: &[CombatEvent],
+        activations: &[(ShipId, PowerupId)],
+    ) -> SpectatorMsg {
         // Ships in BotId order via the bot registry, so the wire payload is stable across
         // identical runs. Falling back to `world.ships` would also be deterministic
         // (BTreeMap on ShipId), but going through `bots` keeps `bot_name` in lock-step.
@@ -910,6 +984,16 @@ impl Room {
                     .iter()
                     .filter(|&&t| t >= cps_cutoff)
                     .count() as f32;
+                let powerup_status: Vec<PowerupStatus> = ship
+                    .powerups
+                    .selected
+                    .iter()
+                    .map(|id| PowerupStatus {
+                        id: *id,
+                        used: ship.powerups.used.contains(id),
+                        active_ticks_left: ship.powerups.ticks_remaining(*id, world_tick),
+                    })
+                    .collect();
                 Some(SpectatorShip {
                     id: ship.id.clone(),
                     bot_name: entry.name.clone(),
@@ -924,6 +1008,8 @@ impl Room {
                     ready: entry.ready,
                     commands_per_sec: recent,
                     sensor_mode: entry.sensor_mode,
+                    selected_powerups: ship.powerups.selected.clone(),
+                    powerup_status,
                 })
             })
             .collect();
@@ -940,7 +1026,7 @@ impl Room {
             })
             .collect();
 
-        let events: Vec<SpectatorEvent> = events
+        let mut spec_events: Vec<SpectatorEvent> = events
             .iter()
             .map(|e| match e {
                 CombatEvent::Hit {
@@ -957,19 +1043,50 @@ impl Room {
                 },
             })
             .collect();
+        for (ship_id, powerup) in activations {
+            spec_events.push(SpectatorEvent::PowerupActivated {
+                ship_id: ship_id.clone(),
+                powerup: *powerup,
+            });
+        }
+
+        let smoke_clouds: Vec<SpectatorSmokeCloud> = self
+            .world
+            .smoke_clouds
+            .iter()
+            .map(|c| SpectatorSmokeCloud {
+                pos: [c.pos.x, c.pos.y],
+                radius: c.radius,
+                expires_at: c.expires_at,
+            })
+            .collect();
+        let decoys: Vec<SpectatorDecoy> = self
+            .world
+            .decoys
+            .iter()
+            .map(|d| SpectatorDecoy {
+                fake_id: d.fake_id,
+                owner: d.owner.clone(),
+                pos: [d.pos.x, d.pos.y],
+                heading_deg: d.heading_deg,
+                expires_at: d.expires_at,
+            })
+            .collect();
 
         SpectatorMsg::World {
             tick: self.world.tick,
             ships,
             shells,
-            events,
+            events: spec_events,
+            smoke_clouds,
+            decoys,
         }
     }
 
     /// Snapshot the current world as a `SpectatorMsg::World` with no combat events.
     /// Replay capture uses this for the tick-0 frame, which precedes any simulation step.
     pub fn spectator_world_snapshot(&self) -> SpectatorMsg {
-        self.build_spectator_world(&[])
+        self.build_spectator_world(&[], &[])
     }
 
     /// Build a `SpectatorMsg::World` and push it onto the spectator broadcast channel.
@@ -980,7 +1097,11 @@ impl Room {
     /// the room throttles broadcasts to every Nth tick (configurable). `game_over` ticks
     /// always emit a frame so the spectator UI sees the deciding frame regardless of
     /// throttle.
-    fn broadcast_spectator_world(&self, events: &[CombatEvent]) {
+    fn broadcast_spectator_world(
+        &self,
+        events: &[CombatEvent],
+        activations: &[(ShipId, PowerupId)],
+    ) {
         let Some(tx) = self.spectator_tx.as_ref() else {
             return;
         };
@@ -990,8 +1111,8 @@ impl Room {
         }
         // Spectator throttling for MC mode. `0` disables non-final broadcasts entirely;
         // any positive value gates on `tick % throttle == 0`. The deciding tick (the one
-        // accompanied by combat events that produced a death) bypasses the gate so the
-        // UI never misses the final frame.
+        // accompanied by combat events that produced a death, or an activation worth
+        // highlighting) bypasses the gate so the UI never misses the final frame.
         let throttle = self.spectator_throttle();
         let is_deciding_tick = events
             .iter()
@@ -1003,7 +1124,7 @@ impl Room {
         {
             return;
         }
-        let msg = self.build_spectator_world(events);
+        let msg = self.build_spectator_world(events, activations);
         let json = match serde_json::to_string(&msg) {
             Ok(s) => s,
             Err(e) => {
@@ -1054,15 +1175,23 @@ impl Room {
         self.world.tick = 0;
         self.world.shells.clear();
         self.world.next_shell_index = 0;
+        self.world.smoke_clouds.clear();
+        self.world.decoys.clear();
+        self.world.next_decoy_index = 0;
         for entry in self.bots.values_mut() {
             if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
                 ship.reset_for_round(center, 0.0, &config);
+                // Returning to Lobby drops the committed loadout — bots may rebind for
+                // the next match. The empty list is reflected back through the room's
+                // copy via `register_bot`-time defaults; we also clear here for clarity.
+                ship.powerups.selected.clear();
             }
             entry.ready = false;
             entry.pending_command = None;
             entry.sensor_mode = SensorMode::Passive;
             entry.last_fire_error_tick = None;
             entry.command_ticks.clear();
+            entry.selected_powerups.clear();
         }
         self.tick_send_time = None;
         self.previous_active_pingers.clear();
@@ -1205,6 +1334,174 @@ impl Room {
         }
     }
 
+    /// If this bot has a pending counter-battery trace reveal, append a synthetic precise
+    /// contact for the attacker to `contacts` and decrement the reveal counter. The
+    /// synthetic contact carries a `cbt_<index>` id and full confidence so bots can tell
+    /// it apart from a regular sensor return if they want to.
+    fn consume_counter_battery_reveal(
+        &mut self,
+        ship_id: &ShipId,
+        viewer_pos: Vec2,
+        contacts: &mut Vec<ProtocolContact>,
+    ) {
+        let attacker_pos = {
+            let ship = match self.world.ships.get(ship_id) {
+                Some(s) => s,
+                None => return,
+            };
+            if ship.powerups.trace_pending_reveals == 0 {
+                return;
+            }
+            let attacker_id = match &ship.powerups.trace_attacker {
+                Some(a) => a.clone(),
+                None => return,
+            };
+            self.world.ships.get(&attacker_id).map(|s| s.pos)
+        };
+        // Insert at front so the trace is easy to find regardless of how many other
+        // contacts the sensor returned.
+        if let Some(pos) = attacker_pos {
+            let to = pos - viewer_pos;
+            let dist = to.length();
+            let bearing = {
+                let deg = to.x.atan2(-to.y).to_degrees();
+                if deg < 0.0 {
+                    deg + 360.0
+                } else {
+                    deg
+                }
+            };
+            let id_index = contacts.len();
+            contacts.insert(
+                0,
+                ProtocolContact {
+                    id: format!("cbt_{id_index}"),
+                    kind: ProtocolContactKind::Ship,
+                    pos: [pos.x, pos.y],
+                    bearing_deg: bearing,
+                    range: Some(dist),
+                    confidence: 1.0,
+                },
+            );
+        }
+        // Decrement reveals regardless of whether the attacker still exists — a missing
+        // attacker (e.g. disconnected) still counts down so the trace doesn't get stuck.
+        let ship = self
+            .world
+            .ships
+            .get_mut(ship_id)
+            .expect("ship still present");
+        ship.powerups.trace_pending_reveals = ship.powerups.trace_pending_reveals.saturating_sub(1);
+        if ship.powerups.trace_pending_reveals == 0 {
+            ship.powerups.trace_attacker = None;
+        }
+    }
+
+    /// Coarse "would the viewer currently see this ship" check, used to gate
+    /// `PowerupActivated` events. Mirrors the sensor module's range rules without
+    /// re-running the RNG: any ship inside the relevant range counts as visible. Smoke
+    /// blocks for active; silent_running hides from passive.
+    fn is_ship_visible_to(
+        &self,
+        viewer_ship_id: &ShipId,
+        viewer_pos: Vec2,
+        sensor_mode: SensorMode,
+        target_ship_id: &ShipId,
+    ) -> bool {
+        let Some(target) = self.world.ships.get(target_ship_id) else {
+            return false;
+        };
+        if !target.alive {
+            return false;
+        }
+        let tick = self.world.tick;
+        let config = &self.world.config;
+        let dist = target.pos.distance(viewer_pos);
+        match sensor_mode {
+            SensorMode::Active => {
+                let viewer = self.world.ships.get(viewer_ship_id);
+                if let Some(v) = viewer {
+                    if v.powerups.is_active(PowerupId::EmpBurst, tick) {
+                        return false;
+                    }
+                }
+                let awacs = viewer
+                    .map(|v| v.powerups.is_active(PowerupId::AwacsScan, tick))
+                    .unwrap_or(false);
+                let base_range = config.active_radar_range;
+                let radar_range = if awacs {
+                    base_range * config.powerups.awacs_range_mult
+                } else {
+                    base_range
+                };
+                let effective_range =
+                    if target.powerups.is_active(PowerupId::SilentRunning, tick) && !awacs {
+                        radar_range * config.powerups.silent_running_active_range_mult
+                    } else {
+                        radar_range
+                    };
+                if dist > effective_range {
+                    return false;
+                }
+                // Smoke blocks active sight when target is in a cloud the viewer isn't in.
+                for cloud in &self.world.smoke_clouds {
+                    if cloud.expires_at <= tick {
+                        continue;
+                    }
+                    let target_in = target.pos.distance(cloud.pos) <= cloud.radius;
+                    if !target_in {
+                        continue;
+                    }
+                    let viewer_in = viewer_pos.distance(cloud.pos) <= cloud.radius;
+                    if !viewer_in {
+                        return false;
+                    }
+                }
+                true
+            }
+            SensorMode::Passive => {
+                if target.powerups.is_active(PowerupId::SilentRunning, tick) {
+                    return false;
+                }
+                let nearby = config.passive_hear_nearby_range;
+                let active_hear = config.passive_hear_active_range;
+                let pinging = self.previous_active_pingers.contains(target_ship_id);
+                dist <= nearby || (pinging && dist <= active_hear)
+            }
+        }
+    }
+
+    /// Translate an `ActivationError` into a typed protocol error frame.
+    fn send_activation_error(&mut self, bot_id: &BotId, id: PowerupId, err: ActivationError) {
+        let (code, msg): (&str, String) = match err {
+            ActivationError::NotSelected => (
+                error_code::POWERUP_NOT_SELECTED,
+                format!("powerup `{}` was not picked for this match", id.as_str()),
+            ),
+            ActivationError::AlreadyUsed => (
+                error_code::POWERUP_ALREADY_USED,
+                format!(
+                    "powerup `{}` has already been activated this match",
+                    id.as_str()
+                ),
+            ),
+            // Dead ships / unknown ships are silent — bot is about to get `game_over` or
+            // already disconnected.
+            ActivationError::ShipDead | ActivationError::UnknownShip => return,
+        };
+        let Some(entry) = self.bots.get_mut(bot_id) else {
+            return;
+        };
+        if let Err(e) = entry.outbound.try_send(protocol::error_msg(code, msg)) {
+            debug!(
+                room = %self.name,
+                bot = %bot_id,
+                error = %e,
+                "powerup activation error not delivered",
+            );
+        }
+    }
+
     /// Translate a `FireError` into a protocol error and queue it on the bot's outbound
     /// channel. `ShipDead` and `UnknownShip` are silent — the bot already received (or
     /// is about to receive) `game_over`; spamming an error message would be noise.
@@ -1285,6 +1582,9 @@ impl Room {
                 if changed {
                     self.publish_admin_state();
                 }
+            }
+            RoomEvent::BotSelectPowerups { bot_id, powerups } => {
+                self.handle_select_powerups(bot_id, powerups);
             }
             RoomEvent::BotCommand { bot_id, command } => {
                 self.handle_bot_command(bot_id, command);
@@ -1394,6 +1694,54 @@ impl Room {
         self.world.config = config;
         info!(room = %self.name, "match parameters updated");
         Ok(())
+    }
+
+    /// Validate `powerups` and record them on the bot's entry. Constraints (per
+    /// `docs/POWERUPS.md`): exactly two distinct entries, both must be known ids, and the
+    /// room must be in `Lobby`. On failure the previous selection (if any) is preserved
+    /// and a typed `error` frame is sent to the bot.
+    fn handle_select_powerups(&mut self, bot_id: BotId, powerups: Vec<PowerupId>) {
+        let state = self.state;
+        let Some(entry) = self.bots.get_mut(&bot_id) else {
+            warn!(
+                room = %self.name,
+                bot = %bot_id,
+                "select_powerups from unknown bot, ignored"
+            );
+            return;
+        };
+        if state != RoomState::Lobby {
+            let _ = entry.outbound.try_send(protocol::error_msg(
+                error_code::POWERUP_LOBBY_ONLY,
+                "powerup selection is only accepted while the room is in lobby",
+            ));
+            return;
+        }
+        if powerups.len() != 2 {
+            let _ = entry.outbound.try_send(protocol::error_msg(
+                error_code::POWERUP_WRONG_COUNT,
+                format!(
+                    "select_powerups requires exactly 2 entries, got {}",
+                    powerups.len()
+                ),
+            ));
+            return;
+        }
+        if powerups[0] == powerups[1] {
+            let _ = entry.outbound.try_send(protocol::error_msg(
+                error_code::POWERUP_DUPLICATE,
+                "select_powerups requires two distinct powerups",
+            ));
+            return;
+        }
+        entry.selected_powerups = powerups;
+        info!(
+            room = %self.name,
+            bot = %bot_id,
+            picks = ?entry.selected_powerups,
+            "bot loadout selected",
+        );
+        self.publish_admin_state();
     }
 
     /// Queue a command for the next tick or reject it as `late_command` per §1.3 of the
@@ -1527,15 +1875,18 @@ impl Room {
         for (i, bot_id) in ordered_ids.iter().enumerate() {
             let (pos, heading_deg) = layout[i];
 
-            let ship_id = {
+            let (ship_id, selected_powerups) = {
                 let entry = self.bots.get_mut(bot_id).expect("snapshot still in map");
                 // Drop any commands queued before the match started.
                 entry.pending_command = None;
-                entry.ship_id.clone()
+                (entry.ship_id.clone(), entry.selected_powerups.clone())
             };
             if let Some(ship) = self.world.ships.get_mut(&ship_id) {
                 // A fresh hull for the match, sized by the configured parameters.
                 ship.reset_for_round(pos, heading_deg, &config);
+                // Mirror the bot's loadout onto the ship so the simulation can read it
+                // without going through the room.
+                ship.powerups.selected = selected_powerups;
             }
 
             let entry = self.bots.get(bot_id).expect("snapshot still in map");
@@ -1553,6 +1904,10 @@ impl Room {
         self.world.tick = 0;
         self.world.shells.clear();
         self.world.next_shell_index = 0;
+        // Drop any leftover smoke / decoy state from a previous match.
+        self.world.smoke_clouds.clear();
+        self.world.decoys.clear();
+        self.world.next_decoy_index = 0;
         self.state = RoomState::Running;
         // Cleared on entry; the first `step_tick` will populate them after broadcasting.
         self.tick_send_time = None;
@@ -1650,13 +2005,14 @@ impl Room {
                         bot_id: b.bot_id.clone(),
                         ship_id: b.ship_id.clone(),
                         name: b.name.clone(),
+                        selected_powerups: b.selected_powerups.clone(),
                     })
                     .collect();
                 bots.sort_by_key(|b| replay::bot_id_seq(&b.bot_id));
                 bots
             },
         };
-        if let Err(e) = writer.write(&ReplayRecord::Header(header)) {
+        if let Err(e) = writer.write(&ReplayRecord::Header(Box::new(header))) {
             warn!(room = %self.name, error = %e, "failed to write replay header");
         }
     }
@@ -1975,6 +2331,7 @@ impl Room {
             },
             tick_hz: self.tick_hz,
             ship_specs: ShipSpecs::from_config(&self.world.config),
+            available_powerups: PowerupId::all().to_vec(),
         };
         // The receiver was just created and has buffer >= 1, so this never fails.
         out_tx
@@ -1994,6 +2351,7 @@ impl Room {
                 sensor_mode: SensorMode::Passive,
                 last_fire_error_tick: None,
                 command_ticks: VecDeque::new(),
+                selected_powerups: Vec::new(),
             },
         );
 
@@ -2566,6 +2924,7 @@ mod tests {
             rudder,
             sensor_mode: SensorMode::Passive,
             fire: None,
+            activate_powerup: None,
         }
     }
 
@@ -2789,6 +3148,7 @@ mod tests {
             rudder,
             sensor_mode: mode,
             fire: None,
+            activate_powerup: None,
         }
     }
 
@@ -2967,6 +3327,7 @@ mod tests {
             rudder: 0.0,
             sensor_mode: mode,
             fire: Some(fire),
+            activate_powerup: None,
         }
     }
 
@@ -3262,12 +3623,15 @@ mod tests {
         room.world.ships.get_mut(&r1.ship_id).unwrap().hp = 1;
         room.world.ships.get_mut(&r2.ship_id).unwrap().hp = 1;
         // Spawn a shell at each ship's position with TTL=1 so it explodes next tick.
+        let cfg = room.world.config;
         room.world.shells.push(crate::sim::world::Shell {
             id_index: 0,
             source_ship: r2.ship_id.clone(),
             pos: Vec2::new(400.0, 500.0),
             vel: Vec2::ZERO,
             ttl_ticks: 1,
+            splash_radius: cfg.splash_radius,
+            max_splash_damage: cfg.max_splash_damage,
         });
         room.world.shells.push(crate::sim::world::Shell {
             id_index: 1,
@@ -3275,6 +3639,8 @@ mod tests {
             pos: Vec2::new(500.0, 500.0),
             vel: Vec2::ZERO,
             ttl_ticks: 1,
+            splash_radius: cfg.splash_radius,
+            max_splash_damage: cfg.max_splash_damage,
         });
         room.world.next_shell_index = 2;
         room.handle_event(RoomEvent::BotCommand {

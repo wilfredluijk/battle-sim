@@ -81,6 +81,7 @@ impl ScriptedBot {
                         SensorMode::Passive
                     },
                     fire,
+                    activate_powerup: None,
                 };
                 room.handle_event(RoomEvent::BotCommand {
                     bot_id: self.bot_id.clone(),

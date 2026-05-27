@@ -10,6 +10,8 @@ Runnable Python bots demonstrating each tactical layer of the SDK:
   (`Tracker`, `Gunner`, `Helm`, `Evader`, `SensorPolicy`).
 - `strategist_bot.py` — Layer 3 `TacticalBot` with a single `decide()`
   method.
+- `loadout_bot.py` — picks two powerups and chains them in a burst combo.
+  See [`../docs/POWERUPS.md`](../docs/POWERUPS.md) for the full catalog.
 
 See [`../sdk-python/README.md`](../sdk-python/README.md) for the layered
 SDK overview, the base API, and the tactical toolkit reference.

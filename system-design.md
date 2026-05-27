@@ -96,7 +96,7 @@ States:
                           └────────────────────────────┴───────────────────────┘
 ```
 
-- **Lobby**: bots can connect, register, and signal `ready`. Operator can start when ready.
+- **Lobby**: bots can connect, register, optionally `select_powerups`, and signal `ready`. Operator can start when ready.
 - **Running**: tick loop active. New bot connections rejected. Spectators can join any time.
 - **Ended**: final state frozen and broadcast. Replay log written to disk.
 
@@ -147,14 +147,19 @@ loop {
     // 2. Collect commands until deadline (or all bots responded)
     let commands = collect_commands_until(&room, deadline);
 
-    // 3. Apply commands deterministically (sorted by bot_id for stable order)
+    // 3. Apply commands deterministically (sorted by bot_id for stable order).
+    //    Each command may carry an `activate_powerup` resolved alongside fire.
     apply_commands(&mut world, commands);
 
-    // 4. Advance physics one tick
+    // 4. Advance physics one tick (effective speed/accel/turn read powerup state)
     step_physics(&mut world, dt);
 
-    // 5. Resolve weapons, damage, deaths
+    // 5. Resolve weapons, damage, deaths (per-shell heavy buff baked at fire time;
+    //    reinforced_hull scales incoming damage; counter_battery_trace arms here)
     resolve_combat(&mut world);
+
+    // 5b. Powerup maintenance: repair_drones regen, GC expired smoke clouds & decoys.
+    step_powerup_maintenance(&mut world);
 
     // 6. Broadcast full state to spectators
     broadcast_spectator(&world);

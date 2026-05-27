@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sim::PowerupId;
+
 /// 2D position / velocity, serialized as a 2-element JSON array `[x, y]`.
 pub type Pos = [f32; 2];
 pub type Vel = [f32; 2];
@@ -28,6 +30,18 @@ pub enum BotMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fire: Option<FireCommand>,
         sensor_mode: SensorMode,
+        /// One-off powerup activation for this tick. Server validates that the bot picked
+        /// the powerup before the match and has not yet used it; an invalid id earns a
+        /// typed `error` frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activate_powerup: Option<PowerupId>,
+    },
+    /// Declare the (up to 2 distinct) powerups the bot will use for this match. May only
+    /// be sent while the room is in `lobby` and before `ready`. Sending it twice replaces
+    /// the previous selection; an invalid loadout earns a typed `error` frame and leaves
+    /// the previous selection (if any) intact.
+    SelectPowerups {
+        powerups: Vec<PowerupId>,
     },
 }
 
@@ -57,6 +71,10 @@ pub enum ServerMsg {
         map: MapInfo,
         tick_hz: u32,
         ship_specs: ShipSpecs,
+        /// Catalog of powerup ids this server understands. Bots use this to discover what
+        /// they may pass to `select_powerups`. Forward-compatible: future servers may add
+        /// entries; SDKs that don't recognise an id should leave it untouched.
+        available_powerups: Vec<PowerupId>,
     },
     GameStart {
         tick: u64,
@@ -133,7 +151,7 @@ impl ShipSpecs {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SelfState {
     pub pos: Pos,
     pub heading_deg: f32,
@@ -142,6 +160,23 @@ pub struct SelfState {
     pub ammo: u32,
     pub rudder: f32,
     pub throttle: f32,
+    /// Loadout the bot picked for the match (in pick order, up to 2 entries). Sent on
+    /// every tick so a bot reconnecting after a brief drop can rehydrate without state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_powerups: Vec<PowerupId>,
+    /// One entry per picked powerup, in the same order as `selected_powerups`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub powerup_status: Vec<PowerupStatus>,
+}
+
+/// Live status for one of the bot's picked powerups. Sent inside `tick.self.powerup_status`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PowerupStatus {
+    pub id: PowerupId,
+    /// True once the bot has activated this powerup; activating a used powerup is rejected.
+    pub used: bool,
+    /// Ticks remaining of the active effect. `0` when not currently active.
+    pub active_ticks_left: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -166,8 +201,20 @@ pub enum ContactKind {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TickEvent {
-    Hit { amount: u32 },
-    ShellSplash { pos: Pos },
+    Hit {
+        amount: u32,
+    },
+    ShellSplash {
+        pos: Pos,
+    },
+    /// A powerup was activated. Sent to the activating bot for any activation, and to
+    /// other bots only if the activating ship is currently a sensor contact (subject to
+    /// the same filtering as ship contacts). Counter-battery trace reveals come in via
+    /// regular `contacts`, not this event.
+    PowerupActivated {
+        ship_id: String,
+        powerup: PowerupId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +229,12 @@ pub enum SpectatorMsg {
         ships: Vec<SpectatorShip>,
         shells: Vec<SpectatorShell>,
         events: Vec<SpectatorEvent>,
+        /// Live smoke clouds on the battlefield. Empty when no `smoke_screen` is active.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        smoke_clouds: Vec<SpectatorSmokeCloud>,
+        /// Live decoy phantoms.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decoys: Vec<SpectatorDecoy>,
     },
 }
 
@@ -207,6 +260,31 @@ pub struct SpectatorShip {
     pub commands_per_sec: f32,
     /// Last commanded sensor mode. Used by the renderer to draw an active-radar ring.
     pub sensor_mode: SensorMode,
+    /// Powerups this bot picked for the match (in pick order).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_powerups: Vec<PowerupId>,
+    /// Per-pick status for the spectator HUD: which are used, which are active, and how
+    /// many ticks of effect remain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub powerup_status: Vec<PowerupStatus>,
+}
+
+/// One smoke cloud on the spectator wire.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct SpectatorSmokeCloud {
+    pub pos: Pos,
+    pub radius: f32,
+    pub expires_at: u64,
+}
+
+/// One decoy phantom on the spectator wire.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SpectatorDecoy {
+    pub fake_id: u32,
+    pub owner: String,
+    pub pos: Pos,
+    pub heading_deg: f32,
+    pub expires_at: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -223,6 +301,7 @@ pub enum SpectatorEvent {
     Hit { ship_id: String, amount: u32 },
     ShellSplash { pos: Pos },
     Death { ship_id: String },
+    PowerupActivated { ship_id: String, powerup: PowerupId },
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +324,13 @@ pub mod error_code {
     pub const NON_FINITE_VALUE: &str = "non_finite_value";
     pub const HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
     pub const CONNECTION_LIMIT: &str = "connection_limit";
+    // --- Powerups ----------------------------------------------------------
+    pub const POWERUP_UNKNOWN: &str = "powerup_unknown";
+    pub const POWERUP_DUPLICATE: &str = "powerup_duplicate";
+    pub const POWERUP_WRONG_COUNT: &str = "powerup_wrong_count";
+    pub const POWERUP_LOBBY_ONLY: &str = "powerup_lobby_only";
+    pub const POWERUP_NOT_SELECTED: &str = "powerup_not_selected";
+    pub const POWERUP_ALREADY_USED: &str = "powerup_already_used";
 }
 
 /// Maximum length of a bot's `hello.name`. Names are also restricted to
@@ -310,6 +396,7 @@ mod tests {
                 range: 300.0,
             }),
             sensor_mode: SensorMode::Active,
+            activate_powerup: None,
         });
         roundtrip(&BotMsg::Command {
             tick: 143,
@@ -317,6 +404,10 @@ mod tests {
             rudder: 0.0,
             fire: None,
             sensor_mode: SensorMode::Passive,
+            activate_powerup: Some(PowerupId::Overdrive),
+        });
+        roundtrip(&BotMsg::SelectPowerups {
+            powerups: vec![PowerupId::RapidFire, PowerupId::HeavyShell],
         });
     }
 
@@ -331,6 +422,7 @@ mod tests {
             },
             tick_hz: 10,
             ship_specs: ShipSpecs::from_config(&crate::sim::SimConfig::default()),
+            available_powerups: PowerupId::all().to_vec(),
         });
         roundtrip(&ServerMsg::GameStart {
             tick: 0,
@@ -348,6 +440,19 @@ mod tests {
                 ammo: 14,
                 rudder: -0.3,
                 throttle: 0.8,
+                selected_powerups: vec![PowerupId::Overdrive, PowerupId::RapidFire],
+                powerup_status: vec![
+                    PowerupStatus {
+                        id: PowerupId::Overdrive,
+                        used: false,
+                        active_ticks_left: 0,
+                    },
+                    PowerupStatus {
+                        id: PowerupId::RapidFire,
+                        used: true,
+                        active_ticks_left: 12,
+                    },
+                ],
             },
             contacts: vec![Contact {
                 id: "c_a1".into(),
@@ -398,6 +503,19 @@ mod tests {
                 ready: true,
                 commands_per_sec: 10.0,
                 sensor_mode: SensorMode::Active,
+                selected_powerups: vec![PowerupId::SmokeScreen, PowerupId::AwacsScan],
+                powerup_status: vec![
+                    PowerupStatus {
+                        id: PowerupId::SmokeScreen,
+                        used: true,
+                        active_ticks_left: 0,
+                    },
+                    PowerupStatus {
+                        id: PowerupId::AwacsScan,
+                        used: false,
+                        active_ticks_left: 0,
+                    },
+                ],
             }],
             shells: vec![SpectatorShell {
                 id_index: 22,
@@ -416,7 +534,17 @@ mod tests {
                 SpectatorEvent::Death {
                     ship_id: "s_2".into(),
                 },
+                SpectatorEvent::PowerupActivated {
+                    ship_id: "s_1".into(),
+                    powerup: PowerupId::SmokeScreen,
+                },
             ],
+            smoke_clouds: vec![SpectatorSmokeCloud {
+                pos: [203.4, 511.7],
+                radius: 60.0,
+                expires_at: 222,
+            }],
+            decoys: vec![],
         });
     }
 
@@ -439,6 +567,7 @@ mod tests {
                 rudder,
                 fire,
                 sensor_mode,
+                activate_powerup,
             } => {
                 assert_eq!(tick, 142);
                 assert!((throttle - 0.8).abs() < 1e-6);
@@ -451,6 +580,7 @@ mod tests {
                     })
                 );
                 assert_eq!(sensor_mode, SensorMode::Active);
+                assert!(activate_powerup.is_none());
             }
             other => panic!("expected Command, got {other:?}"),
         }

@@ -49,3 +49,60 @@ pub const PASSIVE_CONTACT_PLACEHOLDER_DISTANCE: f32 = 100.0;
 
 /// HP cost when a ship slams into a wall.
 pub const WALL_BUMP_DAMAGE: u32 = 2;
+
+// --- Powerups --------------------------------------------------------------
+// Defaults for [`super::config::PowerupConfig`]. See `docs/POWERUPS.md` for what each
+// powerup does. Durations are in *ticks* — at the default `tick_hz = 10`, 50 ticks = 5 s.
+
+// Overdrive: speed/accel/turn boost.
+pub const OVERDRIVE_DURATION_TICKS: u32 = 50;
+pub const OVERDRIVE_SPEED_MULT: f32 = 1.6;
+pub const OVERDRIVE_ACCEL_MULT: f32 = 1.6;
+pub const OVERDRIVE_TURN_MULT: f32 = 1.5;
+
+// Reinforced hull: incoming splash damage scaled down.
+pub const REINFORCED_HULL_DURATION_TICKS: u32 = 60;
+pub const REINFORCED_HULL_DAMAGE_MULT: f32 = 0.4;
+
+// Repair drones: regenerate HP for a window.
+pub const REPAIR_DRONES_DURATION_TICKS: u32 = 60;
+pub const REPAIR_DRONES_HP_PER_TICK: u32 = 1;
+
+// Smoke screen: static AoE cloud that blocks active radar lines of sight from outside.
+pub const SMOKE_SCREEN_DURATION_TICKS: u32 = 80;
+pub const SMOKE_SCREEN_RADIUS: f32 = 60.0;
+
+// Rapid fire: gun cooldown multiplier.
+pub const RAPID_FIRE_DURATION_TICKS: u32 = 50;
+pub const RAPID_FIRE_COOLDOWN_MULT: f32 = 0.3;
+
+// Heavy shell: buff applied to shells fired during the window. Shell carries the buff.
+pub const HEAVY_SHELL_DURATION_TICKS: u32 = 30;
+pub const HEAVY_SHELL_SPLASH_MULT: f32 = 2.0;
+pub const HEAVY_SHELL_DAMAGE_MULT: f32 = 1.5;
+
+// Long-range salvo: buff applied to shells fired during the window.
+pub const LONG_RANGE_DURATION_TICKS: u32 = 40;
+pub const LONG_RANGE_RANGE_MULT: f32 = 1.6;
+pub const LONG_RANGE_SPEED_MULT: f32 = 1.4;
+
+// AWACS scan: double active radar range, zero noise, see through silent running.
+pub const AWACS_DURATION_TICKS: u32 = 60;
+pub const AWACS_RANGE_MULT: f32 = 2.0;
+
+// Silent running: hidden from passive, halved active range against you. Firing breaks it.
+pub const SILENT_RUNNING_DURATION_TICKS: u32 = 80;
+pub const SILENT_RUNNING_ACTIVE_RANGE_MULT: f32 = 0.5;
+
+// Counter-battery trace: arm window + how many reveal frames the victim gets.
+pub const COUNTER_BATTERY_ARM_TICKS: u32 = 60;
+pub const COUNTER_BATTERY_REVEAL_TICKS: u8 = 3;
+
+// EMP burst: instantaneous AoE that slows guns and forces passive sensors.
+pub const EMP_BURST_DURATION_TICKS: u32 = 50;
+pub const EMP_BURST_RADIUS: f32 = 100.0;
+pub const EMP_GUN_COOLDOWN_MULT: f32 = 2.0;
+
+// Decoy flare: phantom contact spawned ahead of the activating ship.
+pub const DECOY_FLARE_DURATION_TICKS: u32 = 60;
+pub const DECOY_FLARE_DISTANCE: f32 = 100.0;

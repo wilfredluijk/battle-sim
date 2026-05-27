@@ -7,10 +7,13 @@ import {
 } from './constants';
 import { colorFor, withAlpha } from './palette';
 import { worldToCanvasTransform } from './canvas';
+import { chipsForShip } from './powerupHud';
 import type {
   Contact,
+  DecoySnapshot,
   ShellSnapshot,
   ShipSnapshot,
+  SmokeCloudSnapshot,
   WorldFrame,
 } from '../types/protocol';
 
@@ -62,6 +65,17 @@ export function draw(
     ctx.stroke();
   }
 
+  // Smoke clouds: translucent grey discs. Drawn under shells and ships so the
+  // sailing target stays legible.
+  for (const cloud of latest.smoke_clouds ?? []) {
+    drawSmokeCloud(ctx, cloud, scale);
+  }
+
+  // Decoys: dashed ghost markers that look like ships but are clearly phantoms.
+  for (const decoy of latest.decoys ?? []) {
+    drawDecoy(ctx, decoy, scale);
+  }
+
   // Shells: small dot + a short trail opposite the velocity vector.
   for (const shell of latest.shells) {
     drawShell(ctx, shell, scale);
@@ -87,6 +101,56 @@ export function draw(
   for (const ship of latest.ships) {
     drawShip(ctx, ship, scale);
   }
+}
+
+function drawSmokeCloud(
+  ctx: CanvasRenderingContext2D,
+  cloud: SmokeCloudSnapshot,
+  scale: number,
+): void {
+  ctx.beginPath();
+  ctx.arc(cloud.pos[0], cloud.pos[1], cloud.radius, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(180, 188, 198, 0.22)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(220, 225, 235, 0.45)';
+  ctx.setLineDash([5 / scale, 5 / scale]);
+  ctx.lineWidth = 1.5 / scale;
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawDecoy(ctx: CanvasRenderingContext2D, decoy: DecoySnapshot, scale: number): void {
+  const color = colorFor(decoy.owner);
+  const x = decoy.pos[0];
+  const y = decoy.pos[1];
+  const rad = (decoy.heading_deg * Math.PI) / 180;
+  const dirX = Math.sin(rad);
+  const dirY = -Math.cos(rad);
+  const perpX = -dirY;
+  const perpY = dirX;
+  // Same hull silhouette as a real ship, drawn dashed and hollow.
+  const nose: [number, number] = [
+    x + dirX * SHIP_RADIUS * 1.4,
+    y + dirY * SHIP_RADIUS * 1.4,
+  ];
+  const tailL: [number, number] = [
+    x - dirX * SHIP_RADIUS * 0.8 + perpX * SHIP_RADIUS * 0.9,
+    y - dirY * SHIP_RADIUS * 0.8 + perpY * SHIP_RADIUS * 0.9,
+  ];
+  const tailR: [number, number] = [
+    x - dirX * SHIP_RADIUS * 0.8 - perpX * SHIP_RADIUS * 0.9,
+    y - dirY * SHIP_RADIUS * 0.8 - perpY * SHIP_RADIUS * 0.9,
+  ];
+  ctx.beginPath();
+  ctx.moveTo(nose[0], nose[1]);
+  ctx.lineTo(tailL[0], tailL[1]);
+  ctx.lineTo(tailR[0], tailR[1]);
+  ctx.closePath();
+  ctx.setLineDash([4 / scale, 4 / scale]);
+  ctx.strokeStyle = withAlpha(color, 0.55);
+  ctx.lineWidth = 1.5 / scale;
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 function drawShell(ctx: CanvasRenderingContext2D, shell: ShellSnapshot, scale: number): void {
@@ -160,6 +224,37 @@ function drawShip(ctx: CanvasRenderingContext2D, ship: ShipSnapshot, scale: numb
     const hpFill = ship.hp > 60 ? '#58d68d' : ship.hp > 25 ? '#f4d35e' : '#ef6b6b';
     ctx.fillStyle = hpFill;
     ctx.fillRect(-barW / 2, 4, barW * pct, barH);
+  }
+
+  // Powerup chip strip — pretty compact dots beneath the HP bar so a glance tells
+  // you what each ship has up its sleeve.
+  const chips = chipsForShip(ship);
+  if (chips.length > 0) {
+    const dotR = 3;
+    const gap = 3;
+    const stripW = chips.length * (dotR * 2) + (chips.length - 1) * gap;
+    const startX = -stripW / 2 + dotR;
+    chips.forEach((chip, i) => {
+      const cx = startX + i * (dotR * 2 + gap);
+      const cy = 14;
+      ctx.beginPath();
+      ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+      if (chip.state === 'active') {
+        ctx.fillStyle = '#f4d35e';
+      } else if (chip.state === 'used') {
+        ctx.fillStyle = 'rgba(180, 188, 198, 0.45)';
+      } else {
+        ctx.fillStyle = 'rgba(220, 225, 235, 0.9)';
+      }
+      ctx.fill();
+      if (chip.state === 'active') {
+        ctx.strokeStyle = 'rgba(244, 211, 94, 0.55)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, dotR + 2, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    });
   }
   ctx.restore();
 }
