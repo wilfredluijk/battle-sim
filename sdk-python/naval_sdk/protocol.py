@@ -66,6 +66,9 @@ class Welcome:
     map: MapInfo
     tick_hz: int
     ship_specs: ShipSpecs
+    #: Powerup ids the server understands. Forward-compatible: unknown future entries
+    #: are simply passed back to the server if a bot picks them — the server validates.
+    available_powerups: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Welcome":
@@ -75,6 +78,24 @@ class Welcome:
             map=MapInfo.from_dict(d["map"]),
             tick_hz=int(d["tick_hz"]),
             ship_specs=ShipSpecs.from_dict(d["ship_specs"]),
+            available_powerups=[str(p) for p in d.get("available_powerups", [])],
+        )
+
+
+@dataclass(frozen=True)
+class PowerupStatus:
+    """Live status for one of the bot's picked powerups, mirrored in every tick."""
+
+    id: str
+    used: bool
+    active_ticks_left: int
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "PowerupStatus":
+        return cls(
+            id=str(d["id"]),
+            used=bool(d.get("used", False)),
+            active_ticks_left=int(d.get("active_ticks_left", 0)),
         )
 
 
@@ -103,6 +124,12 @@ class SelfState:
     ammo: int
     rudder: float
     throttle: float
+    #: Loadout the bot picked for the match, in pick order. Empty if the bot never sent
+    #: `select_powerups`.
+    selected_powerups: Tuple[str, ...] = ()
+    #: One entry per picked powerup, same order. Use this to check whether a powerup is
+    #: still available, currently active, or already used.
+    powerup_status: Tuple[PowerupStatus, ...] = ()
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SelfState":
@@ -115,7 +142,30 @@ class SelfState:
             ammo=int(d["ammo"]),
             rudder=float(d["rudder"]),
             throttle=float(d["throttle"]),
+            selected_powerups=tuple(str(p) for p in d.get("selected_powerups", [])),
+            powerup_status=tuple(
+                PowerupStatus.from_dict(s) for s in d.get("powerup_status", [])
+            ),
         )
+
+    # ---- Convenience for bots ---------------------------------------------
+
+    def powerup(self, powerup_id: str) -> Optional[PowerupStatus]:
+        """Look up the live status of a specific picked powerup, or `None` if not picked."""
+        for status in self.powerup_status:
+            if status.id == powerup_id:
+                return status
+        return None
+
+    def powerup_ready(self, powerup_id: str) -> bool:
+        """True iff the bot picked this powerup and has not yet activated it."""
+        status = self.powerup(powerup_id)
+        return status is not None and not status.used
+
+    def powerup_active(self, powerup_id: str) -> bool:
+        """True iff this powerup is currently in effect (`active_ticks_left > 0`)."""
+        status = self.powerup(powerup_id)
+        return status is not None and status.active_ticks_left > 0
 
 
 @dataclass(frozen=True)
@@ -151,7 +201,17 @@ class ShellSplashEvent:
     pos: Tuple[float, float]
 
 
-TickEvent = Any  # HitEvent | ShellSplashEvent | unknown future event
+@dataclass(frozen=True)
+class PowerupActivatedEvent:
+    """Reported when a ship activates a powerup. Always emitted for the bot's own
+    activations; emitted for other bots only when the activating ship is currently a
+    sensor contact."""
+
+    ship_id: str
+    powerup: str
+
+
+TickEvent = Any  # HitEvent | ShellSplashEvent | PowerupActivatedEvent | unknown
 
 
 def _parse_event(d: Dict[str, Any]) -> TickEvent:
@@ -161,6 +221,11 @@ def _parse_event(d: Dict[str, Any]) -> TickEvent:
     if kind == "shell_splash":
         pos = d["pos"]
         return ShellSplashEvent(pos=(float(pos[0]), float(pos[1])))
+    if kind == "powerup_activated":
+        return PowerupActivatedEvent(
+            ship_id=str(d["ship_id"]),
+            powerup=str(d["powerup"]),
+        )
     return d  # forward-compatible: unknown event types stay as raw dicts
 
 
@@ -233,12 +298,17 @@ class Command:
     `throttle` and `rudder` are clamped to `[-1, 1]` by the server. `sensor_mode`
     defaults to `"active"`. To fire, either pass `fire=FireCommand(...)` directly
     or call `Command.fire_at(target_pos)` / `.fire_at(target_pos, target_vel, ...)`.
+
+    To activate one of your picked powerups, set `activate_powerup="overdrive"` (or any
+    other id from `welcome.available_powerups`). The server validates that the powerup
+    is in your loadout and hasn't been used yet — a bad id earns a typed `error` frame.
     """
 
     throttle: float = 0.0
     rudder: float = 0.0
     sensor_mode: SensorMode = "active"
     fire: Optional[FireCommand] = None
+    activate_powerup: Optional[str] = None
 
     def fire_at(
         self,
@@ -291,4 +361,6 @@ class Command:
         }
         if self.fire is not None:
             out["fire"] = self.fire.to_dict()
+        if self.activate_powerup is not None:
+            out["activate_powerup"] = str(self.activate_powerup)
         return out

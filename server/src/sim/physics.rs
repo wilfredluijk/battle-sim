@@ -6,28 +6,51 @@ use glam::Vec2;
 
 use super::config::SimConfig;
 use super::constants::DT;
+use super::powerups;
 use super::world::{Ship, World};
 
 /// Advance every alive ship in the world by one tick.
 pub fn step_world(world: &mut World) {
     let (width, height) = (world.width, world.height);
     let config = world.config;
+    let tick = world.tick;
     for ship in world.ships.values_mut() {
         if !ship.alive {
             continue;
         }
-        step_ship(ship, &config, width, height);
+        step_ship(ship, &config, width, height, tick);
         if ship.gun_cooldown > 0 {
             ship.gun_cooldown -= 1;
         }
     }
 }
 
-/// Integrate one ship by one tick. Order: speed → heading → position → wall clamp.
-pub fn step_ship(ship: &mut Ship, config: &SimConfig, width: f32, height: f32) {
-    // 1. Speed: drift toward target dictated by throttle, capped by acceleration.
-    let target = target_speed(ship.throttle, config);
-    let max_step = config.acceleration * DT;
+/// Integrate one ship by one tick. Order: speed → heading → position → wall clamp. Reads
+/// effective speed / accel / turn rate via [`super::powerups`] so Overdrive and similar
+/// effects feed straight in.
+pub fn step_ship(ship: &mut Ship, config: &SimConfig, width: f32, height: f32, tick: u64) {
+    let max_forward = powerups::effective_max_forward_speed(
+        config.max_forward_speed,
+        &ship.powerups,
+        &config.powerups,
+        tick,
+    );
+    let accel = powerups::effective_acceleration(
+        config.acceleration,
+        &ship.powerups,
+        &config.powerups,
+        tick,
+    );
+    let turn_rate_max = powerups::effective_turn_rate(
+        config.turn_rate_deg_per_s,
+        &ship.powerups,
+        &config.powerups,
+        tick,
+    );
+
+    // 1. Speed: drift toward target dictated by throttle, capped by (boosted) acceleration.
+    let target = target_speed(ship.throttle, max_forward, config.max_reverse_speed);
+    let max_step = accel * DT;
     let delta = target - ship.speed;
     if delta.abs() <= max_step {
         ship.speed = target;
@@ -35,9 +58,10 @@ pub fn step_ship(ship: &mut Ship, config: &SimConfig, width: f32, height: f32) {
         ship.speed += delta.signum() * max_step;
     }
 
-    // 2. Heading: turn rate scales linearly with |speed| / max_forward.
-    let turn_rate =
-        config.turn_rate_deg_per_s * ship.rudder * (ship.speed.abs() / config.max_forward_speed);
+    // 2. Heading: turn rate scales linearly with |speed| / max_forward. We use the
+    //    (possibly boosted) max_forward so the linear-with-speed curve still tops out at
+    //    `turn_rate_max` when the ship is at its (boosted) top speed.
+    let turn_rate = turn_rate_max * ship.rudder * (ship.speed.abs() / max_forward);
     ship.heading_deg = wrap_deg(ship.heading_deg + turn_rate * DT);
 
     // 3. Position: advance along heading vector.
@@ -57,12 +81,12 @@ pub fn step_ship(ship: &mut Ship, config: &SimConfig, width: f32, height: f32) {
 }
 
 /// Convert a throttle in `[-1, 1]` into the desired scalar speed.
-fn target_speed(throttle: f32, config: &SimConfig) -> f32 {
+fn target_speed(throttle: f32, max_forward: f32, max_reverse: f32) -> f32 {
     let t = throttle.clamp(-1.0, 1.0);
     if t >= 0.0 {
-        t * config.max_forward_speed
+        t * max_forward
     } else {
-        t * config.max_reverse_speed
+        t * max_reverse
     }
 }
 
@@ -102,7 +126,7 @@ mod tests {
         s.throttle = 1.0;
         // 6.0 / (1.5 * 0.1) = 40 ticks to reach max; iterate a bit more for slack.
         for _ in 0..50 {
-            step_ship(&mut s, &SimConfig::default(), W, H);
+            step_ship(&mut s, &SimConfig::default(), W, H, 0);
         }
         assert!(
             (s.speed - MAX_FORWARD_SPEED).abs() < 1e-4,
@@ -116,7 +140,7 @@ mod tests {
         let mut s = ship_at(Vec2::new(500.0, 500.0), 0.0);
         s.throttle = -1.0;
         for _ in 0..50 {
-            step_ship(&mut s, &SimConfig::default(), W, H);
+            step_ship(&mut s, &SimConfig::default(), W, H, 0);
         }
         assert!(
             (s.speed + MAX_REVERSE_SPEED).abs() < 1e-4,
@@ -133,7 +157,7 @@ mod tests {
         s.throttle = 1.0; // hold the speed
         s.rudder = 1.0;
         let h0 = s.heading_deg;
-        step_ship(&mut s, &SimConfig::default(), W, H);
+        step_ship(&mut s, &SimConfig::default(), W, H, 0);
         // Expected: TURN_RATE_DEG_PER_S * DT per tick at top speed.
         let expected = constants::TURN_RATE_DEG_PER_S * constants::DT;
         let delta = s.heading_deg - h0;
@@ -149,7 +173,7 @@ mod tests {
         let mut s = ship_at(Vec2::new(500.0, 500.0), 0.0);
         s.rudder = 1.0; // throttle stays 0, speed 0
         for _ in 0..10 {
-            step_ship(&mut s, &SimConfig::default(), W, H);
+            step_ship(&mut s, &SimConfig::default(), W, H, 0);
         }
         assert_eq!(s.heading_deg, 0.0, "stationary ship should not rotate");
     }
@@ -159,7 +183,7 @@ mod tests {
         let mut s = ship_at(Vec2::new(500.0, 500.0), 90.0);
         s.speed = MAX_FORWARD_SPEED;
         s.throttle = 1.0;
-        step_ship(&mut s, &SimConfig::default(), W, H);
+        step_ship(&mut s, &SimConfig::default(), W, H, 0);
         let step = constants::MAX_FORWARD_SPEED * constants::DT;
         assert!((s.pos.x - (500.0 + step)).abs() < 1e-4, "x = {}", s.pos.x);
         assert!((s.pos.y - 500.0).abs() < 1e-4, "y = {}", s.pos.y);
@@ -170,7 +194,7 @@ mod tests {
         let mut s = ship_at(Vec2::new(500.0, 500.0), 0.0);
         s.speed = MAX_FORWARD_SPEED;
         s.throttle = 1.0;
-        step_ship(&mut s, &SimConfig::default(), W, H);
+        step_ship(&mut s, &SimConfig::default(), W, H, 0);
         let step = constants::MAX_FORWARD_SPEED * constants::DT;
         assert!((s.pos.y - (500.0 - step)).abs() < 1e-4, "y = {}", s.pos.y);
     }
@@ -181,7 +205,7 @@ mod tests {
         s.speed = MAX_FORWARD_SPEED;
         s.throttle = 1.0;
         let hp0 = s.hp;
-        step_ship(&mut s, &SimConfig::default(), W, H);
+        step_ship(&mut s, &SimConfig::default(), W, H, 0);
         assert!(
             (s.pos.x - W).abs() < 1e-4,
             "expected clamp to wall, x = {}",
@@ -197,7 +221,7 @@ mod tests {
         let mut s = ship_at(Vec2::new(500.0, 0.5), 0.0); // north, near north wall
         s.speed = MAX_FORWARD_SPEED;
         s.throttle = 1.0;
-        step_ship(&mut s, &SimConfig::default(), W, H);
+        step_ship(&mut s, &SimConfig::default(), W, H, 0);
         assert!(s.pos.y.abs() < 1e-4, "y should clamp to 0, got {}", s.pos.y);
         assert_eq!(s.speed, 0.0);
     }

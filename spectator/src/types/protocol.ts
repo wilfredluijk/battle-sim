@@ -9,6 +9,13 @@
 
 export type SensorMode = 'active' | 'passive';
 
+/** One picked powerup's live state, mirrored in every ship snapshot. */
+export interface PowerupStatus {
+  id: string;
+  used: boolean;
+  active_ticks_left: number;
+}
+
 export interface ShipSnapshot {
   id: string;
   bot_name: string;
@@ -23,6 +30,10 @@ export interface ShipSnapshot {
   ready: boolean;
   commands_per_sec: number;
   sensor_mode: SensorMode;
+  /** Loadout this bot picked for the match (pick order). Empty when none. */
+  selected_powerups?: string[];
+  /** Live status for each pick, same order as `selected_powerups`. */
+  powerup_status?: PowerupStatus[];
 }
 
 export interface ShellSnapshot {
@@ -32,10 +43,25 @@ export interface ShellSnapshot {
   ttl_ticks: number;
 }
 
+export interface SmokeCloudSnapshot {
+  pos: [number, number];
+  radius: number;
+  expires_at: number;
+}
+
+export interface DecoySnapshot {
+  fake_id: number;
+  owner: string;
+  pos: [number, number];
+  heading_deg: number;
+  expires_at: number;
+}
+
 export type TickEvent =
   | { type: 'hit'; ship_id: string; amount: number }
   | { type: 'shell_splash'; pos: [number, number] }
-  | { type: 'death'; ship_id: string };
+  | { type: 'death'; ship_id: string }
+  | { type: 'powerup_activated'; ship_id: string; powerup: string };
 
 export interface WorldFrame {
   type: 'world';
@@ -43,6 +69,8 @@ export interface WorldFrame {
   ships: ShipSnapshot[];
   shells: ShellSnapshot[];
   events: TickEvent[];
+  smoke_clouds?: SmokeCloudSnapshot[];
+  decoys?: DecoySnapshot[];
 }
 
 // ---------------------------------------------------------------------------

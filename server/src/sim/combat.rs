@@ -9,6 +9,7 @@
 use glam::Vec2;
 
 use super::constants::DT;
+use super::powerups::{self, PowerupId};
 use super::world::{Shell, ShipId, World};
 
 /// Why `fire` refused to spawn a shell. The room translates this into the appropriate
@@ -55,6 +56,7 @@ pub fn fire(
     range: f32,
 ) -> Result<(), FireError> {
     let config = world.config;
+    let tick = world.tick;
     let ship = world.ships.get_mut(ship_id).ok_or(FireError::UnknownShip)?;
     if !ship.alive {
         return Err(FireError::ShipDead);
@@ -66,12 +68,36 @@ pub fn fire(
         return Err(FireError::NoAmmo);
     }
 
-    let clamped_range = range.clamp(0.0, config.max_shell_range);
+    // Shell-tag buffs that travel with the projectile, baked at fire time.
+    let heavy_active = ship.powerups.is_active(PowerupId::HeavyShell, tick);
+    let long_active = ship.powerups.is_active(PowerupId::LongRangeSalvo, tick);
+    let shell_splash_radius = if heavy_active {
+        powerups::buffed_splash_radius(config.splash_radius, &config.powerups)
+    } else {
+        config.splash_radius
+    };
+    let shell_max_damage = if heavy_active {
+        powerups::buffed_splash_damage(config.max_splash_damage, &config.powerups)
+    } else {
+        config.max_splash_damage
+    };
+    let shell_speed = if long_active {
+        powerups::buffed_shell_speed(config.shell_speed, &config.powerups)
+    } else {
+        config.shell_speed
+    };
+    let max_shell_range = if long_active {
+        powerups::buffed_max_shell_range(config.max_shell_range, &config.powerups)
+    } else {
+        config.max_shell_range
+    };
+
+    let clamped_range = range.clamp(0.0, max_shell_range);
     let dir = bearing_to_unit_vec(bearing_deg);
-    let vel = dir * config.shell_speed;
+    let vel = dir * shell_speed;
     // Time to travel `clamped_range` at `shell_speed`, in fixed-DT ticks. `ceil` so a
     // request just over a tick boundary still gets that final tick of flight.
-    let ttl_ticks = (clamped_range / (config.shell_speed * DT)).ceil() as u32;
+    let ttl_ticks = (clamped_range / (shell_speed * DT)).ceil() as u32;
 
     let shell = Shell {
         id_index: world.next_shell_index,
@@ -79,12 +105,24 @@ pub fn fire(
         pos: ship.pos,
         vel,
         ttl_ticks,
+        splash_radius: shell_splash_radius,
+        max_splash_damage: shell_max_damage,
     };
     world.next_shell_index = world.next_shell_index.wrapping_add(1);
     world.shells.push(shell);
 
-    ship.gun_cooldown = config.gun_cooldown_ticks;
+    let effective_cooldown = powerups::effective_gun_cooldown_ticks(
+        config.gun_cooldown_ticks,
+        &ship.powerups,
+        &config.powerups,
+        tick,
+    );
+    ship.gun_cooldown = effective_cooldown;
     ship.ammo -= 1;
+    // Firing breaks silent_running immediately — the muzzle flash is unambiguous.
+    if ship.powerups.silent_running_expires_at > tick {
+        ship.powerups.silent_running_expires_at = tick;
+    }
     Ok(())
 }
 
@@ -96,8 +134,8 @@ pub fn fire(
 pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
     let mut events = Vec::new();
     let mut remaining = Vec::with_capacity(world.shells.len());
-    let splash_radius = world.config.splash_radius;
-    let max_splash_damage = world.config.max_splash_damage;
+    let powerup_config = world.config.powerups;
+    let tick = world.tick;
     let shells = std::mem::take(&mut world.shells);
 
     for mut shell in shells {
@@ -111,6 +149,10 @@ pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
         }
 
         events.push(CombatEvent::Splash { pos: shell.pos });
+        // Per-shell splash parameters: a heavy_shell-tagged shell carries its (boosted)
+        // values from fire time.
+        let splash_radius = shell.splash_radius;
+        let max_splash_damage = shell.max_splash_damage;
         for (id, ship) in world.ships.iter_mut() {
             if !ship.alive {
                 continue;
@@ -122,11 +164,31 @@ pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
             // Linear falloff: full damage at centre, zero at the edge. `round` keeps the
             // integer HP loss honest at the boundaries.
             let frac = 1.0 - (d / splash_radius);
-            let dmg = (max_splash_damage as f32 * frac).round() as u32;
+            let raw_dmg = (max_splash_damage as f32 * frac).round() as u32;
+            // Defender's `reinforced_hull` scales the damage actually subtracted.
+            let dmg = powerups::apply_incoming_damage_reduction(
+                raw_dmg,
+                &ship.powerups,
+                &powerup_config,
+                tick,
+            );
             if dmg == 0 {
                 continue;
             }
             ship.hp = ship.hp.saturating_sub(dmg);
+            // Counter-battery trace: first hit while armed locks in the shooter for the
+            // next `counter_battery_reveal_ticks` reveal frames. Self-hits and hits from
+            // an unknown source don't trigger a trace (no useful info).
+            if ship.powerups.trace_armed_until > tick
+                && ship.powerups.trace_pending_reveals == 0
+                && shell.source_ship != *id
+            {
+                ship.powerups.trace_attacker = Some(shell.source_ship.clone());
+                ship.powerups.trace_pending_reveals = powerup_config.counter_battery_reveal_ticks;
+                // Trace fires once per arming — disarm immediately so a second incoming
+                // hit doesn't overwrite the attacker mid-reveal-sequence.
+                ship.powerups.trace_armed_until = 0;
+            }
             events.push(CombatEvent::Hit {
                 ship_id: id.clone(),
                 amount: dmg,
@@ -375,6 +437,104 @@ mod tests {
             .iter()
             .any(|e| matches!(e, CombatEvent::Death { ship_id, .. } if ship_id == "s_2"));
         assert!(died, "death event missing: {last:?}");
+    }
+
+    #[test]
+    fn reinforced_hull_reduces_damage_from_direct_hit() {
+        // s_1 fires a tiny-range shot at s_2; without reinforced hull s_2 loses 25 hp at
+        // the centre. With reinforced hull active, damage scales by 0.4 → ~10 hp.
+        let mut s1 = ship_at("s_1", Vec2::new(500.0, 500.0));
+        let mut s2 = ship_at("s_2", Vec2::new(500.0, 500.0));
+        s2.powerups.selected = vec![PowerupId::ReinforcedHull];
+        s2.powerups.reinforced_hull_expires_at = 100;
+        let mut world = world_with(vec![s1.clone(), s2]);
+        // Tiny range — shell explodes at firer.
+        fire(&mut world, &"s_1".into(), 0.0, 1.0).expect("fire");
+        while !world.shells.is_empty() {
+            step_shells(&mut world);
+        }
+        let hp_loss = constants::HULL_HP - world.ships.get("s_2").unwrap().hp;
+        assert!(
+            hp_loss < constants::MAX_SPLASH_DAMAGE,
+            "reinforced hull should reduce centre-splash damage; hp_loss={hp_loss}"
+        );
+        // Now without reinforced hull, the same setup deals full splash damage.
+        s1.id = "s_3".into();
+        s1.bot_id = "b_3".into();
+        let mut control_world = world_with(vec![s1, ship_at("s_4", Vec2::new(500.0, 500.0))]);
+        fire(&mut control_world, &"s_3".into(), 0.0, 1.0).expect("fire");
+        while !control_world.shells.is_empty() {
+            step_shells(&mut control_world);
+        }
+        let control_loss = constants::HULL_HP - control_world.ships.get("s_4").unwrap().hp;
+        assert!(
+            control_loss > hp_loss,
+            "control without reinforced hull should lose more hp ({control_loss} vs {hp_loss})"
+        );
+    }
+
+    #[test]
+    fn counter_battery_trace_records_attacker_on_first_hit() {
+        let mut s1 = ship_at("s_1", Vec2::new(500.0, 500.0));
+        let mut s2 = ship_at("s_2", Vec2::new(500.0, 500.0));
+        s2.powerups.selected = vec![PowerupId::CounterBatteryTrace];
+        s2.powerups.trace_armed_until = 100;
+        let mut world = world_with(vec![s1.clone(), s2]);
+        fire(&mut world, &"s_1".into(), 0.0, 1.0).expect("fire");
+        while !world.shells.is_empty() {
+            step_shells(&mut world);
+        }
+        let trace = &world.ships.get("s_2").unwrap().powerups;
+        assert_eq!(trace.trace_attacker.as_deref(), Some("s_1"));
+        assert!(
+            trace.trace_pending_reveals > 0,
+            "should have queued reveals"
+        );
+        // Trace consumed — second hit doesn't overwrite the attacker mid-reveal.
+        s1.id = "s_3".into();
+        s1.bot_id = "b_3".into();
+        s1.gun_cooldown = 0;
+        world.ships.insert(s1.id.clone(), s1);
+        // Make sure s_2 has hp left.
+        world.ships.get_mut("s_2").unwrap().hp = 80;
+        fire(&mut world, &"s_3".into(), 0.0, 1.0).expect("fire");
+        while !world.shells.is_empty() {
+            step_shells(&mut world);
+        }
+        assert_eq!(
+            world
+                .ships
+                .get("s_2")
+                .unwrap()
+                .powerups
+                .trace_attacker
+                .as_deref(),
+            Some("s_1"),
+            "second hit must not overwrite mid-reveal attacker"
+        );
+    }
+
+    #[test]
+    fn firing_breaks_silent_running() {
+        let mut s1 = ship_at("s_1", Vec2::new(500.0, 500.0));
+        s1.powerups.selected = vec![PowerupId::SilentRunning];
+        s1.powerups.silent_running_expires_at = 100;
+        let mut world = world_with(vec![s1]);
+        assert!(world
+            .ships
+            .get("s_1")
+            .unwrap()
+            .powerups
+            .is_active(PowerupId::SilentRunning, 0));
+        fire(&mut world, &"s_1".into(), 0.0, 100.0).expect("fire");
+        // Silent running expires at tick 0 (world.tick is still 0), so is_active should
+        // return false now.
+        assert!(!world
+            .ships
+            .get("s_1")
+            .unwrap()
+            .powerups
+            .is_active(PowerupId::SilentRunning, 0));
     }
 
     #[test]

@@ -49,6 +49,7 @@ fn cmd(
         rudder,
         sensor_mode: mode,
         fire,
+        activate_powerup: None,
     }
 }
 
@@ -132,7 +133,7 @@ fn replay_produces_byte_identical_final_state() {
     // ---- Replay run ----
     let records = replay::read_records_from(Cursor::new(log_bytes.clone())).expect("read records");
     let header = match records.first() {
-        Some(ReplayRecord::Header(h)) => h.clone(),
+        Some(ReplayRecord::Header(h)) => (**h).clone(),
         other => panic!("expected header, got {other:?}"),
     };
     assert_eq!(header.version, REPLAY_FORMAT_VERSION);
@@ -153,6 +154,7 @@ fn replay_produces_byte_identical_final_state() {
                         rudder: c.rudder,
                         sensor_mode: c.sensor_mode,
                         fire: c.fire,
+                        activate_powerup: c.activate_powerup,
                     };
                     replay_room.inject_replay_command(&c.bot_id, pending);
                 }
@@ -251,4 +253,218 @@ fn replay_log_has_header_then_ticks_then_end_when_match_ends() {
             "unexpected mid-stream {r:?}"
         );
     }
+}
+
+#[test]
+fn powerup_activations_replay_byte_identically() {
+    use naval_server::sim::PowerupId;
+
+    // Live match: each bot picks a loadout, drives around, activates a powerup, then
+    // fires a few shots. No direct state mutation — every change goes through commands,
+    // so the replay log fully captures the run.
+    let mut room = Room::new("test".into(), 1000.0, 1000.0, 31337, 10, 80, 4);
+    let mut r1 = connect(&mut room, "alice").expect("a");
+    let mut r2 = connect(&mut room, "bob").expect("b");
+    drain(&mut r1);
+    drain(&mut r2);
+
+    room.handle_event(RoomEvent::BotSelectPowerups {
+        bot_id: r1.bot_id.clone(),
+        powerups: vec![PowerupId::Overdrive, PowerupId::HeavyShell],
+    });
+    room.handle_event(RoomEvent::BotSelectPowerups {
+        bot_id: r2.bot_id.clone(),
+        powerups: vec![PowerupId::ReinforcedHull, PowerupId::SmokeScreen],
+    });
+
+    let (writer, buf) = ReplayWriter::in_memory("match_pup_31337".into());
+    room.set_replay_writer(writer);
+
+    room.handle_event(RoomEvent::BotReady {
+        bot_id: r1.bot_id.clone(),
+    });
+    room.handle_event(RoomEvent::BotReady {
+        bot_id: r2.bot_id.clone(),
+    });
+    start(&mut room, "test").expect("start");
+    drain(&mut r1);
+    drain(&mut r2);
+
+    // Tick 0: both bots activate one of their picks while throttling forward.
+    let t = room.world.tick;
+    room.handle_event(RoomEvent::BotCommand {
+        bot_id: r1.bot_id.clone(),
+        command: PendingCommand {
+            tick: t,
+            throttle: 1.0,
+            rudder: 0.2,
+            sensor_mode: SensorMode::Active,
+            fire: None,
+            activate_powerup: Some(PowerupId::Overdrive),
+        },
+    });
+    room.handle_event(RoomEvent::BotCommand {
+        bot_id: r2.bot_id.clone(),
+        command: PendingCommand {
+            tick: t,
+            throttle: 1.0,
+            rudder: -0.2,
+            sensor_mode: SensorMode::Passive,
+            fire: None,
+            activate_powerup: Some(PowerupId::SmokeScreen),
+        },
+    });
+    room.step_tick();
+    drain(&mut r1);
+    drain(&mut r2);
+
+    // Drive a varied 80 ticks of motion + occasional fire. The pattern is arbitrary —
+    // what matters is that it's reproducible.
+    for i in 0..80 {
+        let t = room.world.tick;
+        let fire_r1 = if i % 10 == 5 {
+            Some(FireCommand {
+                bearing_deg: 90.0 + (i as f32) * 5.0,
+                range: 250.0,
+            })
+        } else {
+            None
+        };
+        let fire_r2 = if i % 12 == 3 {
+            Some(FireCommand {
+                bearing_deg: 270.0 - (i as f32) * 4.0,
+                range: 220.0,
+            })
+        } else {
+            None
+        };
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r1.bot_id.clone(),
+            command: cmd(t, 0.8, 0.15, SensorMode::Active, fire_r1),
+        });
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: r2.bot_id.clone(),
+            command: cmd(t, 0.6, -0.1, SensorMode::Passive, fire_r2),
+        });
+        // Second powerup activations mid-match.
+        if i == 20 {
+            let t = room.world.tick;
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r1.bot_id.clone(),
+                command: PendingCommand {
+                    tick: t,
+                    throttle: 0.8,
+                    rudder: 0.15,
+                    sensor_mode: SensorMode::Active,
+                    fire: None,
+                    activate_powerup: Some(PowerupId::HeavyShell),
+                },
+            });
+        }
+        if i == 30 {
+            let t = room.world.tick;
+            room.handle_event(RoomEvent::BotCommand {
+                bot_id: r2.bot_id.clone(),
+                command: PendingCommand {
+                    tick: t,
+                    throttle: 0.6,
+                    rudder: -0.1,
+                    sensor_mode: SensorMode::Passive,
+                    fire: None,
+                    activate_powerup: Some(PowerupId::ReinforcedHull),
+                },
+            });
+        }
+        room.step_tick();
+        drain(&mut r1);
+        drain(&mut r2);
+    }
+
+    let live_final_tick = room.world.tick;
+    let live_ship_states: Vec<_> = room
+        .world
+        .ships
+        .values()
+        .map(|s| {
+            (
+                s.id.clone(),
+                s.pos,
+                s.heading_deg,
+                s.speed,
+                s.hp,
+                s.ammo,
+                s.alive,
+                s.powerups.used.clone(),
+                s.powerups.selected.clone(),
+            )
+        })
+        .collect();
+    drop(room.take_replay_writer());
+    let bytes = buf.lock().unwrap().clone();
+
+    // ---- Replay run ----
+    let records = replay::read_records_from(Cursor::new(bytes)).expect("read records back");
+    let header = match records.first() {
+        Some(ReplayRecord::Header(h)) => (**h).clone(),
+        other => panic!("expected header, got {other:?}"),
+    };
+    // Sanity: header carries each bot's loadout.
+    assert!(
+        header.bots.iter().any(|b| !b.selected_powerups.is_empty()),
+        "header should record at least one bot's loadout"
+    );
+
+    let mut replay_room = rebuild_room_from_header(&header).expect("rebuild");
+    for record in records.iter().skip(1) {
+        match record {
+            ReplayRecord::Tick(t) => {
+                for c in &t.commands {
+                    let pending = PendingCommand {
+                        tick: t.tick,
+                        throttle: c.throttle,
+                        rudder: c.rudder,
+                        sensor_mode: c.sensor_mode,
+                        fire: c.fire,
+                        activate_powerup: c.activate_powerup,
+                    };
+                    replay_room.inject_replay_command(&c.bot_id, pending);
+                }
+                while replay_room.world.tick < t.tick {
+                    replay_room.step_tick();
+                }
+            }
+            ReplayRecord::End(_) => {}
+            ReplayRecord::Header(_) => panic!("unexpected mid-stream header"),
+        }
+    }
+    while replay_room.world.tick < live_final_tick {
+        replay_room.step_tick();
+    }
+
+    assert_eq!(
+        replay_room.world.tick, live_final_tick,
+        "final tick differs between live and replay"
+    );
+    let replay_ship_states: Vec<_> = replay_room
+        .world
+        .ships
+        .values()
+        .map(|s| {
+            (
+                s.id.clone(),
+                s.pos,
+                s.heading_deg,
+                s.speed,
+                s.hp,
+                s.ammo,
+                s.alive,
+                s.powerups.used.clone(),
+                s.powerups.selected.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        live_ship_states, replay_ship_states,
+        "ship state diverged between live and replay"
+    );
 }

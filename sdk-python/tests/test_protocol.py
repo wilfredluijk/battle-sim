@@ -7,6 +7,8 @@ from naval_sdk.protocol import (
     FireCommand,
     GameOver,
     HitEvent,
+    PowerupActivatedEvent,
+    PowerupStatus,
     ShellSplashEvent,
     Welcome,
     WorldView,
@@ -146,3 +148,66 @@ def test_game_over_parses():
     assert g.winner == "b_1"
     g2 = GameOver.from_dict({"winner": None, "final_tick": 3000, "replay_id": "draw"})
     assert g2.winner is None
+
+
+# --- Powerups -----------------------------------------------------------------
+
+
+def test_welcome_parses_available_powerups():
+    frame = dict(WELCOME_FRAME)
+    frame["available_powerups"] = ["overdrive", "rapid_fire", "heavy_shell"]
+    w = Welcome.from_dict(frame)
+    assert "overdrive" in w.available_powerups
+    assert len(w.available_powerups) == 3
+
+
+def test_welcome_default_powerups_is_empty():
+    # Backward compatibility: no `available_powerups` key → empty list.
+    w = Welcome.from_dict(WELCOME_FRAME)
+    assert w.available_powerups == []
+
+
+def test_self_state_parses_powerup_status_and_convenience_methods_work():
+    frame = dict(TICK_FRAME)
+    frame["self"] = dict(frame["self"])
+    frame["self"]["selected_powerups"] = ["overdrive", "rapid_fire"]
+    frame["self"]["powerup_status"] = [
+        {"id": "overdrive", "used": False, "active_ticks_left": 0},
+        {"id": "rapid_fire", "used": True, "active_ticks_left": 12},
+    ]
+    view = WorldView.from_dict(frame)
+    assert view.me.selected_powerups == ("overdrive", "rapid_fire")
+    assert len(view.me.powerup_status) == 2
+    assert isinstance(view.me.powerup_status[0], PowerupStatus)
+    # Convenience accessors.
+    assert view.me.powerup_ready("overdrive")
+    assert not view.me.powerup_ready("rapid_fire")  # already used
+    assert view.me.powerup_active("rapid_fire")
+    assert not view.me.powerup_active("overdrive")
+    assert view.me.powerup("rapid_fire").active_ticks_left == 12
+    assert view.me.powerup("missing_id") is None
+
+
+def test_powerup_activated_event_parses():
+    frame = dict(TICK_FRAME)
+    frame["events"] = [
+        {"type": "powerup_activated", "ship_id": "s_2", "powerup": "smoke_screen"}
+    ]
+    view = WorldView.from_dict(frame)
+    assert len(view.events) == 1
+    assert isinstance(view.events[0], PowerupActivatedEvent)
+    assert view.events[0].ship_id == "s_2"
+    assert view.events[0].powerup == "smoke_screen"
+
+
+def test_command_serializes_activate_powerup():
+    cmd = Command(throttle=0.5, activate_powerup="overdrive")
+    out = cmd.to_dict(tick=10)
+    assert out["activate_powerup"] == "overdrive"
+
+
+def test_command_without_activation_omits_field():
+    # Forward-compatibility: bots that never activate produce the same JSON shape as before.
+    cmd = Command(throttle=0.5)
+    out = cmd.to_dict(tick=10)
+    assert "activate_powerup" not in out

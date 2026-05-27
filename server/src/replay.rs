@@ -29,22 +29,30 @@ use crate::protocol::{
     Contact, FireCommand, MapInfo, SensorMode, ServerMsg, SpectatorMsg, TickEvent,
 };
 use crate::room::{PendingCommand, Room, RoomEvent, SpectatorFrame};
-use crate::sim::SimConfig;
+use crate::sim::{PowerupId, SimConfig};
 
 /// Bumped on any breaking change to the on-disk format. Readers reject mismatched versions
 /// rather than silently misinterpreting old logs.
 ///
 /// v2 added the `sim_config` field to the header so a replay rebuilds the simulation with
 /// the exact balance parameters the live run used. v1 logs are no longer readable.
-pub const REPLAY_FORMAT_VERSION: u32 = 2;
+///
+/// v3 added per-bot `selected_powerups` to the header and the `activate_powerup` field on
+/// each `ReplayCommand`. The `SimConfig` embedded in the header gained a `powerups` field;
+/// older logs that omit it are accepted by the deserializer because `PowerupConfig` has a
+/// `serde(default)`, but the explicit version bump catches any other shape drift.
+pub const REPLAY_FORMAT_VERSION: u32 = 3;
 
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
 /// they `cat` the file.
+///
+/// The header is boxed because it now carries a fat `SimConfig` (incl. `PowerupConfig`)
+/// and `Vec<ReplayBot>` — boxing keeps the enum size proportional to the smallest variant.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReplayRecord {
-    Header(ReplayHeader),
+    Header(Box<ReplayHeader>),
     Tick(ReplayTick),
     End(ReplayEnd),
 }
@@ -70,6 +78,11 @@ pub struct ReplayBot {
     pub bot_id: String,
     pub ship_id: String,
     pub name: String,
+    /// Powerups this bot picked for the match (in pick order). Empty if the bot never
+    /// sent `select_powerups`. Re-applied by the replay player before any tick is stepped
+    /// so activation commands replay against the same loadout the live run saw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_powerups: Vec<PowerupId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -86,6 +99,9 @@ pub struct ReplayCommand {
     pub sensor_mode: SensorMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fire: Option<FireCommand>,
+    /// Powerup activation that drove this tick. `None` for ticks that did not activate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activate_powerup: Option<PowerupId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -359,6 +375,14 @@ fn rebuild_room_with_outbound(
             )));
         }
         outbound.push((reg.bot_id.clone(), reg.outbound));
+        // Re-apply the recorded loadout, if any, before `BotReady`. This way the room's
+        // `start_match` mirrors the same selections onto the ship as the live run did.
+        if !bot.selected_powerups.is_empty() {
+            room.handle_event(RoomEvent::BotSelectPowerups {
+                bot_id: reg.bot_id.clone(),
+                powerups: bot.selected_powerups.clone(),
+            });
+        }
         room.handle_event(RoomEvent::BotReady { bot_id: reg.bot_id });
     }
 
@@ -435,7 +459,7 @@ pub async fn run_replay(
 
     let mut iter = records.into_iter();
     let header = match iter.next() {
-        Some(ReplayRecord::Header(h)) => h,
+        Some(ReplayRecord::Header(h)) => *h,
         Some(_) => {
             return Err(ReplayError::Header(
                 "replay log does not begin with a header record".into(),
@@ -476,6 +500,7 @@ pub async fn run_replay(
                                 rudder: cmd.rudder,
                                 fire: cmd.fire,
                                 sensor_mode: cmd.sensor_mode,
+                                activate_powerup: cmd.activate_powerup,
                             };
                             room.inject_replay_command(&cmd.bot_id, pending);
                         }
@@ -517,7 +542,7 @@ pub async fn run_replay(
 pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, ReplayError> {
     let mut iter = records.into_iter();
     let header = match iter.next() {
-        Some(ReplayRecord::Header(h)) => h,
+        Some(ReplayRecord::Header(h)) => *h,
         Some(_) => {
             return Err(ReplayError::Header(
                 "replay log does not begin with a header record".into(),
@@ -553,6 +578,7 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
                             rudder: cmd.rudder,
                             fire: cmd.fire,
                             sensor_mode: cmd.sensor_mode,
+                            activate_powerup: cmd.activate_powerup,
                         },
                     );
                 }
@@ -604,7 +630,7 @@ pub fn capture_perspective(
 ) -> Result<CapturedPerspective, ReplayError> {
     let mut iter = records.into_iter();
     let header = match iter.next() {
-        Some(ReplayRecord::Header(h)) => h,
+        Some(ReplayRecord::Header(h)) => *h,
         Some(_) => {
             return Err(ReplayError::Header(
                 "replay log does not begin with a header record".into(),
@@ -638,6 +664,7 @@ pub fn capture_perspective(
                             rudder: cmd.rudder,
                             fire: cmd.fire,
                             sensor_mode: cmd.sensor_mode,
+                            activate_powerup: cmd.activate_powerup,
                         },
                     );
                 }
@@ -752,7 +779,7 @@ fn read_replay_summary(path: &Path) -> io::Result<ReplaySummary> {
         }
         if header.is_none() {
             match serde_json::from_str::<ReplayRecord>(trimmed) {
-                Ok(ReplayRecord::Header(h)) => header = Some(h),
+                Ok(ReplayRecord::Header(h)) => header = Some(*h),
                 Ok(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -832,11 +859,13 @@ mod tests {
                     bot_id: "b_1".into(),
                     ship_id: "s_1".into(),
                     name: "alice".into(),
+                    selected_powerups: vec![PowerupId::Overdrive, PowerupId::RapidFire],
                 },
                 ReplayBot {
                     bot_id: "b_2".into(),
                     ship_id: "s_2".into(),
                     name: "bob".into(),
+                    selected_powerups: vec![],
                 },
             ],
         }
@@ -852,6 +881,7 @@ mod tests {
                     rudder: -0.25,
                     sensor_mode: SensorMode::Active,
                     fire: None,
+                    activate_powerup: Some(PowerupId::Overdrive),
                 },
                 ReplayCommand {
                     bot_id: "b_2".into(),
@@ -862,6 +892,7 @@ mod tests {
                         bearing_deg: 90.0,
                         range: 200.0,
                     }),
+                    activate_powerup: None,
                 },
             ],
         }
@@ -870,7 +901,7 @@ mod tests {
     #[test]
     fn record_roundtrips() {
         for rec in [
-            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::Tick(sample_tick()),
             ReplayRecord::End(ReplayEnd {
                 tick: 1843,
@@ -891,7 +922,7 @@ mod tests {
     fn writer_emits_jsonl() {
         let (mut writer, buf) = ReplayWriter::in_memory("match_test_0".into());
         writer
-            .write(&ReplayRecord::Header(sample_header()))
+            .write(&ReplayRecord::Header(Box::new(sample_header())))
             .expect("write header");
         writer
             .write(&ReplayRecord::Tick(sample_tick()))
@@ -918,7 +949,7 @@ mod tests {
     fn read_records_from_skips_blank_lines() {
         let text = format!(
             "{}\n\n{}\n",
-            serde_json::to_string(&ReplayRecord::Header(sample_header())).unwrap(),
+            serde_json::to_string(&ReplayRecord::Header(Box::new(sample_header()))).unwrap(),
             serde_json::to_string(&ReplayRecord::End(ReplayEnd {
                 tick: 1,
                 winner: None
@@ -945,7 +976,7 @@ mod tests {
     #[test]
     fn capture_replay_yields_one_frame_per_tick() {
         let records = vec![
-            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::Tick(sample_tick()),
             ReplayRecord::End(ReplayEnd {
                 tick: 10,
@@ -966,7 +997,7 @@ mod tests {
     #[test]
     fn capture_perspective_densifies_to_one_frame_per_tick() {
         let records = vec![
-            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::Tick(sample_tick()),
             ReplayRecord::End(ReplayEnd {
                 tick: 10,
@@ -985,7 +1016,7 @@ mod tests {
     #[test]
     fn capture_perspective_rejects_unknown_bot() {
         let records = vec![
-            ReplayRecord::Header(sample_header()),
+            ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::End(ReplayEnd {
                 tick: 1,
                 winner: None,
@@ -1024,6 +1055,7 @@ mod tests {
                 bot_id: format!("b_{n}"),
                 ship_id: format!("s_{n}"),
                 name: format!("bot-{n}"),
+                selected_powerups: vec![],
             })
             .collect();
         bots.sort_by(|a, b| a.bot_id.cmp(&b.bot_id));

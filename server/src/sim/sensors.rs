@@ -14,6 +14,7 @@ use rand::Rng;
 use rand_pcg::Pcg64;
 
 use super::constants::PASSIVE_CONTACT_PLACEHOLDER_DISTANCE;
+use super::powerups::PowerupId;
 use super::world::{ShipId, World};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,20 +49,70 @@ pub fn active_contacts(
     world: &World,
     rng: &mut Pcg64,
 ) -> Vec<Contact> {
-    let radar_range = world.config.active_radar_range;
-    let radar_noise = world.config.active_radar_noise;
+    let tick = world.tick;
+    let powerup_cfg = world.config.powerups;
+    let viewer_state = world.ships.get(viewer_id).map(|s| &s.powerups);
+
+    // EMP forces the affected ship's active radar to return nothing this tick.
+    if let Some(state) = viewer_state {
+        if state.is_active(PowerupId::EmpBurst, tick) {
+            return Vec::new();
+        }
+    }
+
+    let awacs_active = viewer_state
+        .map(|s| s.is_active(PowerupId::AwacsScan, tick))
+        .unwrap_or(false);
+    let base_range = world.config.active_radar_range;
+    let radar_range = if awacs_active {
+        base_range * powerup_cfg.awacs_range_mult
+    } else {
+        base_range
+    };
+    // AWACS bakes a noise-free scan; otherwise the configured noise applies.
+    let radar_noise = if awacs_active {
+        0.0
+    } else {
+        world.config.active_radar_noise
+    };
+
     let mut out = Vec::new();
     for (id, ship) in &world.ships {
         if id == viewer_id || !ship.alive {
             continue;
         }
+        // Per-target effective range. `silent_running` halves the range against this ship
+        // *only*, unless the viewer has `awacs_scan` (which sees through stealth).
+        let target_silent = ship.powerups.is_active(PowerupId::SilentRunning, tick);
+        let effective_range = if target_silent && !awacs_active {
+            radar_range * powerup_cfg.silent_running_active_range_mult
+        } else {
+            radar_range
+        };
+
         let to = ship.pos - viewer_pos;
         let dist = to.length();
-        if dist > radar_range {
+        if dist > effective_range {
             continue;
         }
-        let nx: f32 = rng.gen_range(-radar_noise..=radar_noise);
-        let ny: f32 = rng.gen_range(-radar_noise..=radar_noise);
+
+        // Smoke screen: target inside a live cloud is invisible to active radar coming
+        // from outside the same cloud. AWACS does *not* see through smoke (it sees through
+        // silent_running stealth, which is a separate mechanic).
+        if smoke_blocks(world, viewer_pos, ship.pos, tick) {
+            continue;
+        }
+
+        let nx: f32 = if radar_noise > 0.0 {
+            rng.gen_range(-radar_noise..=radar_noise)
+        } else {
+            0.0
+        };
+        let ny: f32 = if radar_noise > 0.0 {
+            rng.gen_range(-radar_noise..=radar_noise)
+        } else {
+            0.0
+        };
         out.push(Contact {
             kind: ContactKind::Ship,
             pos: ship.pos + Vec2::new(nx, ny),
@@ -70,7 +121,52 @@ pub fn active_contacts(
             confidence: 1.0,
         });
     }
+
+    // Decoys appear in the active radar of every viewer except the decoy's owner. They
+    // produce no noise (they're synthetic) and have full confidence — bots have to use
+    // judgement to tell them apart from real ships. Iteration is over `world.decoys` in
+    // insertion order, so the output stays deterministic.
+    for decoy in &world.decoys {
+        if &decoy.owner == viewer_id {
+            continue;
+        }
+        let to = decoy.pos - viewer_pos;
+        let dist = to.length();
+        if dist > radar_range {
+            continue;
+        }
+        if smoke_blocks(world, viewer_pos, decoy.pos, tick) {
+            continue;
+        }
+        out.push(Contact {
+            kind: ContactKind::Ship,
+            pos: decoy.pos,
+            bearing_deg: compass_deg(to),
+            range: Some(dist),
+            confidence: 1.0,
+        });
+    }
     out
+}
+
+/// True iff the line of sight from `viewer` to `target` is occluded by a live smoke cloud
+/// that the viewer is *not* themselves inside. Implemented as: the target is inside some
+/// live cloud, and the viewer is not in the same cloud. Coarse but cheap and consistent.
+fn smoke_blocks(world: &World, viewer: Vec2, target: Vec2, tick: u64) -> bool {
+    for cloud in &world.smoke_clouds {
+        if cloud.expires_at <= tick {
+            continue;
+        }
+        let target_in = target.distance(cloud.pos) <= cloud.radius;
+        if !target_in {
+            continue;
+        }
+        let viewer_in = viewer.distance(cloud.pos) <= cloud.radius;
+        if !viewer_in {
+            return true;
+        }
+    }
+    false
 }
 
 /// Passive listening from `viewer_id` at `viewer_pos`. Detects:
@@ -90,9 +186,14 @@ pub fn passive_contacts(
     let nearby_range = world.config.passive_hear_nearby_range;
     let active_range = world.config.passive_hear_active_range;
     let bearing_noise = world.config.passive_bearing_noise_deg;
+    let tick = world.tick;
     let mut out = Vec::new();
     for (id, ship) in &world.ships {
         if id == viewer_id || !ship.alive {
+            continue;
+        }
+        // Silent running hides the target from *all* passive listeners.
+        if ship.powerups.is_active(PowerupId::SilentRunning, tick) {
             continue;
         }
         let to = ship.pos - viewer_pos;
@@ -114,6 +215,33 @@ pub fn passive_contacts(
             bearing_deg: bearing,
             range: None,
             confidence: if pinging { 0.85 } else { 0.5 },
+        });
+    }
+
+    // Decoys also show up in passive contacts (bearing only, like real ships in engine
+    // range), reusing the same noise draw to stay deterministic. They are heard like
+    // nearby ships — bearing-only with the standard nearby threshold.
+    for decoy in &world.decoys {
+        if &decoy.owner == viewer_id {
+            continue;
+        }
+        let to = decoy.pos - viewer_pos;
+        let dist = to.length();
+        if dist > nearby_range {
+            continue;
+        }
+        let true_bearing = compass_deg(to);
+        let noise: f32 = rng.gen_range(-bearing_noise..=bearing_noise);
+        let bearing = (true_bearing + noise).rem_euclid(360.0);
+        let radians = bearing.to_radians();
+        let placeholder = viewer_pos
+            + Vec2::new(radians.sin(), -radians.cos()) * PASSIVE_CONTACT_PLACEHOLDER_DISTANCE;
+        out.push(Contact {
+            kind: ContactKind::Ship,
+            pos: placeholder,
+            bearing_deg: bearing,
+            range: None,
+            confidence: 0.5,
         });
     }
     out
@@ -349,6 +477,148 @@ mod tests {
                 "bearing {bearing} > 5° off from 90"
             );
         }
+    }
+
+    // ----- Powerup interactions -------------------------------------------
+
+    #[test]
+    fn silent_running_hides_target_from_passive() {
+        use crate::sim::PowerupId;
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        // s_2 is well within passive nearby range (100u east, threshold 150u) but is
+        // silent_running — should be invisible.
+        let mut s2 = ship("s_2", 600.0, 500.0);
+        s2.powerups.selected = vec![PowerupId::SilentRunning];
+        s2.powerups.silent_running_expires_at = 100;
+        world.insert_ship(s2);
+        let mut rng = Pcg64::seed_from_u64(7);
+        let contacts = passive_contacts(
+            &"s_1".into(),
+            Vec2::new(500.0, 500.0),
+            &world,
+            &BTreeSet::new(),
+            &mut rng,
+        );
+        assert!(
+            contacts.is_empty(),
+            "silent_running target should be invisible to passive: {contacts:?}"
+        );
+    }
+
+    #[test]
+    fn silent_running_halves_active_range_against_target() {
+        use crate::sim::PowerupId;
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        // Place target at 250 units east. Default active radar range = 350; silent
+        // halves it to 175. So a silent target at 250u should be invisible while a normal
+        // one at the same range is visible.
+        let mut s2 = ship("s_2", 750.0, 500.0);
+        s2.powerups.selected = vec![PowerupId::SilentRunning];
+        s2.powerups.silent_running_expires_at = 100;
+        world.insert_ship(s2);
+        let mut rng = Pcg64::seed_from_u64(7);
+        let contacts = active_contacts(&"s_1".into(), Vec2::new(500.0, 500.0), &world, &mut rng);
+        assert!(
+            contacts.is_empty(),
+            "silent target at 250u (> 350 * 0.5) should be invisible to active"
+        );
+    }
+
+    #[test]
+    fn awacs_sees_through_silent_running() {
+        use crate::sim::PowerupId;
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
+        // Viewer with AWACS active.
+        let mut viewer = ship("s_1", 500.0, 500.0);
+        viewer.powerups.selected = vec![PowerupId::AwacsScan];
+        viewer.powerups.awacs_expires_at = 100;
+        world.insert_ship(viewer);
+        // Silent target at 250u east — without AWACS, this would be invisible.
+        let mut s2 = ship("s_2", 750.0, 500.0);
+        s2.powerups.selected = vec![PowerupId::SilentRunning];
+        s2.powerups.silent_running_expires_at = 100;
+        world.insert_ship(s2);
+        let mut rng = Pcg64::seed_from_u64(7);
+        let contacts = active_contacts(&"s_1".into(), Vec2::new(500.0, 500.0), &world, &mut rng);
+        assert_eq!(
+            contacts.len(),
+            1,
+            "AWACS should bypass silent_running and see the target"
+        );
+    }
+
+    #[test]
+    fn smoke_screen_blocks_active_radar_from_outside() {
+        use crate::sim::world::SmokeCloud;
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
+        world.insert_ship(ship("s_1", 100.0, 500.0));
+        world.insert_ship(ship("s_2", 400.0, 500.0));
+        // A smoke cloud centred on s_2 — viewer s_1 is outside, target is inside.
+        world.smoke_clouds.push(SmokeCloud {
+            pos: Vec2::new(400.0, 500.0),
+            radius: 60.0,
+            expires_at: 100,
+        });
+        let mut rng = Pcg64::seed_from_u64(7);
+        let contacts = active_contacts(&"s_1".into(), Vec2::new(100.0, 500.0), &world, &mut rng);
+        assert!(
+            contacts.is_empty(),
+            "smoke should block external active sight: {contacts:?}"
+        );
+        // From *inside* the smoke, the same target should be visible.
+        let mut rng = Pcg64::seed_from_u64(7);
+        let from_inside = active_contacts(&"s_1".into(), Vec2::new(380.0, 500.0), &world, &mut rng);
+        assert_eq!(
+            from_inside.len(),
+            1,
+            "viewer inside the same smoke cloud should still see the target"
+        );
+    }
+
+    #[test]
+    fn emp_burst_empties_active_radar_for_affected_ship() {
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
+        let mut viewer = ship("s_1", 500.0, 500.0);
+        viewer.powerups.emp_expires_at = 100;
+        world.insert_ship(viewer);
+        world.insert_ship(ship("s_2", 700.0, 500.0));
+        let mut rng = Pcg64::seed_from_u64(7);
+        let contacts = active_contacts(&"s_1".into(), Vec2::new(500.0, 500.0), &world, &mut rng);
+        assert!(
+            contacts.is_empty(),
+            "an EMP'd ship should see nothing on active radar: {contacts:?}"
+        );
+    }
+
+    #[test]
+    fn decoy_appears_in_other_ships_active_but_not_owners() {
+        use crate::sim::world::Decoy;
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
+        world.insert_ship(ship("s_1", 500.0, 500.0));
+        world.insert_ship(ship("s_2", 700.0, 500.0));
+        // s_2 deploys a decoy 50u east of itself.
+        world.decoys.push(Decoy {
+            fake_id: 0,
+            owner: "s_2".into(),
+            pos: Vec2::new(750.0, 500.0),
+            heading_deg: 90.0,
+            expires_at: 100,
+        });
+        let mut rng = Pcg64::seed_from_u64(7);
+        // s_1 sees the real s_2 and the decoy = 2 contacts.
+        let from_one = active_contacts(&"s_1".into(), Vec2::new(500.0, 500.0), &world, &mut rng);
+        assert_eq!(from_one.len(), 2, "viewer should see real ship + decoy");
+        // s_2 (the owner) does not see its own decoy — just nothing visible (no other
+        // ships in range from its perspective).
+        let mut rng = Pcg64::seed_from_u64(7);
+        let from_owner = active_contacts(&"s_2".into(), Vec2::new(700.0, 500.0), &world, &mut rng);
+        assert_eq!(
+            from_owner.len(),
+            1,
+            "decoy owner should not see its own decoy"
+        );
     }
 
     #[test]

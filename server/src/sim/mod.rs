@@ -7,8 +7,10 @@ pub mod combat;
 pub mod config;
 pub mod constants;
 pub mod physics;
+pub mod powerups;
 pub mod sensors;
 pub mod world;
 
-pub use config::SimConfig;
-pub use world::{BotId, Shell, Ship, ShipId, World};
+pub use config::{PowerupConfig, SimConfig};
+pub use powerups::{ActivationError, PowerupId, PowerupState};
+pub use world::{BotId, Decoy, Shell, Ship, ShipId, SmokeCloud, World};
