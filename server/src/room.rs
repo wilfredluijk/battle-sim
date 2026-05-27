@@ -1638,15 +1638,23 @@ impl Room {
             },
             max_bots: self.max_bots,
             sim_config: self.world.config,
-            bots: self
-                .bots
-                .values()
-                .map(|b| ReplayBot {
-                    bot_id: b.bot_id.clone(),
-                    ship_id: b.ship_id.clone(),
-                    name: b.name.clone(),
-                })
-                .collect(),
+            bots: {
+                // `self.bots` is a `BTreeMap` keyed by the string `BotId`, so `.values()`
+                // yields lexicographic order (`b_10` ahead of `b_2`). Sort into
+                // registration order so the header matches what `rebuild_room_from_header`
+                // reconstructs.
+                let mut bots: Vec<ReplayBot> = self
+                    .bots
+                    .values()
+                    .map(|b| ReplayBot {
+                        bot_id: b.bot_id.clone(),
+                        ship_id: b.ship_id.clone(),
+                        name: b.name.clone(),
+                    })
+                    .collect();
+                bots.sort_by_key(|b| replay::bot_id_seq(&b.bot_id));
+                bots
+            },
         };
         if let Err(e) = writer.write(&ReplayRecord::Header(header)) {
             warn!(room = %self.name, error = %e, "failed to write replay header");

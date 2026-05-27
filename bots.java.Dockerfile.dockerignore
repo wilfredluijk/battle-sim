@@ -1,0 +1,10 @@
+# Per-Dockerfile ignore for bots.java.Dockerfile — replaces the root
+# .dockerignore for this image's build context. Exclude everything, then allow
+# back only what the Java bot image needs.
+*
+!sdk-java
+!examples
+# ...minus build artefacts that may live inside those trees.
+**/target
+**/node_modules
+**/__pycache__

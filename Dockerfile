@@ -16,7 +16,7 @@ RUN npm run build
 # Produces /spectator/dist/{index.html,index.js,index.css}
 
 # ---- stage 2: server build ----
-FROM rust:1.86-slim AS server-build
+FROM rust:1.95-slim AS server-build
 WORKDIR /build
 
 # Dep-cache trick: copy just the manifests, build a stub binary so cargo fetches & compiles

@@ -1,0 +1,12 @@
+# Per-Dockerfile ignore for bots.python.Dockerfile — replaces the root
+# .dockerignore for this image's build context. Exclude everything, then allow
+# back only what the Python bot image needs.
+*
+!sdk-python
+!examples
+# ...minus build artefacts that may live inside those trees.
+**/target
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
