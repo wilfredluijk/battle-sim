@@ -21,7 +21,6 @@ replays
 
 # Docs / sibling projects not needed by the server build.
 docs
-sdk-java
 sdk-python
 examples
 spectator/legacy

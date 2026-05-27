@@ -11,7 +11,7 @@ has lost the picture, fire only when a vetted shot is available.
 
 Run against a local server:
 
-    python examples/python/tactician_bot.py --host localhost --port 7878 --name tactician
+    python examples/tactician_bot.py --host localhost --port 7878 --name tactician
 """
 
 from __future__ import annotations

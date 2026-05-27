@@ -615,7 +615,6 @@ The server's release version is included in `welcome.version` (planned — curre
 - Added `/admin` WebSocket endpoint gated by a rotating token (logged at startup, overridable with `--admin-token`). Client → server: `start`, `abort`, `reset`, `kick`. Server → client: `state` snapshots on every transition, plus `ack` / `error`.
 - Added server → bot `lobby` message. After every `game_over` the room auto-returns to `Lobby` (~2 s post-game pause), reseeds the RNG from `--seed`, and emits `lobby` to every connected bot. Bots stay connected across matches; `bot_id` and `ship_id` are stable per connection.
 - Python SDK: `Bot.on_game_over` now returns `Optional[bool]` (return `False` to disconnect, default `True`). New `Bot.on_lobby` hook. SDK auto-sends `ready` on `lobby`.
-- Java SDK: `Bot.onGameOver` now returns `boolean`. New `Bot.onLobby` hook. SDK auto-sends `ready` on `lobby`.
 - Backwards compatible for bots that subclass with defaults — they automatically participate in subsequent matches.
 
 ## 2026-05-12 — richer spectator world frames

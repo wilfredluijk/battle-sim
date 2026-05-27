@@ -7,7 +7,7 @@ bot author writes *intent*, not plumbing.
 
 Run against a local server:
 
-    python examples/python/strategist_bot.py --host localhost --port 7878 --name strategist
+    python examples/strategist_bot.py --host localhost --port 7878 --name strategist
 """
 
 from __future__ import annotations

@@ -22,7 +22,7 @@ Conventions:
 | 7 | Spectator | **complete** |
 | 8 | Replay | **complete** |
 | 9 | Python SDK | **complete** |
-| 9b | Java SDK | **complete** |
+| 9b | Java SDK | **retired** |
 | 10 | Examples and onboarding | pending |
 | 11 | Polish | **complete** |
 
@@ -188,53 +188,14 @@ Conventions:
 
 ---
 
-## Phase 9b — Java SDK  *(complete)*
+## Phase 9b — Java SDK  *(retired)*
 
-A second reference SDK for JVM bot authors. Same trust model and ergonomics as
-the Python SDK: subclass `Bot`, override `onTick`, return a `Command`. The
-runtime owns the WebSocket, the handshake, and the message dispatch. Bot code
-never sees raw frames unless it opts in via the `rawSend` / `rawRecv` escape
-hatches.
-
-### 9b.1 Module skeleton  *(done)*
-- **Deliverable:** `sdk-java/` Maven project (`pom.xml`) producing artifact
-  `naval-sdk` under group `com.battlesim`. Minimal runtime deps: `Java-WebSocket`
-  for transport and `Jackson` for JSON; `junit-jupiter` for tests only. JDK 17+.
-- **Acceptance:** `mvn -q -DskipTests package` produces a jar; `mvn -q test`
-  runs (even with zero tests).
-
-### 9b.2 Protocol classes  *(done)*
-- **Deliverable:** `com.battlesim.naval.protocol` package mirroring the Python
-  dataclasses: immutable POJOs for `Welcome`, `ShipSpecs`, `MapInfo`,
-  `GameStart`, `WorldView`, `SelfState`, `Contact`, `GameOver`, plus event
-  types `HitEvent` / `ShellSplashEvent`. Outbound `Command` builder with
-  `fireAt(...)` analogous to the Python helper, and `FireCommand` value type.
-  All parsed via Jackson with tolerant `from(JsonNode)` factories that log and
-  skip unknown fields rather than throwing.
-- **Acceptance:** Round-trip tests that read the canonical `tick` and `welcome`
-  frames from PROTOCOL.md and assert the parsed values; `Command.toJson(tick)`
-  matches the schema documented in PROTOCOL.md §1.1.
-
-### 9b.3 Connection and message loop  *(done)*
-- **Deliverable:** `com.battlesim.naval.Bot` abstract class with overridable
-  callbacks (`onWelcome`, `onGameStart`, `onTick`, `onGameOver`, `onError`).
-  `BotRunner.run(bot, host, port, name)` performs the WebSocket connect, sends
-  `hello`, waits for `welcome`, sends `ready`, then pumps frames until
-  `game_over`. Malformed frames are logged (via `java.util.logging`) and
-  skipped, mirroring Python SDK behaviour. `rawSend(ObjectNode)` and
-  `rawRecv()` are exposed for power users.
-- **Acceptance:** A `Bot` subclass returning `new Command().throttle(1.0)` is
-  documented in the README as the smoke-test bot; `mvn test` includes
-  protocol-parse tests but not a live-server integration test (that lives
-  outside the SDK module).
-
-### 9b.4 Math helpers  *(done)*
-- **Deliverable:** `com.battlesim.naval.Geometry` with `bearingTo`, `distance`,
-  `leadTarget` matching the Python SDK's behaviour and bearing convention
-  (0° = north / -y, 90° = east / +x).
-- **Acceptance:** JUnit tests cover the four cardinal bearings, the
-  stationary-target lead case, a crossing-target lead case, and the
-  unreachable-target case.
+A second reference SDK for JVM bot authors shipped alongside the Python SDK
+under `sdk-java/`, with parallel example bots under `examples/java/` and a
+shared `bots.java.Dockerfile`. It mirrored the Python SDK's shapes (subclass
+`Bot`, override `onTick`, return a `Command`) and reached parity on the
+tactical toolkit. The Java SDK and its examples were later removed; the Python
+SDK is the only reference implementation.
 
 ---
 

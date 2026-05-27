@@ -27,7 +27,7 @@ produce the same outcome.
 
 Run against a local server:
 
-    python examples/python/powerful_bot.py --host localhost --port 7878 --name warlord
+    python examples/powerful_bot.py --host localhost --port 7878 --name warlord
 """
 
 from __future__ import annotations

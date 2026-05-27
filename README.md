@@ -6,7 +6,7 @@ naval simulation. A browser spectator renders matches live, and every match is
 saved as a JSONL replay log that can be re-played at full fidelity.
 
 **Pick the doc you need:**
-- **Writing a bot?** Start with the SDK guide: [`docs/SDK_GUIDE.md`](docs/SDK_GUIDE.md). Reference SDKs live in [`sdk-python/`](sdk-python/) and [`sdk-java/`](sdk-java/), with runnable examples under [`examples/`](examples/).
+- **Writing a bot?** Start with the SDK guide: [`sdk-python/README.md`](sdk-python/README.md). Runnable examples live under [`examples/`](examples/).
 - **Implementing the wire protocol directly?** Read [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — every Bot↔Server and Server→Spectator frame is documented there.
 - **Curious how the game works?** [`system-design.md`](system-design.md) covers physics, sensors, weapons, and the trust model.
 
@@ -14,12 +14,11 @@ saved as a JSONL replay log that can be re-played at full fidelity.
 
 ```
 server/         Rust binary — authoritative simulation, WebSocket server, replay log
-sdk-python/     Reference Python SDK (`pip install -e .`)
-sdk-java/       Reference Java SDK (Maven, JDK 17+)
-examples/       Runnable example bots: circle / chaser / sniper, plus Java variants
+sdk-python/     Reference Python SDK (`pip install -e .`); README is the bot author's manual
+examples/       Runnable example bots covering each tactical layer
 spectator/      Svelte + TypeScript + Vite app. Bundle is built to spectator/dist/
                 and baked into the server binary via `include_str!`.
-docs/           PROTOCOL.md, SDK_GUIDE.md, TACTICAL_TOOLKIT.md, design-decisions/
+docs/           PROTOCOL.md (wire protocol) + design-decisions/
 Dockerfile      Multi-stage build (node → rust → debian-slim) producing a
                 self-contained server image.
 docker-compose.yml  One-service compose for `docker compose up --build`.
@@ -135,13 +134,12 @@ admin password first). The bot will start receiving `tick` frames; reply with
 `command` messages each tick. Full message reference in
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
-In practice you'll use one of the reference SDKs — Python ([`sdk-python/`](sdk-python/))
-or Java ([`sdk-java/`](sdk-java/)) — and start from an example under
-[`examples/`](examples/) (`circle_bot.py`, `chaser_bot.py`, `sniper_bot.py`,
-plus Java equivalents). The SDK owns the WebSocket, the handshake, and frame
-dispatch; you only override `on_tick`. See [`docs/SDK_GUIDE.md`](docs/SDK_GUIDE.md)
-for the API surface and [`docs/TACTICAL_TOOLKIT.md`](docs/TACTICAL_TOOLKIT.md)
-for the helm / tracker / sensor helpers.
+In practice you'll use the reference Python SDK ([`sdk-python/`](sdk-python/))
+and start from an example under [`examples/`](examples/) (`circle_bot.py`,
+`tactician_bot.py`, `strategist_bot.py`, …). The SDK owns the WebSocket, the
+handshake, and frame dispatch; you only override `on_tick`. The SDK README
+covers the API surface, match lifecycle, and the optional tactical toolkit
+(helm / tracker / sensor / evader helpers).
 
 ## Replays
 

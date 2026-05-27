@@ -1,9 +1,10 @@
 # Design Decision: SDK Tactical Toolkit
 
-**Status:** Implemented (Python and Java SDKs)
+**Status:** Implemented (Python SDK)
 **Date:** 2026-05-13
-**Scope:** `sdk-python/` and `sdk-java/` — same shapes, same defaults, one
-document per language for installation/idioms.
+**Scope:** `sdk-python/`. A Java port (`sdk-java/`) was shipped alongside the
+Python implementation but has since been retired; this document reflects the
+Python design only.
 
 ---
 
@@ -108,8 +109,6 @@ sdk-python/naval_sdk/
 ```
 
 Keeping `tactical/` as a sub-package makes the L0/L1 surface unchanged and signals "this is opt-in."
-
-The Java SDK mirrors this layout under `sdk-java/src/main/java/com/battlesim/naval/tactical/`, with one class per file (`Tracker.java`, `Gunner.java`, `Helm.java`, `SensorPolicy.java`, `Evader.java`, `Intent.java`, `ThreatList.java`, `TacticalContext.java`, `TacticalBot.java`, `Track.java`, `FireSolution.java`). `Intent` is a sealed interface with record variants instead of Python's tagged-union dataclass.
 
 ### 4.2 Tracker — the keystone
 

@@ -9,7 +9,7 @@ and converting that estimate into a vetted shot.
 
 Run against a local server:
 
-    python examples/python/tracking_bot.py --host localhost --port 7878 --name tracker
+    python examples/tracking_bot.py --host localhost --port 7878 --name tracker
 """
 
 from __future__ import annotations

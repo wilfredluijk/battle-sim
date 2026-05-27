@@ -1,4 +1,4 @@
-# Image for the Python example bots (examples/python/*.py).
+# Image for the Python example bots (examples/*.py).
 # Built once and shared by every Python bot service in docker-compose.bots.yml.
 #
 # Uses a per-Dockerfile ignore file (bots.python.Dockerfile.dockerignore) so the
@@ -13,6 +13,6 @@ COPY sdk-python/ ./sdk-python/
 RUN pip install --no-cache-dir ./sdk-python
 
 # The example bots. Run as: python bots/<name>.py --host ... --port ... --name ...
-COPY examples/python/ ./bots/
+COPY examples/ ./bots/
 
 ENTRYPOINT ["python"]

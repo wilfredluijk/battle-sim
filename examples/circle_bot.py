@@ -7,7 +7,7 @@ purely a baseline for the other examples to outperform.
 
 Run against a local server:
 
-    python examples/python/circle_bot.py --host localhost --port 7878 --name circler
+    python examples/circle_bot.py --host localhost --port 7878 --name circler
 """
 
 from __future__ import annotations

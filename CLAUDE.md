@@ -111,7 +111,7 @@ npm run dev                  # http://localhost:5173 with HMR.
 docker compose up --build    # builds the multi-stage image and serves on :7878.
                              #   Replays land in ./replays/ via bind-mount.
 
-# Start every example bot (5 Python + 6 Java), each in its own container.
+# Start every example bot, each in its own container.
 # Needs a server already running (the `docker compose up` above, or `cargo run`).
 docker compose -f docker-compose.bots.yml up --build
                              #   Bots reach the server at host.docker.internal:7878.

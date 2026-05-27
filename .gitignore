@@ -1,6 +1,4 @@
 /server/target/
-/sdk-java/target/
-/examples/*/target/
 /server/replays/
 
 # Python build/test artifacts

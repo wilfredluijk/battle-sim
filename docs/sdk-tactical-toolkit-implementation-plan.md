@@ -57,7 +57,7 @@ Companion to [`design-decisions/sdk-tactical-toolkit.md`](./design-decisions/sdk
 
 ## Phase 4 — Documentation pass (1 day)
 
-- Add a "Tactical Toolkit" section to `docs/SDK_GUIDE.md`.
+- Add a "Tactical Toolkit" section to the SDK README.
 - Add a cookbook page showing the same bot written at L0, L2, and L3 side-by-side.
 - Add a short determinism note clarifying that bot-side code is not bound by the simulation's determinism rules.
 - Update `docs/QUICKSTART.md` to point new players at `TacticalBot` as the recommended starting point.
@@ -83,22 +83,8 @@ Companion to [`design-decisions/sdk-tactical-toolkit.md`](./design-decisions/sdk
 
 ---
 
-## Follow-up: Java SDK parity (completed)
+## Follow-up: Java SDK port (retired)
 
-After landing the Python toolkit, the same shapes were ported to the Java
-SDK under `com.battlesim.naval.tactical` with identical default constants:
-
-- Geometry helpers (`signedBearingDelta`, `wrapBearing`, `clamp`) added to
-  `com.battlesim.naval.Geometry`.
-- L2 components ported as Java classes: `Tracker`, `Gunner`, `Helm`,
-  `SensorPolicy` (functional interface + four nested static
-  implementations), `Evader`.
-- L3 orchestrator ported as `TacticalBot` with `Intent` as a sealed
-  interface and record variants.
-- Mirrored test suite: 53 Java tests (was 16) covering each component and
-  an end-to-end synthetic-match harness.
-- Example bots rewritten: `TrackingCircleBot` (190 → 68 lines),
-  `StrongTacticalBot` (330 → 120 lines), new `StrategistBot` (~65 lines,
-  ~30 of tactical code).
-- `docs/TACTICAL_TOOLKIT.md` updated with a Python ↔ Java shape map so the
-  same document serves both languages.
+A second SDK at `sdk-java/` mirrored the Python toolkit shape-for-shape and
+shipped alongside it. It was later retired together with its example bots; the
+Python SDK is the only reference implementation.
