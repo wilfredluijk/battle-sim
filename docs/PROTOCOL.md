@@ -37,6 +37,19 @@ Sent after `welcome` is received and the bot is willing to start.
 { "type": "ready" }
 ```
 
+#### `select_powerups`
+Optional. Declare the (exactly two distinct) powerups this bot will use for the match. May only be sent while the room is in `lobby`; the bot may send it before *or* after `ready`, but always before `game_start`. Sending it twice in lobby replaces the previous selection. Bots that never send it play with no powerups (vanilla).
+
+```json
+{ "type": "select_powerups", "powerups": ["rapid_fire", "heavy_shell"] }
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `powerups` | array of string | Exactly 2 distinct ids from `welcome.available_powerups`. |
+
+Validation errors come back as typed `error` frames; the previous selection (if any) is preserved on failure. See §3 for the `powerup_*` codes. The full catalog and tuning lives in `docs/POWERUPS.md`.
+
 #### `command`
 Sent once per tick in response to a `tick` message. Echo the tick number from the `tick` frame.
 
@@ -47,7 +60,8 @@ Sent once per tick in response to a `tick` message. Echo the tick number from th
   "throttle": 0.8,
   "rudder": -0.3,
   "fire": { "bearing_deg": 47.5, "range": 300.0 },
-  "sensor_mode": "active"
+  "sensor_mode": "active",
+  "activate_powerup": "overdrive"
 }
 ```
 
@@ -60,6 +74,7 @@ Sent once per tick in response to a `tick` message. Echo the tick number from th
 | `fire.bearing_deg` | f32 | Absolute compass bearing for the shell. |
 | `fire.range` | f32 | Requested travel distance, clamped server-side to `max_shell_range`. |
 | `sensor_mode` | `"active"` \| `"passive"` | Required. |
+| `activate_powerup` | string, optional | One-off activation of a powerup this bot picked (e.g. `"rapid_fire"`). Resolved alongside `fire` on the same tick. Each picked powerup can activate at most once per match. Unknown or already-used ids yield typed `powerup_*` errors. See `docs/POWERUPS.md` for the catalog. |
 
 ### 1.2 Server → Bot
 
@@ -86,11 +101,18 @@ Acknowledges the `hello` and assigns identifiers and gameplay constants.
     "max_shell_range": 300.0,
     "splash_radius": 15.0,
     "max_splash_damage": 25
-  }
+  },
+  "available_powerups": [
+    "overdrive", "reinforced_hull", "repair_drones", "smoke_screen",
+    "rapid_fire", "heavy_shell", "long_range_salvo", "awacs_scan",
+    "silent_running", "counter_battery_trace", "emp_burst", "decoy_flare"
+  ]
 }
 ```
 
 Field values shown above are the current defaults; the live `welcome` payload always reflects whatever the server is actually running. The runtime authority for these constants is `server/src/sim/constants.rs` — `ship_specs` is derived from there.
+
+`available_powerups` is the catalog the server understands; pass any of these ids to `select_powerups`. See `docs/POWERUPS.md` for what each one does.
 
 #### `game_start`
 Sent when the operator transitions the room to `running`.
@@ -119,7 +141,12 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
     "hp": 78,
     "ammo": 14,
     "rudder": -0.3,
-    "throttle": 0.8
+    "throttle": 0.8,
+    "selected_powerups": ["overdrive", "rapid_fire"],
+    "powerup_status": [
+      { "id": "overdrive",  "used": false, "active_ticks_left": 0 },
+      { "id": "rapid_fire", "used": true,  "active_ticks_left": 23 }
+    ]
   },
   "contacts": [
     {
@@ -133,7 +160,8 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
   ],
   "events": [
     { "type": "hit", "amount": 12 },
-    { "type": "shell_splash", "pos": [220.0, 505.0] }
+    { "type": "shell_splash", "pos": [220.0, 505.0] },
+    { "type": "powerup_activated", "ship_id": "s_2", "powerup": "smoke_screen" }
   ]
 }
 ```
@@ -144,7 +172,11 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
 
 `contacts[].kind` is one of `"ship"`, `"shell"`, `"unknown"`.
 
-`events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range.
+`events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range, plus `powerup_activated` events for the bot's own activations and any activation by a currently-visible ship.
+
+`self.selected_powerups` and `self.powerup_status` are omitted (or sent as empty arrays) when the bot picked no powerups. `powerup_status[i].active_ticks_left` counts down each tick; check `used && active_ticks_left == 0` to know a pick is spent.
+
+A bot with `counter_battery_trace` armed will see a synthetic precise contact for the attacker in the next three tick frames after the trace fires. These contacts use a `cbt_<n>` id and full confidence.
 
 #### `game_over`
 Sent when a match ends — either naturally (last ship standing / match timeout) or because the operator aborted. `winner` is `null` for a draw **or an aborted match**.
@@ -185,8 +217,8 @@ If a `command` arrives after the per-tick deadline, the server replies with `err
 Bots persist across matches on a single WebSocket connection:
 
 ```
-hello → welcome → (ready) → game_start → tick* → game_over →
-                  (lobby) → (ready) → game_start → tick* → game_over → …
+hello → welcome → [select_powerups] → ready → game_start → tick* → game_over →
+                  (lobby) → [select_powerups] → ready → game_start → tick* → … 
 ```
 
 - `welcome` is sent exactly once per connection.
@@ -220,7 +252,12 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
       "alive": true,
       "ready": true,
       "commands_per_sec": 10.0,
-      "sensor_mode": "active"
+      "sensor_mode": "active",
+      "selected_powerups": ["overdrive", "rapid_fire"],
+      "powerup_status": [
+        { "id": "overdrive",  "used": false, "active_ticks_left": 0 },
+        { "id": "rapid_fire", "used": true,  "active_ticks_left": 23 }
+      ]
     }
   ],
   "shells": [
@@ -234,7 +271,20 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
   "events": [
     { "type": "hit", "ship_id": "s_1", "amount": 12 },
     { "type": "shell_splash", "pos": [220.0, 505.0] },
-    { "type": "death", "ship_id": "s_2" }
+    { "type": "death", "ship_id": "s_2" },
+    { "type": "powerup_activated", "ship_id": "s_1", "powerup": "rapid_fire" }
+  ],
+  "smoke_clouds": [
+    { "pos": [320.0, 480.0], "radius": 60.0, "expires_at": 222 }
+  ],
+  "decoys": [
+    {
+      "fake_id": 0,
+      "owner": "s_2",
+      "pos": [500.0, 500.0],
+      "heading_deg": 90.0,
+      "expires_at": 200
+    }
   ]
 }
 ```
@@ -248,6 +298,10 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
 `ships[].ready` is the lobby-readiness flag — `true` once the bot has sent `ready`. It stays `true` for the rest of the match.
 
 `ships[].commands_per_sec` is the number of `command` frames the room accepted from this bot over the last second of sim time (i.e. the last `tick_hz` ticks). The value is zero in the lobby and ticks up once the match is running. Late, stale, or violation-rejected commands do not count.
+
+`ships[].selected_powerups` and `ships[].powerup_status` mirror the per-bot tick fields and are sent for spectator HUDs. Both are omitted (or empty arrays) when the bot picked nothing.
+
+`smoke_clouds[]` lists live `smoke_screen` clouds; `decoys[]` lists live `decoy_flare` phantoms. Both arrays are omitted (or empty) when no such entity exists this tick. Spectators get full ground truth — bots only learn about smoke / decoys via the contact filter.
 
 ---
 
@@ -452,6 +506,12 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `stale_command` | `command.tick` was outside the accepted window (`world_tick ± 1`). |
 | `non_finite_value` | A command contained `NaN` or `Inf` in `throttle`, `rudder`, or `fire.{bearing_deg,range}`. |
 | `handshake_timeout` | The bot connected but did not send `hello` within the handshake timeout. The connection is closed. |
+| `powerup_unknown` | `select_powerups` or `command.activate_powerup` referenced an id not in `welcome.available_powerups`. |
+| `powerup_duplicate` | `select_powerups.powerups` listed the same id twice. |
+| `powerup_wrong_count` | `select_powerups.powerups` did not contain exactly two entries. |
+| `powerup_lobby_only` | `select_powerups` was sent while the room was not in `lobby`. |
+| `powerup_not_selected` | `command.activate_powerup` named a powerup the bot didn't pick for this match. |
+| `powerup_already_used` | `command.activate_powerup` named a powerup the bot already activated this match. |
 
 After 5 protocol violations on a single bot connection, the server sends `too_many_violations` and closes with WebSocket close code `Policy (1008)`. The violation-counted codes are `malformed_json`, `invalid_message`, `non_finite_value`, and `binary_frames_unsupported`. `handshake_timeout` and `invalid_name` close the connection on the first occurrence and bypass the counter. `late_command`, `stale_command`, `cooldown_active`, and `no_ammo` are gameplay rejections and do not count against the bot.
 
@@ -473,6 +533,19 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-05-27 — powerups
+
+- New `select_powerups` bot→server message (§1.1).
+- New optional `activate_powerup` field on `command`.
+- New `welcome.available_powerups` array advertising the server's catalog.
+- `tick.self` gained optional `selected_powerups` and `powerup_status` arrays.
+- New `powerup_activated` `events[]` entry on both the `tick` and `world` payloads.
+- Spectator `world` payload gained optional `smoke_clouds[]` and `decoys[]` arrays, plus per-ship `selected_powerups` / `powerup_status`.
+- New `powerup_*` error codes: `powerup_unknown`, `powerup_duplicate`, `powerup_wrong_count`, `powerup_lobby_only`, `powerup_not_selected`, `powerup_already_used`.
+- Replay format bumped to `v3` (older logs are rejected with `replay_format_version`). The header now records each bot's `selected_powerups` and each `ReplayCommand` may carry `activate_powerup`.
+
+All additions are forward-compatible for bots that don't use powerups: omit `select_powerups` and the new fields, and play as before.
 
 ## 2026-05-21 — replay viewer REST routes
 

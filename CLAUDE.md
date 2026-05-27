@@ -31,6 +31,8 @@ The simulation must produce bit-identical results given the same seed and comman
 
 When in doubt: if the code path runs inside `step_tick()`, assume it must be deterministic.
 
+Powerups (`server/src/sim/powerups.rs`) are part of this contract: every effect helper reads only `Ship`, `World`, `world.tick`, and `PowerupConfig` — never wall-clock or `thread_rng`. The catalog of one-off powerups bots pick at match start lives there; see `docs/POWERUPS.md` for the published behaviour.
+
 ### Trust boundary
 
 The server never executes bot code. Bots are remote WebSocket clients. Anything coming in on `/bot` is **untrusted input** — validate it, bound it, and never let a malformed message panic the server task. A bot sending garbage should get an `error` message and possibly a disconnect, never crash the room.

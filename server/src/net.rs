@@ -807,6 +807,7 @@ async fn handle_bot(
                                 rudder,
                                 fire,
                                 sensor_mode,
+                                activate_powerup,
                             }) => {
                                 if let Err(reason) =
                                     validate_command_floats(throttle, rudder, fire.as_ref())
@@ -833,11 +834,25 @@ async fn handle_bot(
                                     rudder,
                                     sensor_mode,
                                     fire,
+                                    activate_powerup,
                                 };
                                 if room_tx
                                     .send(RoomEvent::BotCommand {
                                         bot_id: bot_id.clone(),
                                         command,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    debug!(%peer, "room channel closed; ending bot loop");
+                                    break;
+                                }
+                            }
+                            Ok(BotMsg::SelectPowerups { powerups }) => {
+                                if room_tx
+                                    .send(RoomEvent::BotSelectPowerups {
+                                        bot_id: bot_id.clone(),
+                                        powerups,
                                     })
                                     .await
                                     .is_err()

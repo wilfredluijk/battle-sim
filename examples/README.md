@@ -7,6 +7,8 @@ Language-specific bot examples live in subfolders:
   - `tracking_bot.py`, `tactician_bot.py` — composed L2 tactical components
     (`Tracker`, `Gunner`, `Helm`, `Evader`, `SensorPolicy`).
   - `strategist_bot.py` — Layer 3 `TacticalBot` with a single `decide()` method.
+  - `loadout_bot.py` — picks two powerups and chains them in a burst combo.
+    See [`../docs/POWERUPS.md`](../docs/POWERUPS.md) for the full catalog.
 - [`java`](java) — Java bots built on `sdk-java`:
   - `SimpleCircleBot` — bare protocol (Layer 0).
   - `TrackingCircleBot`, `StrongTacticalBot` — composed L2 tactical
