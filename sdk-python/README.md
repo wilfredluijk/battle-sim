@@ -37,16 +37,17 @@ debugging at the wire level or building a non-Python client.
 5. [What you see each tick](#what-you-see-each-tick)
 6. [How a match flows](#how-a-match-flows)
 7. [Coordinates, bearings, and units](#coordinates-bearings-and-units)
-8. [Base API reference](#base-api-reference)
-9. [Tactical toolkit](#tactical-toolkit)
-10. [Example bots](#example-bots)
-11. [Errors and how to react](#errors-and-how-to-react)
-12. [Common pitfalls](#common-pitfalls)
-13. [Logging and debugging](#logging-and-debugging)
-14. [Escape hatches: raw frames](#escape-hatches-raw-frames)
-15. [Testing your bot](#testing-your-bot)
-16. [Determinism](#determinism)
-17. [Versioning and compatibility](#versioning-and-compatibility)
+8. [Powerups](#powerups)
+9. [Base API reference](#base-api-reference)
+10. [Tactical toolkit](#tactical-toolkit)
+11. [Example bots](#example-bots)
+12. [Errors and how to react](#errors-and-how-to-react)
+13. [Common pitfalls](#common-pitfalls)
+14. [Logging and debugging](#logging-and-debugging)
+15. [Escape hatches: raw frames](#escape-hatches-raw-frames)
+16. [Testing your bot](#testing-your-bot)
+17. [Determinism](#determinism)
+18. [Versioning and compatibility](#versioning-and-compatibility)
 
 ---
 
@@ -288,11 +289,14 @@ real position estimate. Use `bearing_deg` and gate on `range is None`.
 
 ### Events
 
-Things that happened in your vicinity this tick. Bots see two kinds:
+Things that happened in your vicinity this tick. Bots see three kinds:
 
-- `Hit` — *you* just took damage, with the HP amount.
-- `ShellSplash` — a shell exploded within sensor range. The bot
+- `HitEvent` — *you* just took damage, with the HP amount.
+- `ShellSplashEvent` — a shell exploded within sensor range. The bot
   doesn't get to see whose shell it was, only where it went off.
+- `PowerupActivatedEvent` — a ship activated a powerup. Always emitted
+  for your own activations; emitted for other ships only when they are
+  currently a sensor contact of yours. See [Powerups](#powerups).
 
 You don't get a `Death` event for yourself — when your HP reaches
 zero, the next message you receive is `game_over`. Other ships'
@@ -306,15 +310,16 @@ Every bot connection follows the same lifecycle. The SDK drives all of
 it for you — the table below is for understanding *what your callbacks
 see and when*.
 
-| # | Direction | Frame        | What the SDK does                                                                 |
-|---|-----------|--------------|-----------------------------------------------------------------------------------|
-| 1 | bot → srv | `hello`      | Sent automatically when you call the SDK's `run` entry point.                     |
-| 2 | srv → bot | `welcome`    | SDK parses it, stores it on the bot, fires `on_welcome`, sends `ready`.           |
-| 3 | srv → bot | `game_start` | SDK fires `on_game_start`.                                                        |
-| 4 | srv → bot | `tick` …     | SDK fires `on_tick` and sends your returned `Command` back.                       |
-| 5 | srv → bot | `game_over`  | SDK fires `on_game_over`. By default the bot stays connected.                     |
-| 6 | srv → bot | `lobby`      | Sent ~2s later, after the post-game pause. SDK fires `on_lobby`, sends `ready` again. |
-| 7 | →          | (loop)       | Steps 3–6 repeat for every match the operator starts.                             |
+| # | Direction | Frame              | What the SDK does                                                                 |
+|---|-----------|--------------------|-----------------------------------------------------------------------------------|
+| 1 | bot → srv | `hello`            | Sent automatically when you call the SDK's `run` entry point.                     |
+| 2 | srv → bot | `welcome`          | SDK parses it, stores it on the bot, fires `on_welcome`, then calls `choose_powerups`. |
+| 3 | bot → srv | `select_powerups`  | Sent only if `choose_powerups` returns a non-empty list. Then SDK sends `ready`.  |
+| 4 | srv → bot | `game_start`       | SDK fires `on_game_start`.                                                        |
+| 5 | srv → bot | `tick` …           | SDK fires `on_tick` and sends your returned `Command` back.                       |
+| 6 | srv → bot | `game_over`        | SDK fires `on_game_over`. By default the bot stays connected.                     |
+| 7 | srv → bot | `lobby`            | Sent ~2s later, after the post-game pause. SDK fires `on_lobby`, sends `ready` again. The previous match's powerup selection is **not** resent — `choose_powerups` only runs once per connection. |
+| 8 | →          | (loop)             | Steps 4–7 repeat for every match the operator starts.                             |
 
 Between (2) and (3) the server is in **lobby**: it waits for *all*
 connected bots to be ready before starting. Your bot can connect any
@@ -361,6 +366,119 @@ helper returns the value the server expects.
 
 ---
 
+## Powerups
+
+Before each match a bot can pick **two distinct powerups** from the
+server's catalog. Each pick can be activated **once** during the match
+for a time-bounded effect (speed boost, splash buff, smoke screen,
+EMP …). Vanilla play — no picks at all — is also valid; bots that
+ignore powerups keep working unchanged.
+
+The full catalog (effect, duration, synergies, counters) lives in
+[`../docs/POWERUPS.md`](../docs/POWERUPS.md). This section only covers
+the SDK surface; for what `overdrive` actually *does* read the catalog.
+
+### Selecting a loadout
+
+Override `choose_powerups(welcome) → list[str]`. The SDK calls it
+once, right after `on_welcome`, and sends `select_powerups` to the
+server before `ready`:
+
+```python
+class BurstBot(Bot):
+    def choose_powerups(self, welcome):
+        # `welcome.available_powerups` is the server's catalog.
+        return ["rapid_fire", "heavy_shell"]
+```
+
+Constraints (the server validates):
+
+- Exactly two ids, or an empty list to play vanilla.
+- Both ids distinct.
+- Each id must appear in `welcome.available_powerups`.
+
+An invalid loadout earns a typed `powerup_*` error frame (see
+[Errors](#errors-and-how-to-react)), which `on_error` will log. The
+default implementation returns `[]` — vanilla play.
+
+The SDK calls `choose_powerups` once per connection, on initial
+`welcome`. The selection persists across matches on the same
+connection: a bot that stays alive through a `game_over` → `lobby`
+→ `game_start` cycle reuses its first-match loadout for the next
+match. Picking a different loadout per match isn't exposed by the
+typed API today.
+
+### Activating in flight
+
+Set `Command.activate_powerup` on your normal tick reply:
+
+```python
+def on_tick(self, view):
+    cmd = Command(throttle=1.0, sensor_mode="active")
+    if view.me.powerup_ready("overdrive") and self._need_burst(view):
+        cmd.activate_powerup = "overdrive"
+    return cmd
+```
+
+The activation resolves the same tick as the command — alongside
+`fire`, *before* physics integrate. Each picked powerup can be
+activated at most once per match. Naming a powerup you didn't pick,
+already used, or that doesn't exist yields a typed `powerup_*` error
+(see [Errors](#errors-and-how-to-react)); the rest of the command
+(throttle/rudder/sensor/fire) still applies.
+
+### Reading status each tick
+
+`view.me` carries your loadout and live status for every powerup you
+picked. The two helpers cover the common cases:
+
+```python
+view.me.selected_powerups      # ("rapid_fire", "heavy_shell") — pick order
+view.me.powerup_ready("rapid_fire")    # picked, not yet activated
+view.me.powerup_active("rapid_fire")   # currently in effect
+view.me.powerup("rapid_fire")          # full PowerupStatus or None
+```
+
+`PowerupStatus` has three fields:
+
+| field               | type   | meaning                                                    |
+|---------------------|--------|------------------------------------------------------------|
+| `id`                | `str`  | The powerup id (e.g. `"overdrive"`).                       |
+| `used`              | `bool` | True once activated this match.                            |
+| `active_ticks_left` | `int`  | Ticks remaining in the effect window. 0 if inactive.       |
+
+A buff is "ready" when `used == False`. A buff is "active" when
+`active_ticks_left > 0`. A spent buff has `used == True` and
+`active_ticks_left == 0` and stays that way for the rest of the
+match.
+
+### Observing other ships activate
+
+When another ship activates a powerup *and* you currently have it as
+a sensor contact, you get a `PowerupActivatedEvent` in
+`view.events`:
+
+```python
+from naval_sdk.protocol import PowerupActivatedEvent
+
+for ev in view.events:
+    if isinstance(ev, PowerupActivatedEvent):
+        log.info("contact %s popped %s", ev.ship_id, ev.powerup)
+```
+
+`ship_id` matches the ship id from your contact list. Your own
+activations also surface here so you can audit the timing.
+
+### A complete worked example
+
+See [`../examples/loadout_bot.py`](../examples/loadout_bot.py) — it
+picks `rapid_fire` + `heavy_shell`, holds the combo until a target
+is in range or a fallback tick fires, then chains the two
+activations across consecutive ticks to dump damage. It's the
+canonical reference for the full workflow.
+
+---
+
 ## Base API reference
 
 Everything below is exported from `naval_sdk` and importable as
@@ -376,18 +494,26 @@ class Bot:
     last_tick: int                  # tick number of the most recent on_tick
 
     def on_welcome(self, welcome: Welcome) -> None: ...
+    def choose_powerups(self, welcome: Welcome) -> list[str]: ...  # default: []
     def on_game_start(self,
                       tick: int,
                       starting_position: tuple[float, float],
                       starting_heading_deg: float) -> None: ...
     def on_tick(self, view: WorldView) -> Command: ...        # primary
     def on_game_over(self, result: GameOver) -> None: ...
+    def on_lobby(self, tick: int) -> None: ...
     def on_error(self, code: str, message: str) -> None: ...  # default: log
 
     # Escape hatches
     async def raw_send(self, payload: dict) -> None: ...
     async def raw_recv(self) -> dict: ...
 ```
+
+`choose_powerups` is called once, right after `on_welcome`. Return a
+list of up to two powerup ids drawn from `welcome.available_powerups`
+to send a `select_powerups` frame before the SDK signals `ready`. The
+default returns `[]` (vanilla play). See [Powerups](#powerups) for the
+full workflow.
 
 **`on_tick(view)` is the only callback you must override.** Return a
 `Command`. Return `None` or raise an exception and the SDK falls back to
@@ -398,12 +524,13 @@ logged.
 
 A mutable per-tick action. Constructor args:
 
-| field         | type                     | default     | notes                                              |
-|---------------|--------------------------|-------------|----------------------------------------------------|
-| `throttle`    | `float`                  | `0.0`       | Clamped server-side to `[-1, 1]`.                  |
-| `rudder`      | `float`                  | `0.0`       | `-1` hard port, `+1` hard starboard.               |
-| `sensor_mode` | `"active"` or `"passive"`| `"active"`  | Active gives range, passive is stealth.            |
-| `fire`        | `FireCommand` or `None`  | `None`      | Omit to not fire this tick.                        |
+| field               | type                     | default     | notes                                              |
+|---------------------|--------------------------|-------------|----------------------------------------------------|
+| `throttle`          | `float`                  | `0.0`       | Clamped server-side to `[-1, 1]`.                  |
+| `rudder`            | `float`                  | `0.0`       | `-1` hard port, `+1` hard starboard.               |
+| `sensor_mode`       | `"active"` or `"passive"`| `"active"`  | Active gives range, passive is stealth.            |
+| `fire`              | `FireCommand` or `None`  | `None`      | Omit to not fire this tick.                        |
+| `activate_powerup`  | `str` or `None`          | `None`      | Activate one of your picked powerups this tick. See [Powerups](#powerups). |
 
 ```python
 Command(throttle=0.8, rudder=-0.3, sensor_mode="passive")
@@ -455,7 +582,24 @@ Passive contacts have `range=None` (bearing-only).
 ### `SelfState`
 
 Your ship's state this tick:
-`pos`, `heading_deg`, `speed`, `hp`, `ammo`, `rudder`, `throttle`.
+`pos`, `heading_deg`, `speed`, `hp`, `ammo`, `rudder`, `throttle`,
+plus the powerup mirror:
+
+| field                | type                          | notes                                                       |
+|----------------------|-------------------------------|-------------------------------------------------------------|
+| `selected_powerups`  | `tuple[str, ...]`             | Loadout for this match, in pick order. Empty if vanilla.    |
+| `powerup_status`     | `tuple[PowerupStatus, ...]`   | One entry per pick, same order. See [Powerups](#powerups).  |
+
+Plus three convenience methods, all keyed by powerup id:
+
+- `powerup(id) → PowerupStatus | None` — full status, or `None` if not picked.
+- `powerup_ready(id) → bool` — picked and not yet activated.
+- `powerup_active(id) → bool` — currently in effect (`active_ticks_left > 0`).
+
+### `PowerupStatus`
+
+`id: str`, `used: bool`, `active_ticks_left: int`. See
+[Powerups](#powerups).
 
 ### `ShipSpecs`
 
@@ -869,8 +1013,10 @@ class StatBot(Bot):
             print(f"Defeated by {result.winner}. Replay: {result.replay_id}")
 ```
 
-More runnable bots live in [`../examples/`](../examples/), one per
-tactical layer.
+More runnable bots live in [`../examples/`](../examples/), including
+one per tactical layer and
+[`loadout_bot.py`](../examples/loadout_bot.py) — a complete worked
+example of the powerup workflow.
 
 ---
 
@@ -891,12 +1037,18 @@ protocol violations and don't count toward disconnection. Most bots
 can ignore them; you only need to handle them if your decision logic
 depends on whether a specific action took effect.
 
-| Code              | Trigger                                                                | Effect                                                              |
-|-------------------|------------------------------------------------------------------------|---------------------------------------------------------------------|
-| `late_command`    | Your `command` arrived after `deadline_ms` for that tick.              | Previous tick's throttle / rudder / sensor persist; no shot fires.  |
-| `stale_command`   | Your `command.tick` was outside `[world_tick − 1, world_tick + 1]`.    | The command is dropped entirely.                                    |
-| `cooldown_active` | You issued `fire` while the gun was still cooling down.                | Movement / sensor changes still apply; no shell spawns.             |
-| `no_ammo`         | You issued `fire` with an empty magazine.                              | Movement / sensor changes still apply; no shell spawns.             |
+| Code                    | Trigger                                                                                                  | Effect                                                              |
+|-------------------------|----------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------|
+| `late_command`          | Your `command` arrived after `deadline_ms` for that tick.                                                | Previous tick's throttle / rudder / sensor persist; no shot fires.  |
+| `stale_command`         | Your `command.tick` was outside `[world_tick − 1, world_tick + 1]`.                                      | The command is dropped entirely.                                    |
+| `cooldown_active`       | You issued `fire` while the gun was still cooling down.                                                  | Movement / sensor changes still apply; no shell spawns.             |
+| `no_ammo`               | You issued `fire` with an empty magazine.                                                                | Movement / sensor changes still apply; no shell spawns.             |
+| `powerup_unknown`       | `choose_powerups` or `command.activate_powerup` named an id not in `welcome.available_powerups`.         | Loadout: previous selection (if any) is kept. Activation: dropped. Rest of command still applies. |
+| `powerup_duplicate`     | `choose_powerups` returned the same id twice.                                                            | Previous selection (if any) is kept.                                |
+| `powerup_wrong_count`   | `choose_powerups` returned anything other than exactly two ids (and the list wasn't empty).              | Previous selection (if any) is kept.                                |
+| `powerup_lobby_only`    | `select_powerups` arrived after the room left lobby.                                                     | The frame is dropped.                                               |
+| `powerup_not_selected`  | `command.activate_powerup` named a powerup the bot didn't pick this match.                               | Activation dropped; rest of command still applies.                  |
+| `powerup_already_used`  | `command.activate_powerup` named a powerup already activated this match.                                 | Activation dropped; rest of command still applies.                  |
 
 `late_command` is the one to watch in development — if you see it
 under load, your tick handler is doing too much work or blocking on

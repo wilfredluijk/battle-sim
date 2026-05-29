@@ -187,17 +187,6 @@ ship. You do not see your own decoy.
 - Synergy: `silent_running` (the real ship hides while the fake draws fire).
 - Counter to: `awacs_scan`, `counter_battery_trace`.
 
-## Synergy / counter matrix
-
-| Loadout              | Plays well with                           | Counters                      |
-|----------------------|-------------------------------------------|-------------------------------|
-| Burst                | `rapid_fire` + `heavy_shell`              | `repair_drones`, weak hulls   |
-| Sniper               | `awacs_scan` + `long_range_salvo`         | `silent_running`              |
-| Tank                 | `reinforced_hull` + `repair_drones`       | `heavy_shell`, `rapid_fire`   |
-| Stealth-and-stab     | `silent_running` + `smoke_screen`         | `awacs_scan` if isolated      |
-| Bait-and-switch      | `silent_running` + `decoy_flare`          | `awacs_scan`, `counter_battery_trace` |
-| Trap                 | `emp_burst` + `rapid_fire`                | mobility (`overdrive`)        |
-
 ## Operator tuning
 
 Every duration and multiplier above lives on `SimConfig.powerups` (a `PowerupConfig`
