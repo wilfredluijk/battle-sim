@@ -2,6 +2,9 @@
 //!
 //! Format (one JSON object per line):
 //!   1. Header (line 0): version, seed, tick rate, map size, bots in registration order.
+//!      Each bot also carries its `selected_powerups` and (v4+) its actual `spawn_pos` +
+//!      `spawn_heading_deg`, so a replay reproduces the true starting layout even when the
+//!      live run used a non-Fixed variance layout (e.g. Monte Carlo `Shuffled`).
 //!   2. Tick records: one per tick the room produces in `Running` state, listing the
 //!      commands actually applied that tick (sorted by `bot_id`, matching the order the
 //!      simulation processed them).
@@ -41,7 +44,14 @@ use crate::sim::{PowerupId, SimConfig};
 /// each `ReplayCommand`. The `SimConfig` embedded in the header gained a `powerups` field;
 /// older logs that omit it are accepted by the deserializer because `PowerupConfig` has a
 /// `serde(default)`, but the explicit version bump catches any other shape drift.
-pub const REPLAY_FORMAT_VERSION: u32 = 3;
+///
+/// v4 added per-bot `spawn_pos` + `spawn_heading_deg` to the header so a replay reproduces
+/// the *actual* starting positions, regardless of the variance layout the live run used
+/// (Monte Carlo runs use non-Fixed layouts; rebuilding via the default ring diverged).
+/// Both fields are `serde(default)`, so v2/v3 logs (which lack them) still deserialize;
+/// the reader treats `version <= REPLAY_FORMAT_VERSION` as loadable and falls back to the
+/// rebuilt ring layout when the recorded spawns are absent/all-zero.
+pub const REPLAY_FORMAT_VERSION: u32 = 4;
 
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
@@ -83,6 +93,16 @@ pub struct ReplayBot {
     /// so activation commands replay against the same loadout the live run saw.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_powerups: Vec<PowerupId>,
+    /// Actual spawn position `[x, y]` of this bot's ship at tick 0, as placed by whatever
+    /// variance layout the live run used. Recorded (v4+) so the replay reproduces faithful
+    /// starting positions even for non-Fixed (e.g. Monte Carlo `Shuffled`) layouts. Absent
+    /// in v2/v3 logs, which deserialize this to `[0.0, 0.0]`; the rebuild then keeps the
+    /// default ring layout instead of overwriting (see `rebuild_room_with_outbound`).
+    #[serde(default)]
+    pub spawn_pos: [f32; 2],
+    /// Actual spawn heading (compass degrees) at tick 0. Defaults to `0.0` for v2/v3 logs.
+    #[serde(default)]
+    pub spawn_heading_deg: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -396,6 +416,29 @@ fn rebuild_room_with_outbound(
         .map_err(|_| ReplayError::Header("room dropped start reply".into()))?
         .map_err(|e| ReplayError::Header(format!("start refused: {}", e.as_str())))?;
 
+    // `OperatorStart` placed every ship on the default ring (`default_ring_layout`). For
+    // logs that recorded explicit spawn state (v4+), overwrite each ship's position and
+    // heading with the recorded values so the replay starts from the *actual* layout the
+    // live run used — Monte Carlo runs use non-Fixed layouts that the ring can't reproduce.
+    //
+    // Guard against old logs: v2/v3 lack the spawn fields, so they deserialize to
+    // `[0.0, 0.0]` / `0.0`. Only overwrite when the header is v4+ AND at least one bot
+    // carries a non-zero spawn (a real spawn is never exactly the origin on any map),
+    // leaving pre-v4 replays on the rebuilt ring as before.
+    let has_recorded_spawns = header.version >= 4
+        && header
+            .bots
+            .iter()
+            .any(|b| b.spawn_pos != [0.0, 0.0] || b.spawn_heading_deg != 0.0);
+    if has_recorded_spawns {
+        for bot in &header.bots {
+            if let Some(ship) = room.world.ships.get_mut(&bot.ship_id) {
+                ship.pos = glam::Vec2::new(bot.spawn_pos[0], bot.spawn_pos[1]);
+                ship.heading_deg = bot.spawn_heading_deg;
+            }
+        }
+    }
+
     Ok((room, outbound))
 }
 
@@ -467,7 +510,10 @@ pub async fn run_replay(
         }
         None => return Err(ReplayError::Header("replay log is empty".into())),
     };
-    if header.version != REPLAY_FORMAT_VERSION {
+    // Accept any version up to and including the current one. Old logs (v2/v3) lack the
+    // v4 spawn fields, which deserialize to defaults and trigger the ring-layout fallback
+    // on rebuild. Newer-than-current logs are still rejected — we can't know their shape.
+    if header.version > REPLAY_FORMAT_VERSION {
         return Err(ReplayError::Version(header.version));
     }
 
@@ -550,7 +596,10 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
         }
         None => return Err(ReplayError::Header("replay log is empty".into())),
     };
-    if header.version != REPLAY_FORMAT_VERSION {
+    // Accept any version up to and including the current one. Old logs (v2/v3) lack the
+    // v4 spawn fields, which deserialize to defaults and trigger the ring-layout fallback
+    // on rebuild. Newer-than-current logs are still rejected — we can't know their shape.
+    if header.version > REPLAY_FORMAT_VERSION {
         return Err(ReplayError::Version(header.version));
     }
 
@@ -638,7 +687,10 @@ pub fn capture_perspective(
         }
         None => return Err(ReplayError::Header("replay log is empty".into())),
     };
-    if header.version != REPLAY_FORMAT_VERSION {
+    // Accept any version up to and including the current one. Old logs (v2/v3) lack the
+    // v4 spawn fields, which deserialize to defaults and trigger the ring-layout fallback
+    // on rebuild. Newer-than-current logs are still rejected — we can't know their shape.
+    if header.version > REPLAY_FORMAT_VERSION {
         return Err(ReplayError::Version(header.version));
     }
     if !header.bots.iter().any(|b| b.bot_id == bot_id) {
@@ -860,12 +912,16 @@ mod tests {
                     ship_id: "s_1".into(),
                     name: "alice".into(),
                     selected_powerups: vec![PowerupId::Overdrive, PowerupId::RapidFire],
+                    spawn_pos: [300.0, 500.0],
+                    spawn_heading_deg: 90.0,
                 },
                 ReplayBot {
                     bot_id: "b_2".into(),
                     ship_id: "s_2".into(),
                     name: "bob".into(),
                     selected_powerups: vec![],
+                    spawn_pos: [700.0, 500.0],
+                    spawn_heading_deg: 270.0,
                 },
             ],
         }
@@ -1056,6 +1112,8 @@ mod tests {
                 ship_id: format!("s_{n}"),
                 name: format!("bot-{n}"),
                 selected_powerups: vec![],
+                spawn_pos: [0.0, 0.0],
+                spawn_heading_deg: 0.0,
             })
             .collect();
         bots.sort_by(|a, b| a.bot_id.cmp(&b.bot_id));
@@ -1068,5 +1126,64 @@ mod tests {
 
         let room = rebuild_room_from_header(&header).expect("rebuild tolerates header order");
         assert_eq!(room.bot_count(), 11);
+    }
+
+    #[test]
+    fn spawn_state_round_trips_through_serialization() {
+        // The v4 header's per-bot spawn fields must survive a JSONL write/read cycle.
+        let header = sample_header();
+        let line =
+            serde_json::to_string(&ReplayRecord::Header(Box::new(header.clone()))).expect("ser");
+        let records = read_records_from(Cursor::new(line)).expect("read");
+        let ReplayRecord::Header(parsed) = &records[0] else {
+            panic!("expected header record");
+        };
+        assert_eq!(parsed.bots[0].spawn_pos, [300.0, 500.0]);
+        assert_eq!(parsed.bots[0].spawn_heading_deg, 90.0);
+        assert_eq!(parsed.bots[1].spawn_pos, [700.0, 500.0]);
+        assert_eq!(parsed.bots[1].spawn_heading_deg, 270.0);
+    }
+
+    #[test]
+    fn rebuild_applies_recorded_non_ring_spawns() {
+        // A v4 header records explicit spawn positions that are *not* on the default ring.
+        // Rebuild must place ships at exactly those positions — this is what makes a
+        // non-Fixed (Monte Carlo `Shuffled`) layout replay faithfully instead of diverging
+        // back onto the ring. `sample_header` records s_1 at (300,500)/90° and s_2 at
+        // (700,500)/270°; the default ring for 2 bots on a 1000×1000 map would instead place
+        // them at (900,500) and (100,500).
+        let header = sample_header();
+        let room = rebuild_room_from_header(&header).expect("rebuild");
+
+        let s1 = room.world.ships.get("s_1").expect("ship s_1");
+        let s2 = room.world.ships.get("s_2").expect("ship s_2");
+        assert_eq!([s1.pos.x, s1.pos.y], [300.0, 500.0]);
+        assert_eq!(s1.heading_deg, 90.0);
+        assert_eq!([s2.pos.x, s2.pos.y], [700.0, 500.0]);
+        assert_eq!(s2.heading_deg, 270.0);
+        // Genuinely off the ring (would be x≈900 or x≈100 under the old ring rebuild).
+        assert!(
+            (s1.pos.x - 900.0).abs() > 1.0 && (s1.pos.x - 100.0).abs() > 1.0,
+            "spawn fell back onto the default ring: {:?}",
+            s1.pos
+        );
+    }
+
+    #[test]
+    fn old_log_without_spawns_keeps_ring_layout() {
+        // Pre-v4 logs lack spawn fields, which deserialize to [0,0]/0. Rebuild must NOT
+        // overwrite the rebuilt ring with the origin; it keeps the default ring layout.
+        let mut header = sample_header();
+        header.version = 3;
+        for b in &mut header.bots {
+            b.spawn_pos = [0.0, 0.0];
+            b.spawn_heading_deg = 0.0;
+        }
+        let room = rebuild_room_from_header(&header).expect("rebuild old log");
+        let s1 = room.world.ships.get("s_1").expect("ship s_1");
+        // Default ring: 2 bots at (900,500) / (100,500) on a 1000×1000 map.
+        let on_ring = ((s1.pos.x - 900.0).abs() < 1e-3 || (s1.pos.x - 100.0).abs() < 1e-3)
+            && (s1.pos.y - 500.0).abs() < 1e-3;
+        assert!(on_ring, "old log should keep ring layout, got {:?}", s1.pos);
     }
 }

@@ -57,6 +57,16 @@ class TacticianBot(Bot):
             wall_margin=90.0,
         )
 
+    def on_game_start(self, tick, starting_position, starting_heading_deg) -> None:
+        # Monte-Carlo mode reuses this bot across matches; the server resets the
+        # tick to 0 and sends only ``game_start``. Clear match-scoped state so a
+        # carried-over track doesn't become an immortal "ghost" the bot chases
+        # forever, and reset the evader's state machine. Welcome-derived config
+        # (specs, map, helm) is preserved.
+        if self.tracker is not None:
+            self.tracker.reset()
+        self.evader.reset()
+
     def on_tick(self, view: WorldView) -> Command:
         assert self.tracker and self.gunner and self.helm
 

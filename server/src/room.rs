@@ -2001,11 +2001,25 @@ impl Room {
                 let mut bots: Vec<ReplayBot> = self
                     .bots
                     .values()
-                    .map(|b| ReplayBot {
-                        bot_id: b.bot_id.clone(),
-                        ship_id: b.ship_id.clone(),
-                        name: b.name.clone(),
-                        selected_powerups: b.selected_powerups.clone(),
+                    .map(|b| {
+                        // Record the ship's actual placed spawn (set by `apply_match_layout`
+                        // just before this) so a replay reproduces the true starting layout
+                        // regardless of the variance mode the live run used. Falls back to
+                        // the origin only if the ship is somehow missing.
+                        let (spawn_pos, spawn_heading_deg) = self
+                            .world
+                            .ships
+                            .get(&b.ship_id)
+                            .map(|s| ([s.pos.x, s.pos.y], s.heading_deg))
+                            .unwrap_or(([0.0, 0.0], 0.0));
+                        ReplayBot {
+                            bot_id: b.bot_id.clone(),
+                            ship_id: b.ship_id.clone(),
+                            name: b.name.clone(),
+                            selected_powerups: b.selected_powerups.clone(),
+                            spawn_pos,
+                            spawn_heading_deg,
+                        }
                     })
                     .collect();
                 bots.sort_by_key(|b| replay::bot_id_seq(&b.bot_id));
@@ -2460,10 +2474,15 @@ fn compass_deg_facing(from: Vec2, to: Vec2) -> f32 {
 fn default_ring_layout(width: f32, height: f32, bot_count: usize) -> Vec<(Vec2, f32)> {
     let center = Vec2::new(width * 0.5, height * 0.5);
     let n = bot_count as f32;
+    // BALANCE/DETERMINISM: bound the spawn ring to the map so ships start strictly inside
+    // the walls even on small maps. `STARTING_RING_RADIUS` is the upper bound (unchanged on
+    // 1000x1000 maps, where 0.4*1000 == 400); on smaller maps it shrinks so physics never
+    // clamps a spawn onto a wall. Matches `monte_carlo::bounded_ring_radius`.
+    let ring_radius = STARTING_RING_RADIUS.min(0.4 * width.min(height));
     (0..bot_count)
         .map(|i| {
             let angle = std::f32::consts::TAU * (i as f32) / n;
-            let offset = Vec2::new(angle.cos(), angle.sin()) * STARTING_RING_RADIUS;
+            let offset = Vec2::new(angle.cos(), angle.sin()) * ring_radius;
             let pos = center + offset;
             let heading = compass_deg_facing(pos, center);
             (pos, heading)

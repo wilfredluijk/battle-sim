@@ -76,6 +76,36 @@ class TacticalBot(Bot):
             self.evader = Evader()
         self.on_tactical_welcome(welcome)
 
+    def on_game_start(
+        self, tick: int, starting_position, starting_heading_deg: float
+    ) -> None:
+        """Reset all match-scoped tactical state at the start of each match.
+
+        In Monte-Carlo mode the connection (and therefore this ``TacticalBot``
+        instance) persists across many back-to-back matches; the server resets
+        ``world.tick`` to 0 and sends only ``game_start`` — never a fresh
+        ``welcome``. Without this reset the :class:`Tracker` carries tracks from
+        the previous match whose ``last_seen_tick`` now exceeds the new ``tick``,
+        producing immortal "ghost" contacts that wedge reactive bots into
+        permanently engaging a phantom (saturated throttle/rudder).
+
+        Connection/welcome-derived config (map size, ship specs, sensor policy
+        choice, powerup loadout) is deliberately preserved — only per-match
+        runtime state is cleared. Subclasses overriding this should call
+        ``super().on_game_start(...)``.
+        """
+        if self.tracker is not None:
+            self.tracker.reset()
+        if self.evader is not None and hasattr(self.evader, "reset"):
+            self.evader.reset()
+        if hasattr(self.sensor_policy, "reset"):
+            self.sensor_policy.reset()
+        # Patrol cursor is match-scoped: a fresh match starts from corner 0.
+        self._patrol_corner = 0
+        # Gunner's only mutable state is its fire-cooldown counter (keyed off the
+        # match tick); a reset to tick 0 makes it immediately fireable again, so
+        # it needs no explicit reset.
+
     def on_tick(self, view: WorldView) -> Command:
         if (
             self.tracker is None

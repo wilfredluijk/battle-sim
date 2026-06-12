@@ -298,11 +298,21 @@ pub fn place_ships_for_variance(
         return Vec::new();
     }
     let center = Vec2::new(map_width * 0.5, map_height * 0.5);
+    // BALANCE/DETERMINISM: bound the spawn ring to the map so ships start strictly inside
+    // the walls even on small maps. `STARTING_RING_RADIUS` is the upper bound (legacy
+    // behaviour on 1000x1000 maps, where 0.4*1000 == 400). On smaller maps the radius
+    // shrinks so physics never clamps a spawn onto a wall. Changing this changes spawn
+    // geometry, and therefore match outcomes — old on-disk replays used the unbounded ring.
+    let ring_radius = bounded_ring_radius(map_width, map_height);
     let mut rng = Pcg64::seed_from_u64(seed);
     match mode {
-        VarianceMode::Fixed => {
-            ring_layout(center, bot_count, 0.0, &(0..bot_count).collect::<Vec<_>>())
-        }
+        VarianceMode::Fixed => ring_layout(
+            center,
+            bot_count,
+            0.0,
+            &(0..bot_count).collect::<Vec<_>>(),
+            ring_radius,
+        ),
         VarianceMode::Rotated => {
             let angle_offset = rng.gen_range(0.0_f32..std::f32::consts::TAU);
             ring_layout(
@@ -310,12 +320,13 @@ pub fn place_ships_for_variance(
                 bot_count,
                 angle_offset,
                 &(0..bot_count).collect::<Vec<_>>(),
+                ring_radius,
             )
         }
         VarianceMode::Shuffled => {
             let angle_offset = rng.gen_range(0.0_f32..std::f32::consts::TAU);
             let permutation = deterministic_permutation(bot_count, &mut rng);
-            ring_layout(center, bot_count, angle_offset, &permutation)
+            ring_layout(center, bot_count, angle_offset, &permutation, ring_radius)
         }
         VarianceMode::Random => {
             random_disk_layout(center, bot_count, map_width, map_height, &mut rng).unwrap_or_else(
@@ -329,6 +340,7 @@ pub fn place_ships_for_variance(
                         bot_count,
                         angle_offset,
                         &(0..bot_count).collect::<Vec<_>>(),
+                        ring_radius,
                     )
                 },
             )
@@ -336,17 +348,27 @@ pub fn place_ships_for_variance(
     }
 }
 
+/// Spawn-ring radius bounded to the map. Returns [`STARTING_RING_RADIUS`] on large maps and
+/// shrinks on smaller ones so every spawn stays well inside the walls. `0.4 * min_dim`
+/// leaves a comfortable margin (a 700x700 map yields 280, ~70 units of clearance from each
+/// edge before any ship geometry). On 1000x1000 maps `0.4*1000 == 400 == STARTING_RING_RADIUS`,
+/// so legacy behaviour is unchanged there.
+fn bounded_ring_radius(map_width: f32, map_height: f32) -> f32 {
+    STARTING_RING_RADIUS.min(0.4 * map_width.min(map_height))
+}
+
 fn ring_layout(
     center: Vec2,
     bot_count: usize,
     angle_offset: f32,
     slot_assignment: &[usize],
+    ring_radius: f32,
 ) -> Vec<(Vec2, f32)> {
     let n = bot_count as f32;
     let mut out = vec![(Vec2::ZERO, 0.0_f32); bot_count];
     for (bot_index, &slot) in slot_assignment.iter().enumerate() {
         let angle = std::f32::consts::TAU * (slot as f32) / n + angle_offset;
-        let offset = Vec2::new(angle.cos(), angle.sin()) * STARTING_RING_RADIUS;
+        let offset = Vec2::new(angle.cos(), angle.sin()) * ring_radius;
         let pos = center + offset;
         let heading = compass_deg_facing(pos, center);
         out[bot_index] = (pos, heading);
@@ -361,7 +383,9 @@ fn random_disk_layout(
     map_height: f32,
     rng: &mut Pcg64,
 ) -> Option<Vec<(Vec2, f32)>> {
-    let radius = STARTING_RING_RADIUS * 1.1;
+    // BALANCE/DETERMINISM: bound the sampling disk to the map (same rule as the ring) so
+    // candidate positions stay inside the walls on small maps before the `margin` clamp.
+    let radius = bounded_ring_radius(map_width, map_height) * 1.1;
     // Stay inside the map even if the disk would otherwise clip the edge.
     let margin = MIN_SPAWN_SEPARATION;
     let min_x = (center.x - radius).max(margin);
@@ -581,6 +605,63 @@ mod tests {
         let a = place_ships_for_variance(VarianceMode::Random, 7, 4, 1000.0, 1000.0);
         let b = place_ships_for_variance(VarianceMode::Random, 7, 4, 1000.0, 1000.0);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn spawns_stay_inside_small_maps() {
+        // On small maps the spawn ring must shrink so no ship lands on or past a wall.
+        // Check every VarianceMode across a few seeds for both a 700x700 and a 400x400 map.
+        let maps = [(700.0_f32, 700.0_f32), (400.0_f32, 400.0_f32)];
+        let modes = [
+            VarianceMode::Fixed,
+            VarianceMode::Rotated,
+            VarianceMode::Shuffled,
+            VarianceMode::Random,
+        ];
+        // Comfortable buffer from each edge (well over any ship hit radius ~ a few units).
+        let buffer = 1.0_f32;
+        for (w, h) in maps {
+            let center = Vec2::new(w * 0.5, h * 0.5);
+            let max_r = bounded_ring_radius(w, h);
+            for mode in modes {
+                for seed in 0u64..20 {
+                    let layout = place_ships_for_variance(mode, seed, 4, w, h);
+                    assert_eq!(layout.len(), 4);
+                    for (pos, _heading) in &layout {
+                        assert!(
+                            pos.x > buffer && pos.x < w - buffer,
+                            "x out of bounds: {} on {w}x{h} ({mode:?}, seed {seed})",
+                            pos.x,
+                        );
+                        assert!(
+                            pos.y > buffer && pos.y < h - buffer,
+                            "y out of bounds: {} on {w}x{h} ({mode:?}, seed {seed})",
+                            pos.y,
+                        );
+                        // Distance from centre never exceeds the bounded radius. Random
+                        // mode samples a disk of radius `max_r * 1.1`, so allow that.
+                        let r = (*pos - center).length();
+                        let limit = if mode == VarianceMode::Random {
+                            max_r * 1.1 + 1e-3
+                        } else {
+                            max_r + 1e-3
+                        };
+                        assert!(
+                            r < limit,
+                            "spawn too far from centre: r = {r} (limit {limit}) on {w}x{h} ({mode:?}, seed {seed})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_map_radius_matches_legacy() {
+        // On 1000x1000, 0.4*1000 == 400 == STARTING_RING_RADIUS, so the ring is unchanged.
+        assert!((bounded_ring_radius(1000.0, 1000.0) - STARTING_RING_RADIUS).abs() < 1e-3);
+        // Anything >= 1000 in both dims also pins to the constant.
+        assert!((bounded_ring_radius(2000.0, 1500.0) - STARTING_RING_RADIUS).abs() < 1e-3);
     }
 
     #[test]

@@ -35,6 +35,14 @@ class TrackingBot(Bot):
         self.tracker = Tracker(welcome.ship_specs, tick_hz=welcome.tick_hz)
         self.gunner = Gunner(welcome.ship_specs)
 
+    def on_game_start(self, tick, starting_position, starting_heading_deg) -> None:
+        # Monte-Carlo mode reuses this bot across matches and only sends
+        # ``game_start`` (not a fresh ``welcome``) each time, resetting tick to 0.
+        # Clear the carried-over tracker so stale contacts from the previous
+        # match don't survive as an immortal "ghost" the bot chases forever.
+        if self.tracker is not None:
+            self.tracker.reset()
+
     def on_tick(self, view: WorldView) -> Command:
         assert self.tracker is not None and self.gunner is not None
 

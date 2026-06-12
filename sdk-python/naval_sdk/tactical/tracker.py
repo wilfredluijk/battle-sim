@@ -142,10 +142,15 @@ class Tracker:
                     track.source = "dead_reckoned"
 
         # 5. Stale old tracks.
+        # A negative elapsed (``tick`` ran backwards, e.g. a Monte-Carlo match
+        # reset ``world.tick`` to 0 under a persisted connection) is treated as
+        # stale too — otherwise a carried-over track has
+        # ``tick - last_seen_tick < 0``, never prunes, and becomes an immortal
+        # "ghost" contact in every subsequent match.
         stale_ids = [
             tid
             for tid, t in self._tracks.items()
-            if tick - t.last_seen_tick > self._stale
+            if not (0 <= tick - t.last_seen_tick <= self._stale)
         ]
         for tid in stale_ids:
             del self._tracks[tid]
@@ -160,6 +165,19 @@ class Tracker:
 
     def get(self, track_id: int) -> Optional[Track]:
         return self._tracks.get(track_id)
+
+    def reset(self) -> None:
+        """Drop all tracks and history. Call between matches.
+
+        Configuration (specs, gates, staleness window) is preserved; only the
+        per-match track set, observation history, and id counter are cleared.
+        In Monte-Carlo mode the same ``Tracker`` instance persists across
+        back-to-back matches, so this must be invoked on ``game_start`` to avoid
+        carrying stale contacts (and a desync'd id counter) forward.
+        """
+        self._tracks.clear()
+        self._history.clear()
+        self._next_id = 1
 
     # -- Internals ---------------------------------------------------------
 

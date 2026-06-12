@@ -460,8 +460,10 @@ every tick.
 
 ```json
 {
-  "header": { "version": 2, "replay_id": "...", "seed": 42, "map": { "...": "..." },
-              "sim_config": { "...": "..." }, "bots": [ { "bot_id": "b_1", "ship_id": "s_1", "name": "powerful" } ] },
+  "header": { "version": 4, "replay_id": "...", "seed": 42, "map": { "...": "..." },
+              "sim_config": { "...": "..." },
+              "bots": [ { "bot_id": "b_1", "ship_id": "s_1", "name": "powerful",
+                          "spawn_pos": [300.0, 500.0], "spawn_heading_deg": 90.0 } ] },
   "frames": [ /* one `world` payload (§2 `world`) per tick; frames[t] is the world at tick t */ ],
   "end": { "tick": 1071, "winner": "b_1" }
 }
@@ -642,6 +644,17 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-06-02 — replay spawn state
+
+- Replay format bumped to `v4`. The header's per-bot entries now record `spawn_pos`
+  (`[x, y]`) and `spawn_heading_deg` — the ship's actual placed position at tick 0. This
+  lets a replay reproduce the true starting layout even when the live run used a non-Fixed
+  variance layout (Monte Carlo runs default to `shuffled`), which the old ring-based rebuild
+  could not. Both fields are optional (`serde(default)`): older `v2`/`v3` logs deserialize
+  them to `[0, 0]` / `0` and rebuild falls back to the default ring layout, so they still
+  load. Readers now accept any header `version <= 4` and reject only newer-than-current
+  logs.
 
 ## 2026-05-27 — powerups
 

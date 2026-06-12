@@ -35,11 +35,26 @@ class Evader:
         self._throttle = float(throttle)
         self._state: EvaderState = EvaderState.IDLE
         self._state_until: int = 0
-        self._rudder_sign: float = 1.0 if initial_rudder_sign >= 0 else -1.0
+        self._initial_rudder_sign: float = 1.0 if initial_rudder_sign >= 0 else -1.0
+        self._rudder_sign: float = self._initial_rudder_sign
 
     @property
     def state(self) -> EvaderState:
         return self._state
+
+    def reset(self) -> None:
+        """Return the state machine to IDLE for a fresh match.
+
+        In Monte-Carlo mode the same ``Evader`` persists across back-to-back
+        matches. ``_state_until`` is an absolute tick, so once the match tick
+        resets to 0 a carried EVADING/COOLDOWN state could emit a spurious
+        steering override on the first ticks of the new match. Clearing it keeps
+        the new match clean. Configuration (durations, throttle) is preserved;
+        the rudder sign is restored to its construction default.
+        """
+        self._state = EvaderState.IDLE
+        self._state_until = 0
+        self._rudder_sign = self._initial_rudder_sign
 
     def update(self, view: WorldView) -> Optional[Command]:
         """Advance the state machine. Returns an override ``Command`` while

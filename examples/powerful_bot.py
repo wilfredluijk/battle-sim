@@ -123,6 +123,17 @@ class PowerfulBot(Bot):
             self._max_ammo,
         )
 
+    def on_game_start(self, tick, starting_position, starting_heading_deg) -> None:
+        # Monte-Carlo mode reuses this bot across many matches; the server resets
+        # ``world.tick`` to 0 and sends only ``game_start`` (no fresh ``welcome``).
+        # All match-scoped runtime state lives in ``self.state`` (tracks, the
+        # track-id counter, evade/active-burst counters) plus ``self._next_fire_tick``.
+        # Rebuild it so stale tracks from the previous match don't survive as
+        # immortal "ghosts" with ``tick - last_seen_tick < 0`` that never prune.
+        # Welcome-derived config (specs, map dims) is intentionally preserved.
+        self.state = TacticalState()
+        self._next_fire_tick = 0
+
     # ---- main loop --------------------------------------------------------
 
     def on_tick(self, view: WorldView) -> Command:
