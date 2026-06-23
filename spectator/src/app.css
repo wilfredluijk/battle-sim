@@ -867,6 +867,9 @@ main.replay-viewer {
 .rv-marker-kill {
   background: #ef6b6b;
 }
+.rv-marker-powerup {
+  background: #a479e2;
+}
 
 .rv-readout {
   font-size: 12px;

@@ -120,7 +120,7 @@ Per tick:
    - Active contacts (range available): position distance gate (default `60` units, configurable).
    - Passive contacts (bearing-only): bearing gate (default `±20°`) against predicted bearing from own ship.
 3. **Fold** matched contacts into existing tracks; **spawn** new tracks for unmatched ones.
-4. **Update velocity** via EMA: `v_new = α * (Δp/Δt) + (1-α) * v_old`, default `α = 0.4`. Skip the update for passive-only folds (no position fix).
+4. **Update velocity** via EMA: `v_new = α * (Δp/Δt) + (1-α) * v_old`, default `α = 0.3`. Skip the update for passive-only folds (no position fix).
 5. **Stale** any track not seen for `staleness_ticks` (default 40) — drop it.
 
 Why EMA and not Kalman? With `±2u` uniform position noise and `dt = 0.1s`, EMA's tracking error settles at well under 1 u/s — adequate for `shell_speed = 70 u/s` lead solutions. Kalman is more code, more tuning, and the same answer in this regime.
@@ -139,9 +139,9 @@ Internal cooldown counter is updated when the caller actually fires; the SDK exp
 
 ### 4.4 Helm
 
-`steer_to_bearing(me, target_bearing, *, max_turn_throttle=0.6) -> (throttle, rudder)`:
-- `rudder = clamp(signed_bearing_delta(target, current) / 30°, -1, 1)`.
-- `throttle = 1.0` when aligned within ±10°, scaling down to `max_turn_throttle` at large deltas. This works *with* the speed-coupled turn rate rather than against it.
+`steer_to_bearing(me, target_bearing_deg, *, respect_walls=True, desired_throttle=1.0) -> (throttle, rudder)`:
+- `rudder = clamp(signed_bearing_delta(target, current) / turn_aggression_deg, -1, 1)` (`turn_aggression_deg` defaults to 30°).
+- `throttle = desired_throttle` when aligned within `align_threshold_deg` (±10°), then scales **linearly** down toward the `min_turn_throttle` floor (constructor arg, default `0.55`) as the bearing delta grows toward 180°. This works *with* the speed-coupled turn rate rather than against it. (The throttle floor is a constructor parameter, not a method kwarg.)
 
 `steer_to_point(me, point)` is a thin wrapper that computes the bearing first.
 

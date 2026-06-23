@@ -1,16 +1,23 @@
 import { COLOR_PALETTE } from './constants';
 
 /**
- * Memoised name → palette colour. The mapping is stable for the lifetime of the page so a
- * given bot always renders in the same colour. Names are cycled through `COLOR_PALETTE`
- * in first-seen order. An optional `cache` argument is exposed so tests can isolate state.
+ * Name → palette colour, derived by hashing the name into `COLOR_PALETTE`. The mapping is
+ * deterministic, so a given bot renders in the same colour on every surface (sidebar,
+ * report, canvas) regardless of the order names are first seen — unlike a first-seen counter,
+ * which could assign different colours to the same bot on different screens. The `cache` just
+ * memoises the hash; an optional argument is exposed so tests can isolate state.
  */
 export function colorFor(name: string, cache: Map<string, string> = defaultCache): string {
   const cached = cache.get(name);
   if (cached) return cached;
-  const next = COLOR_PALETTE[cache.size % COLOR_PALETTE.length];
-  cache.set(name, next);
-  return next;
+  // Simple deterministic string hash (djb2-ish), folded to a palette index.
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }
+  const color = COLOR_PALETTE[Math.abs(hash) % COLOR_PALETTE.length];
+  cache.set(name, color);
+  return color;
 }
 
 const defaultCache = new Map<string, string>();

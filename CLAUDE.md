@@ -6,7 +6,7 @@ Guidance for Claude when working in this repository. Read this before making non
 
 ## What this project is
 
-A hackathon programming game. Players write bots in any language, connect them to a central Rust server over WebSocket, and battle in a deterministic top-down naval simulation. A browser spectator renders matches live. The full system design lives in `docs/system-design.md` — read it first if you're new to the repo.
+A hackathon programming game. Players write bots in any language, connect them to a central Rust server over WebSocket, and battle in a deterministic top-down naval simulation. A browser spectator renders matches live. The full system design lives in `system-design.md` (repo root) — read it first if you're new to the repo.
 
 **Three components, three trust levels:**
 - `server/` — Rust, authoritative, trusted. Owns all simulation state.
@@ -63,11 +63,12 @@ spectator/      Svelte + TypeScript + Vite app, built to spectator/dist/ and
                 baked into the server binary via `include_str!`. Served at /.
                 Pure logic lives under src/lib/ (unit-tested with Vitest);
                 Svelte components in src/components/ are thin glue.
-examples/       Example bots (circle_bot.py, chaser_bot.py, sniper_bot.py)
+examples/       Example bots (circle_bot.py, powerful_bot.py, tracking_bot.py,
+                tactician_bot.py, strategist_bot.py, loadout_bot.py)
+system-design.md  Full design doc — source of truth for architecture (repo root)
 docs/
-  system-design.md   Full design doc — source of truth for architecture
   PROTOCOL.md        Wire protocol spec, kept in sync with src/protocol.rs
-  QUICKSTART.md      5-minute onboarding for new players
+  POWERUPS.md        Published powerup catalog and behaviour
 ```
 
 When you change the wire protocol, update **all three** of: `server/src/protocol.rs`, `docs/PROTOCOL.md`, and the SDK. The protocol doc is the public contract; if it drifts from the code, players' bots break silently.
@@ -93,7 +94,7 @@ pip install -e .
 pytest
 
 # Run an example bot against a local server
-python examples/chaser_bot.py --host localhost --port 7878 --name chaser
+python examples/tactician_bot.py --host localhost --port 7878 --name tactician
 
 # Spectator (Svelte / TS / Vite)
 cd spectator

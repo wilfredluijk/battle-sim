@@ -2,6 +2,13 @@
 
 > A hackathon-friendly programming game where players write algorithms to control a battleship and compete against other players' algorithms in a deterministic top-down naval simulation.
 
+> **Status — original MVP design doc.** This captures the initial architecture and intent. Several specifics have since evolved; where this doc and the code disagree, the code and the contract docs win. Known drift:
+> - **Room lifecycle is a REST control plane under `/api/*` (JWT-gated), not stdin commands.** The "Operator CLI / stdin" interface described in §3.3 was removed — see `docs/PROTOCOL.md §2.5`.
+> - **The spectator is a Svelte + TypeScript + Vite app** (built to `spectator/dist/`, baked into the server), not a no-build static HTML/JS page.
+> - **Powerups exist** (picked at match start) and are part of the wire protocol — see `docs/POWERUPS.md`, which postdates this doc.
+> - **Default map is 700×700** (some examples below show 1000×1000).
+> - Authoritative current sources: `docs/PROTOCOL.md` (wire protocol), `docs/POWERUPS.md` (powerups), `CLAUDE.md` (repo layout & conventions).
+
 ---
 
 ## 1. Goals & Constraints
@@ -221,7 +228,7 @@ JSON is the right call for a hackathon: human-readable when debugging, every lan
   "type": "welcome",
   "bot_id": "b_3",
   "ship_id": "s_3",
-  "map": { "width": 1000, "height": 1000 },
+  "map": { "width": 700, "height": 700 },
   "tick_hz": 10,
   "ship_specs": { /* see §5.2 */ }
 }

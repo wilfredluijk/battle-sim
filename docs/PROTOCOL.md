@@ -27,7 +27,7 @@ First message after the WebSocket connects.
 
 | Field | Type | Notes |
 |---|---|---|
-| `name` | string | 1–32 bytes of `[A-Za-z0-9 _-]`. An invalid name is rejected with `invalid_name`; a duplicate of another live bot in the same room is rejected with `invalid_message`. Both close the connection. |
+| `name` | string | 1–32 bytes of `[A-Za-z0-9 _-]`. An invalid name is rejected with `invalid_name`; a duplicate of another live bot in the same room is rejected with `duplicate_name`. Both close the connection. |
 | `version` | string | SDK version, free-form. |
 
 #### `ready`
@@ -176,7 +176,7 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
 
 `self.selected_powerups` and `self.powerup_status` are omitted (or sent as empty arrays) when the bot picked no powerups. `powerup_status[i].active_ticks_left` counts down each tick; check `used && active_ticks_left == 0` to know a pick is spent.
 
-A bot with `counter_battery_trace` armed will see a synthetic precise contact for the attacker in the next three tick frames after the trace fires. These contacts use a `cbt_<n>` id and full confidence.
+A bot with `counter_battery_trace` armed will see a synthetic precise contact for the attacker for the next `counter_battery_reveal_ticks` tick frames (default 15) after the trace fires. These contacts use a `cbt_<n>` id and full confidence.
 
 #### `game_over`
 Sent when a match ends — either naturally (last ship standing / match timeout) or because the operator aborted. `winner` is `null` for a draw **or an aborted match**.
@@ -614,6 +614,7 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `cooldown_active` | `fire` was issued while the gun was still cooling down. The `message` field reports the current tick and the remaining cooldown ticks. Duplicate cooldown errors in the same tick are coalesced into a single frame. |
 | `no_ammo` | `fire` was issued but the ship has no ammo left. Coalesced like `cooldown_active`. |
 | `invalid_name` | `hello.name` was empty, longer than 32 bytes, or contained characters outside `[A-Za-z0-9 _-]`. The connection is closed. |
+| `duplicate_name` | `hello.name` duplicates another live bot already registered in the room. The connection is closed. |
 | `stale_command` | `command.tick` was outside the accepted window (`world_tick ± 1`). |
 | `non_finite_value` | A command contained `NaN` or `Inf` in `throttle`, `rudder`, or `fire.{bearing_deg,range}`. |
 | `handshake_timeout` | The bot connected but did not send `hello` within the handshake timeout. The connection is closed. |
@@ -624,11 +625,10 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `powerup_not_selected` | `command.activate_powerup` named a powerup the bot didn't pick for this match. |
 | `powerup_already_used` | `command.activate_powerup` named a powerup the bot already activated this match. |
 
-After 5 protocol violations on a single bot connection, the server sends `too_many_violations` and closes with WebSocket close code `Policy (1008)`. The violation-counted codes are `malformed_json`, `invalid_message`, `non_finite_value`, and `binary_frames_unsupported`. `handshake_timeout` and `invalid_name` close the connection on the first occurrence and bypass the counter. `late_command`, `stale_command`, `cooldown_active`, and `no_ammo` are gameplay rejections and do not count against the bot.
+After 5 protocol violations on a single bot connection, the server sends `too_many_violations` and closes with WebSocket close code `Policy (1008)`. The violation-counted codes are `malformed_json`, `invalid_message`, `non_finite_value`, and `binary_frames_unsupported`. `handshake_timeout`, `invalid_name`, and `duplicate_name` close the connection on the first occurrence and bypass the counter. `late_command`, `stale_command`, `cooldown_active`, and `no_ammo` are gameplay rejections and do not count against the bot.
 
-Two further server-side limits are enforced without a dedicated error code:
+One further server-side limit is enforced without a dedicated error code:
 
-- **Duplicate `hello.name`** — when another live bot in the room already holds the name, registration fails and the server sends `invalid_message` (with the rejection reason in `message`), then closes the connection.
 - **Per-IP connection cap** — when the peer IP is at `--max-connections-per-ip`, the TCP stream is dropped *before* the WebSocket handshake completes. The bot observes a connection close with no error frame.
 
 WebSocket messages are capped at 16 KiB. The `/spectate` endpoint can be restricted to the loopback interface with `--tournament` so competing bots cannot use it to bypass the sensor filter.
@@ -644,6 +644,15 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-06-23 — more specific join-rejection codes
+
+- A `hello.name` that duplicates another live bot in the room is now rejected with the
+  dedicated `duplicate_name` error code instead of the generic `invalid_message`. A name
+  failing `[A-Za-z0-9 _-]{1,32}` validation at registration likewise surfaces as
+  `invalid_name`. Both still close the connection. Bots that switch on the exact `code`
+  for the duplicate case should accept `duplicate_name`; the human-readable `message` is
+  unchanged.
 
 ## 2026-06-02 — replay spawn state
 
@@ -715,6 +724,6 @@ All additions are forward-compatible for bots that don't use powerups: omit `sel
 - Commands with `NaN` / `Inf` floats are rejected as `non_finite_value` and count toward the 5-violation budget.
 - WebSocket message and frame size are capped at 16 KiB.
 - The HTTP head and the post-upgrade `hello` each have a 5-second timeout (configurable via `--handshake-timeout-secs`), enforced by `handshake_timeout`.
-- A per-IP cap on simultaneous TCP connections is enforced at accept time (`--max-connections-per-ip`, default 8; set to 0 to disable). Connections beyond the cap are dropped before the WebSocket handshake — no error frame is sent.
+- A per-IP cap on simultaneous TCP connections is enforced at accept time (`--max-connections-per-ip`, default 25; set to 0 to disable). Connections beyond the cap are dropped before the WebSocket handshake — no error frame is sent.
 - `--tournament` restricts the `/spectate` endpoint to the loopback interface, preventing competing bots from subscribing to ground-truth world state.
 - Duplicate `cooldown_active` / `no_ammo` errors are coalesced to one per tick to protect the bot's 32-slot outbound buffer from spam.

@@ -116,5 +116,6 @@
     <span><i class="rv-dot rv-marker-fired"></i> shot fired</span>
     <span><i class="rv-dot rv-marker-hit"></i> hit</span>
     <span><i class="rv-dot rv-marker-kill"></i> kill</span>
+    <span><i class="rv-dot rv-marker-powerup"></i> powerup</span>
   </div>
 </main>

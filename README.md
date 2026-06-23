@@ -98,6 +98,9 @@ Run `npm test` for the Vitest unit tests against `src/lib/`.
 | `--seed` | `42` | RNG seed (drives all simulation randomness) |
 | `--replay-dir` | `./replays` | Where match replay JSONL files are written |
 | `--replay <FILE>` | — | Replay a saved match instead of accepting bot connections |
+| `--max-connections-per-ip` | `25` | Max simultaneous TCP connections per peer IP (`0` disables the cap) |
+| `--handshake-timeout-secs` | `5` | Seconds to wait for the HTTP head + WebSocket `hello` before dropping a half-open connection |
+| `--tournament` | `false` | Restrict `/spectate` to loopback so bots can't subscribe to ground-truth state |
 | `--admin-password` | random | Password for `POST /api/login` (logged once at startup if unset; also `BATTLE_ADMIN_PASSWORD`) |
 | `--token-ttl-hours` | `12` | Lifetime of issued admin JWTs |
 

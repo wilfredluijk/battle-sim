@@ -500,7 +500,7 @@ class Bot:
                       starting_position: tuple[float, float],
                       starting_heading_deg: float) -> None: ...
     def on_tick(self, view: WorldView) -> Command: ...        # primary
-    def on_game_over(self, result: GameOver) -> None: ...
+    def on_game_over(self, result: GameOver) -> bool | None: ...  # return False to disconnect; None/True stays
     def on_lobby(self, tick: int) -> None: ...
     def on_error(self, code: str, message: str) -> None: ...  # default: log
 
@@ -1161,17 +1161,19 @@ If the typed API doesn't fit (you're debugging, prototyping a new
 protocol field, or building an inspector), bypass it:
 
 ```python
-class LurkBot(Bot):
-    async def on_tick(self, view):           # WARNING: see note below
-        await self.raw_send({"type": "command", "tick": view.tick,
-                             "throttle": 0.0, "rudder": 0.0,
-                             "sensor_mode": "active"})
-        return Command()  # ignored by the SDK once you've already sent
+await bot.raw_send({"type": "command", "tick": tick,
+                    "throttle": 0.0, "rudder": 0.0,
+                    "sensor_mode": "active"})
+frame = await bot.raw_recv()
 ```
 
-`raw_send` / `raw_recv` are async because they hit the live socket. They
-work inside `on_tick` only if you make your override `async` — the SDK
-will await it. Most bots don't need this; the typed `Command` is enough.
+`raw_send` / `raw_recv` are async because they hit the live socket, so call
+them from async code that drives the bot yourself (see `run_async`). They do
+**not** work from inside `on_tick`: that method is called *synchronously* and
+is never awaited, so an `async def on_tick` will not run — its only output is
+the typed `Command` it returns. Use `Command` for the per-tick move; reach for
+raw frames only when you're driving the connection by hand. Most bots don't
+need this; the typed `Command` is enough.
 
 ---
 

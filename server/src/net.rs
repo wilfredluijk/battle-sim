@@ -36,8 +36,8 @@ use crate::monte_carlo::{McConfig, McStatus};
 use crate::protocol::{self, error_code, BotMsg, FireCommand, ServerMsg};
 use crate::replay;
 use crate::room::{
-    BotRegistration, ConfigureError, MatchReport, McStartError, McStopError, PendingCommand,
-    RoomEvent, RoomSnapshot, SpectatorFrame, StartError,
+    BotRegistration, ConfigureError, JoinError, MatchReport, McStartError, McStopError,
+    PendingCommand, RoomEvent, RoomSnapshot, SpectatorFrame, StartError,
 };
 use crate::sim::SimConfig;
 
@@ -1100,7 +1100,14 @@ async fn register(
         Ok(Ok(reg)) => Some(reg),
         Ok(Err(e)) => {
             warn!(%peer, reason = e.as_str(), "room rejected join");
-            send_error(sink, error_code::INVALID_MESSAGE, e.as_str()).await;
+            // Map each join failure to its most specific wire code so bot authors can
+            // switch on it; fall back to the generic schema code for the rest.
+            let code = match e {
+                JoinError::DuplicateName => error_code::DUPLICATE_NAME,
+                JoinError::InvalidName => error_code::INVALID_NAME,
+                JoinError::NotInLobby | JoinError::RoomFull => error_code::INVALID_MESSAGE,
+            };
+            send_error(sink, code, e.as_str()).await;
             None
         }
         Err(_) => {

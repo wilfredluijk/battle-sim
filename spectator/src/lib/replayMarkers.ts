@@ -3,7 +3,7 @@
 
 import type { WorldFrame } from '../types/protocol';
 
-export type ReplayMarkerKind = 'fired' | 'hit' | 'kill';
+export type ReplayMarkerKind = 'fired' | 'hit' | 'kill' | 'powerup';
 
 /** A point of interest on the replay timeline, placed at `tick`. */
 export interface ReplayMarker {
@@ -14,7 +14,7 @@ export interface ReplayMarker {
 /**
  * Scan a replay's ground-truth frames for slider markers:
  *
- * - `hit` / `kill` come straight from each frame's `events`.
+ * - `hit` / `kill` / `powerup` come straight from each frame's `events`.
  * - `fired` is derived: a shell `id_index` that was absent the previous frame means a
  *   shot was loosed that tick. The wire protocol has no explicit "fired" event, so this
  *   diff is how the viewer surfaces one without a protocol change.
@@ -41,12 +41,15 @@ export function extractMarkers(frames: WorldFrame[]): ReplayMarker[] {
 
     let hit = false;
     let kill = false;
+    let powerup = false;
     for (const ev of frame.events) {
       if (ev.type === 'hit') hit = true;
       else if (ev.type === 'death') kill = true;
+      else if (ev.type === 'powerup_activated') powerup = true;
     }
     if (hit) markers.push({ tick: frame.tick, kind: 'hit' });
     if (kill) markers.push({ tick: frame.tick, kind: 'kill' });
+    if (powerup) markers.push({ tick: frame.tick, kind: 'powerup' });
 
     prevShells = shells;
   }

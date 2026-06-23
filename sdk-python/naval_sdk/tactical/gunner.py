@@ -66,10 +66,16 @@ class Gunner:
         if self._require_active and (view.tick - track.last_active_tick) > self._max_age:
             return None
 
+        # Intercept solution: `pred` is where the target will be when a shell fired
+        # *now* reaches it. `lead_target` returns None when no real intercept exists
+        # (target outruns the shell and is fleeing).
         pred = lead_target(me.pos, track.pos, track.vel, self._specs.shell_speed)
         if pred is None:
             return None
 
+        # Range gate doubles as the time-of-flight feasibility check: by construction
+        # |pred - me| == shell_speed * t, so requiring that distance <= max_shell_range
+        # rejects shots where the target will have left range by the time the shell lands.
         rng = math.hypot(pred[0] - me.pos[0], pred[1] - me.pos[1])
         if rng > self._specs.max_shell_range:
             return None

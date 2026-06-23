@@ -14,6 +14,8 @@ export function formatEvent(tick: number, ev: TickEvent | undefined | null): str
       return `${t} splash @ (${ev.pos[0].toFixed(0)}, ${ev.pos[1].toFixed(0)})`;
     case 'death':
       return `${t} ${ev.ship_id} destroyed`;
+    case 'powerup_activated':
+      return `${t} ${ev.ship_id} activated ${ev.powerup}`;
     default:
       return null;
   }
