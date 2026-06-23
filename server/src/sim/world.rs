@@ -104,8 +104,9 @@ pub struct SmokeCloud {
     pub expires_at: u64,
 }
 
-/// A phantom contact spawned by `decoy_flare`. Stationary at `pos`; the activating ship
-/// does not perceive its own decoy.
+/// A phantom contact spawned by `decoy_flare`. Cruises at the velocity it inherited from the
+/// activator at spawn time (so it can't be filtered out as a motionless contact). The
+/// activating ship does not perceive its own decoy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decoy {
     /// Stable per-decoy index for spectator UIs. The bot-facing protocol uses a synthetic
@@ -114,6 +115,9 @@ pub struct Decoy {
     pub owner: ShipId,
     pub pos: Vec2,
     pub heading_deg: f32,
+    /// Constant velocity (units per second) inherited from the activator at spawn. Advanced
+    /// by `powerups::step_tick_maintenance` each tick.
+    pub vel: Vec2,
     pub expires_at: u64,
 }
 

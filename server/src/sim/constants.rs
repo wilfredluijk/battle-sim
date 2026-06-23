@@ -61,48 +61,60 @@ pub const OVERDRIVE_ACCEL_MULT: f32 = 1.6;
 pub const OVERDRIVE_TURN_MULT: f32 = 1.5;
 
 // Reinforced hull: incoming splash damage scaled down.
-pub const REINFORCED_HULL_DURATION_TICKS: u32 = 60;
-pub const REINFORCED_HULL_DAMAGE_MULT: f32 = 0.4;
+pub const REINFORCED_HULL_DURATION_TICKS: u32 = 70;
+pub const REINFORCED_HULL_DAMAGE_MULT: f32 = 0.45;
 
-// Repair drones: regenerate HP for a window.
-pub const REPAIR_DRONES_DURATION_TICKS: u32 = 60;
+// Repair drones: instant burst on activation, then per-tick regen for a window.
+pub const REPAIR_DRONES_DURATION_TICKS: u32 = 50;
 pub const REPAIR_DRONES_HP_PER_TICK: u32 = 1;
+/// HP healed immediately on activation, before per-tick regen begins.
+pub const REPAIR_DRONES_INSTANT_HP: u32 = 20;
 
 // Smoke screen: static AoE cloud that blocks active radar lines of sight from outside.
 pub const SMOKE_SCREEN_DURATION_TICKS: u32 = 80;
-pub const SMOKE_SCREEN_RADIUS: f32 = 60.0;
+pub const SMOKE_SCREEN_RADIUS: f32 = 70.0;
 
-// Rapid fire: gun cooldown multiplier.
+// Rapid fire: gun cooldown multiplier. Cooldown ticks are rounded (ties round up), so the
+// default 15-tick cooldown becomes round(15 * 0.5) = round(7.5) = 8 ticks.
 pub const RAPID_FIRE_DURATION_TICKS: u32 = 50;
-pub const RAPID_FIRE_COOLDOWN_MULT: f32 = 0.3;
+pub const RAPID_FIRE_COOLDOWN_MULT: f32 = 0.5;
 
 // Heavy shell: buff applied to shells fired during the window. Shell carries the buff.
 pub const HEAVY_SHELL_DURATION_TICKS: u32 = 30;
-pub const HEAVY_SHELL_SPLASH_MULT: f32 = 2.0;
-pub const HEAVY_SHELL_DAMAGE_MULT: f32 = 1.5;
+pub const HEAVY_SHELL_SPLASH_MULT: f32 = 1.5;
+pub const HEAVY_SHELL_DAMAGE_MULT: f32 = 1.3;
 
 // Long-range salvo: buff applied to shells fired during the window.
 pub const LONG_RANGE_DURATION_TICKS: u32 = 40;
-pub const LONG_RANGE_RANGE_MULT: f32 = 1.6;
-pub const LONG_RANGE_SPEED_MULT: f32 = 1.4;
+pub const LONG_RANGE_RANGE_MULT: f32 = 1.5;
+pub const LONG_RANGE_SPEED_MULT: f32 = 1.6;
 
-// AWACS scan: double active radar range, zero noise, see through silent running.
+// AWACS scan: double active radar range + zero noise on normal contacts. Silent-running
+// targets are *not* fully pierced — they show only within base radar range as jittered,
+// low-confidence contacts (soft counter to silent_running).
 pub const AWACS_DURATION_TICKS: u32 = 60;
 pub const AWACS_RANGE_MULT: f32 = 2.0;
+/// Half-width of the position jitter (units) applied to silent-running contacts seen by AWACS.
+pub const AWACS_SILENT_JITTER: f32 = 15.0;
+/// Confidence reported for silent-running contacts surfaced by AWACS.
+pub const AWACS_SILENT_CONFIDENCE: f32 = 0.6;
 
 // Silent running: hidden from passive, halved active range against you. Firing breaks it.
 pub const SILENT_RUNNING_DURATION_TICKS: u32 = 80;
 pub const SILENT_RUNNING_ACTIVE_RANGE_MULT: f32 = 0.5;
 
-// Counter-battery trace: arm window + how many reveal frames the victim gets.
+// Counter-battery trace: arm window + reveal-track duration. Non-consuming: every hit during
+// the armed window (re)starts a `REVEAL_TICKS`-long full-confidence track on the attacker.
 pub const COUNTER_BATTERY_ARM_TICKS: u32 = 60;
-pub const COUNTER_BATTERY_REVEAL_TICKS: u8 = 3;
+pub const COUNTER_BATTERY_REVEAL_TICKS: u32 = 15;
 
 // EMP burst: instantaneous AoE that slows guns and forces passive sensors.
-pub const EMP_BURST_DURATION_TICKS: u32 = 50;
-pub const EMP_BURST_RADIUS: f32 = 100.0;
+pub const EMP_BURST_DURATION_TICKS: u32 = 40;
+pub const EMP_BURST_RADIUS: f32 = 130.0;
 pub const EMP_GUN_COOLDOWN_MULT: f32 = 2.0;
 
-// Decoy flare: phantom contact spawned ahead of the activating ship.
+// Decoy flare: phantom contact that inherits the activator's heading/speed and cruises.
+// Spawn distance ahead is jittered (seeded) in [MIN, MAX].
 pub const DECOY_FLARE_DURATION_TICKS: u32 = 60;
-pub const DECOY_FLARE_DISTANCE: f32 = 100.0;
+pub const DECOY_FLARE_DISTANCE_MIN: f32 = 80.0;
+pub const DECOY_FLARE_DISTANCE_MAX: f32 = 140.0;

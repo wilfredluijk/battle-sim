@@ -69,25 +69,37 @@ pub fn active_contacts(
     } else {
         base_range
     };
-    // AWACS bakes a noise-free scan; otherwise the configured noise applies.
-    let radar_noise = if awacs_active {
-        0.0
-    } else {
-        world.config.active_radar_noise
-    };
+    let base_noise = world.config.active_radar_noise;
 
     let mut out = Vec::new();
     for (id, ship) in &world.ships {
         if id == viewer_id || !ship.alive {
             continue;
         }
-        // Per-target effective range. `silent_running` halves the range against this ship
-        // *only*, unless the viewer has `awacs_scan` (which sees through stealth).
+        // Per-target range / noise / confidence. AWACS is a *soft* counter to silent_running:
+        // a silent target is detected only within base radar range (not the doubled AWACS
+        // range), and reported as a jittered, low-confidence contact rather than a precise
+        // one. A silent target without AWACS halves the range as before. Normal targets get
+        // the doubled range and zero noise under AWACS, configured noise otherwise.
         let target_silent = ship.powerups.is_active(PowerupId::SilentRunning, tick);
-        let effective_range = if target_silent && !awacs_active {
-            radar_range * powerup_cfg.silent_running_active_range_mult
+        let (effective_range, effective_noise, confidence) = if target_silent {
+            if awacs_active {
+                (
+                    base_range,
+                    powerup_cfg.awacs_silent_jitter,
+                    powerup_cfg.awacs_silent_confidence,
+                )
+            } else {
+                (
+                    radar_range * powerup_cfg.silent_running_active_range_mult,
+                    base_noise,
+                    1.0,
+                )
+            }
+        } else if awacs_active {
+            (radar_range, 0.0, 1.0)
         } else {
-            radar_range
+            (radar_range, base_noise, 1.0)
         };
 
         let to = ship.pos - viewer_pos;
@@ -103,13 +115,13 @@ pub fn active_contacts(
             continue;
         }
 
-        let nx: f32 = if radar_noise > 0.0 {
-            rng.gen_range(-radar_noise..=radar_noise)
+        let nx: f32 = if effective_noise > 0.0 {
+            rng.gen_range(-effective_noise..=effective_noise)
         } else {
             0.0
         };
-        let ny: f32 = if radar_noise > 0.0 {
-            rng.gen_range(-radar_noise..=radar_noise)
+        let ny: f32 = if effective_noise > 0.0 {
+            rng.gen_range(-effective_noise..=effective_noise)
         } else {
             0.0
         };
@@ -118,7 +130,7 @@ pub fn active_contacts(
             pos: ship.pos + Vec2::new(nx, ny),
             bearing_deg: compass_deg(to),
             range: Some(dist),
-            confidence: 1.0,
+            confidence,
         });
     }
 
@@ -527,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn awacs_sees_through_silent_running() {
+    fn awacs_soft_counters_silent_running_within_base_range() {
         use crate::sim::PowerupId;
         let mut world = World::new(2000.0, 2000.0, SimConfig::default());
         // Viewer with AWACS active.
@@ -535,7 +547,8 @@ mod tests {
         viewer.powerups.selected = vec![PowerupId::AwacsScan];
         viewer.powerups.awacs_expires_at = 100;
         world.insert_ship(viewer);
-        // Silent target at 250u east — without AWACS, this would be invisible.
+        // Silent target at 250u east — inside base radar range (350). AWACS surfaces it, but
+        // only as a low-confidence contact (soft counter), not a precise one.
         let mut s2 = ship("s_2", 750.0, 500.0);
         s2.powerups.selected = vec![PowerupId::SilentRunning];
         s2.powerups.silent_running_expires_at = 100;
@@ -545,7 +558,34 @@ mod tests {
         assert_eq!(
             contacts.len(),
             1,
-            "AWACS should bypass silent_running and see the target"
+            "AWACS should surface a silent target in base range"
+        );
+        assert_eq!(
+            contacts[0].confidence, world.config.powerups.awacs_silent_confidence,
+            "silent target seen by AWACS should be a low-confidence contact"
+        );
+    }
+
+    #[test]
+    fn awacs_does_not_see_silent_running_beyond_base_range() {
+        use crate::sim::PowerupId;
+        let mut world = World::new(2000.0, 2000.0, SimConfig::default());
+        // Viewer with AWACS active — doubled range would be 700.
+        let mut viewer = ship("s_1", 500.0, 500.0);
+        viewer.powerups.selected = vec![PowerupId::AwacsScan];
+        viewer.powerups.awacs_expires_at = 100;
+        world.insert_ship(viewer);
+        // Silent target at 500u east: beyond base 350 but inside the doubled 700 range. Under
+        // the soft counter a silent runner is only detected within base range, so it's hidden.
+        let mut s2 = ship("s_2", 1000.0, 500.0);
+        s2.powerups.selected = vec![PowerupId::SilentRunning];
+        s2.powerups.silent_running_expires_at = 100;
+        world.insert_ship(s2);
+        let mut rng = Pcg64::seed_from_u64(7);
+        let contacts = active_contacts(&"s_1".into(), Vec2::new(500.0, 500.0), &world, &mut rng);
+        assert!(
+            contacts.is_empty(),
+            "AWACS must not see a silent runner beyond base radar range: {contacts:?}"
         );
     }
 
@@ -604,6 +644,7 @@ mod tests {
             owner: "s_2".into(),
             pos: Vec2::new(750.0, 500.0),
             heading_deg: 90.0,
+            vel: Vec2::ZERO,
             expires_at: 100,
         });
         let mut rng = Pcg64::seed_from_u64(7);

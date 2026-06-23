@@ -10,9 +10,12 @@
 use std::collections::BTreeSet;
 
 use glam::Vec2;
+use rand::Rng;
+use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
 use super::config::PowerupConfig;
+use super::constants::DT;
 use super::world::{Decoy, ShipId, SmokeCloud, World};
 
 /// The full set of powerups available to bots. Snake-case serialization matches the wire
@@ -119,12 +122,13 @@ pub struct PowerupState {
     pub long_range_expires_at: u64,
     pub awacs_expires_at: u64,
     pub silent_running_expires_at: u64,
-    /// Window during which the *first* incoming hit triggers the trace reveal sequence.
+    /// Window during which incoming hits arm/refresh the trace reveal. Non-consuming: every
+    /// hit while `world.tick < trace_armed_until` (re)starts the reveal track below.
     pub trace_armed_until: u64,
-    /// Number of remaining tick payloads in which the bot still receives a synthetic
-    /// precise contact for `trace_attacker`. Decremented each time a reveal is emitted.
-    pub trace_pending_reveals: u8,
-    /// Ship that triggered the trace. Cleared once reveals are exhausted.
+    /// Tick until which the bot keeps receiving a synthetic precise contact for
+    /// `trace_attacker`. Refreshed (not decremented) on each hit during the armed window.
+    pub trace_reveal_until: u64,
+    /// Ship that last hit this one during the armed window. Drives the reveal track.
     pub trace_attacker: Option<ShipId>,
     /// EMP slow window. While `world.tick < emp_expires_at`, the ship's gun cooldown is
     /// multiplied by `emp_gun_cooldown_mult` (stacks with rapid_fire) and active radar
@@ -147,7 +151,7 @@ impl PowerupState {
         self.awacs_expires_at = 0;
         self.silent_running_expires_at = 0;
         self.trace_armed_until = 0;
-        self.trace_pending_reveals = 0;
+        self.trace_reveal_until = 0;
         self.trace_attacker = None;
         self.emp_expires_at = 0;
     }
@@ -223,13 +227,24 @@ impl ActivationError {
 
 /// Activate `id` for `ship_id`. Applies the relevant effect, marks the powerup as used,
 /// and (for AoE powerups) mutates the world. Returns `Ok(())` on success.
-pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<(), ActivationError> {
+///
+/// `rng` is the room's seeded `Pcg64`. Only `decoy_flare` draws from it (one draw, for the
+/// jittered spawn distance); keeping every other arm draw-free preserves the deterministic
+/// per-tick RNG stream the sensor pass relies on.
+pub fn activate(
+    world: &mut World,
+    ship_id: &ShipId,
+    id: PowerupId,
+    rng: &mut Pcg64,
+) -> Result<(), ActivationError> {
     let tick = world.tick;
     let config = world.config.powerups;
+    let hull_hp = world.config.hull_hp;
 
     // Validate the activator first without taking long-lived borrows on `world.ships`.
     let activator_pos;
     let activator_heading;
+    let activator_speed;
     {
         let ship = world
             .ships
@@ -246,6 +261,7 @@ pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<()
         }
         activator_pos = ship.pos;
         activator_heading = ship.heading_deg;
+        activator_speed = ship.speed;
     }
 
     // World-level effects (read positions of other ships first, then take a single mutable
@@ -288,11 +304,16 @@ pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<()
             });
         }
         PowerupId::DecoyFlare => {
-            // Project a phantom contact `decoy_flare_distance` units along the activator's
-            // current heading. Compass heading: 0° = north (-y), 90° = east (+x).
+            // Project a phantom a seeded-jittered distance along the activator's current
+            // heading, then have it cruise at the activator's heading/speed so it can't be
+            // filtered out as a motionless contact. Compass heading: 0° = north (-y), 90° = east (+x).
+            // This is the only RNG draw `activate` makes — keep it a single, unconditional draw.
             let r = activator_heading.to_radians();
             let dir = Vec2::new(r.sin(), -r.cos());
-            let pos = activator_pos + dir * config.decoy_flare_distance;
+            let dist =
+                rng.gen_range(config.decoy_flare_distance_min..=config.decoy_flare_distance_max);
+            let pos = activator_pos + dir * dist;
+            let vel = dir * activator_speed;
             let fake_id = world.next_decoy_index;
             world.next_decoy_index = world.next_decoy_index.wrapping_add(1);
             world.decoys.push(Decoy {
@@ -300,6 +321,7 @@ pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<()
                 owner: ship_id.clone(),
                 pos,
                 heading_deg: activator_heading,
+                vel,
                 expires_at: tick + config.decoy_flare_duration_ticks as u64,
             });
         }
@@ -320,6 +342,11 @@ pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<()
                 tick + config.reinforced_hull_duration_ticks as u64;
         }
         PowerupId::RepairDrones => {
+            // Front-loaded burst on activation, then per-tick regen via step_tick_maintenance.
+            ship.hp = ship
+                .hp
+                .saturating_add(config.repair_drones_instant_hp)
+                .min(hull_hp);
             ship.powerups.repair_drones_expires_at =
                 tick + config.repair_drones_duration_ticks as u64;
         }
@@ -341,7 +368,7 @@ pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<()
         }
         PowerupId::CounterBatteryTrace => {
             ship.powerups.trace_armed_until = tick + config.counter_battery_arm_ticks as u64;
-            ship.powerups.trace_pending_reveals = 0;
+            ship.powerups.trace_reveal_until = 0;
             ship.powerups.trace_attacker = None;
         }
         // AoE effects already mutated the world above; mark used and exit.
@@ -351,9 +378,9 @@ pub fn activate(world: &mut World, ship_id: &ShipId, id: PowerupId) -> Result<()
     Ok(())
 }
 
-/// End-of-tick maintenance: regen HP for ships with `repair_drones` active, garbage-collect
-/// expired smoke clouds and decoys. Call after physics+combat but before the per-bot tick
-/// payload is built so the bots see fresh state.
+/// End-of-tick maintenance: regen HP for ships with `repair_drones` active, advance cruising
+/// decoys, and garbage-collect expired smoke clouds and decoys. Call after physics+combat but
+/// before the per-bot tick payload is built so the bots see fresh state.
 pub fn step_tick_maintenance(world: &mut World) {
     let tick = world.tick;
     let hp_per_tick = world.config.powerups.repair_drones_hp_per_tick;
@@ -365,6 +392,10 @@ pub fn step_tick_maintenance(world: &mut World) {
         if ship.powerups.repair_drones_expires_at > tick && hp_per_tick > 0 {
             ship.hp = ship.hp.saturating_add(hp_per_tick).min(max_hp);
         }
+    }
+    // Decoys cruise at their inherited velocity (fixed dt; no wall clock).
+    for decoy in world.decoys.iter_mut() {
+        decoy.pos += decoy.vel * DT;
     }
     world.smoke_clouds.retain(|c| c.expires_at > tick);
     world.decoys.retain(|d| d.expires_at > tick);
@@ -458,7 +489,7 @@ pub fn buffed_max_shell_range(base: f32, config: &PowerupConfig) -> f32 {
 
 /// Apply reinforced-hull damage reduction. Returns the (possibly reduced) damage value to
 /// actually subtract from HP. `round` rather than `floor` to keep the boundary cases
-/// honest (1 hp at 0.4× still costs 0 hp by design).
+/// honest (1 hp at 0.45× still costs 0 hp by design).
 pub fn apply_incoming_damage_reduction(
     raw_damage: u32,
     state: &PowerupState,
@@ -478,6 +509,7 @@ mod tests {
     use super::*;
     use crate::sim::config::SimConfig;
     use crate::sim::world::Ship;
+    use rand::SeedableRng;
 
     fn world_with(ships: Vec<Ship>) -> World {
         let mut w = World::new(1000.0, 1000.0, SimConfig::default());
@@ -485,6 +517,11 @@ mod tests {
             w.insert_ship(s);
         }
         w
+    }
+
+    /// Seeded RNG for tests that call `activate` (only `decoy_flare` actually draws).
+    fn test_rng() -> Pcg64 {
+        Pcg64::seed_from_u64(42)
     }
 
     fn ship_with_loadout(id: &str, loadout: &[PowerupId]) -> Ship {
@@ -508,7 +545,13 @@ mod tests {
             "s_1",
             &[PowerupId::Overdrive, PowerupId::RapidFire],
         )]);
-        let err = activate(&mut world, &"s_1".into(), PowerupId::SmokeScreen).unwrap_err();
+        let err = activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::SmokeScreen,
+            &mut test_rng(),
+        )
+        .unwrap_err();
         assert_eq!(err, ActivationError::NotSelected);
     }
 
@@ -518,8 +561,20 @@ mod tests {
             "s_1",
             &[PowerupId::Overdrive, PowerupId::RapidFire],
         )]);
-        activate(&mut world, &"s_1".into(), PowerupId::Overdrive).expect("first activate");
-        let err = activate(&mut world, &"s_1".into(), PowerupId::Overdrive).unwrap_err();
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::Overdrive,
+            &mut test_rng(),
+        )
+        .expect("first activate");
+        let err = activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::Overdrive,
+            &mut test_rng(),
+        )
+        .unwrap_err();
         assert_eq!(err, ActivationError::AlreadyUsed);
     }
 
@@ -529,7 +584,13 @@ mod tests {
             "s_1",
             &[PowerupId::Overdrive, PowerupId::RapidFire],
         )]);
-        activate(&mut world, &"s_1".into(), PowerupId::Overdrive).expect("activate");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::Overdrive,
+            &mut test_rng(),
+        )
+        .expect("activate");
         let dur = world.config.powerups.overdrive_duration_ticks as u64;
         let state = &world.ships.get("s_1").unwrap().powerups;
         assert_eq!(state.overdrive_expires_at, dur);
@@ -544,7 +605,13 @@ mod tests {
             "s_1",
             &[PowerupId::SmokeScreen, PowerupId::Overdrive],
         )]);
-        activate(&mut world, &"s_1".into(), PowerupId::SmokeScreen).expect("activate");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::SmokeScreen,
+            &mut test_rng(),
+        )
+        .expect("activate");
         assert_eq!(world.smoke_clouds.len(), 1);
         let cloud = &world.smoke_clouds[0];
         assert_eq!(cloud.pos, Vec2::new(500.0, 500.0));
@@ -560,7 +627,13 @@ mod tests {
         s2.alive = true;
         s3.alive = true;
         let mut world = world_with(vec![s1, s2, s3]);
-        activate(&mut world, &"s_1".into(), PowerupId::EmpBurst).expect("activate");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::EmpBurst,
+            &mut test_rng(),
+        )
+        .expect("activate");
         let dur = world.config.powerups.emp_burst_duration_ticks as u64;
         assert_eq!(world.ships.get("s_2").unwrap().powerups.emp_expires_at, dur);
         assert_eq!(world.ships.get("s_3").unwrap().powerups.emp_expires_at, 0);
@@ -575,7 +648,13 @@ mod tests {
             &[PowerupId::Overdrive, PowerupId::RapidFire],
         )]);
         world.ships.get_mut("s_1").unwrap().alive = false;
-        let err = activate(&mut world, &"s_1".into(), PowerupId::Overdrive).unwrap_err();
+        let err = activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::Overdrive,
+            &mut test_rng(),
+        )
+        .unwrap_err();
         assert_eq!(err, ActivationError::ShipDead);
     }
 
@@ -586,13 +665,22 @@ mod tests {
             &[PowerupId::RepairDrones, PowerupId::Overdrive],
         )]);
         world.ships.get_mut("s_1").unwrap().hp = 50;
-        activate(&mut world, &"s_1".into(), PowerupId::RepairDrones).expect("activate");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::RepairDrones,
+            &mut test_rng(),
+        )
+        .expect("activate");
+        let instant = world.config.powerups.repair_drones_instant_hp;
         let per_tick = world.config.powerups.repair_drones_hp_per_tick;
         let dur = world.config.powerups.repair_drones_duration_ticks as u64;
-        // Advance one tick: hp regens by `per_tick`.
+        // Instant burst lands immediately on activation.
+        assert_eq!(world.ships.get("s_1").unwrap().hp, 50 + instant);
+        // Advance one tick: hp regens by `per_tick` on top of the burst.
         world.tick = 1;
         step_tick_maintenance(&mut world);
-        assert_eq!(world.ships.get("s_1").unwrap().hp, 50 + per_tick);
+        assert_eq!(world.ships.get("s_1").unwrap().hp, 50 + instant + per_tick);
         // Past expiry: no further regen.
         world.tick = dur + 5;
         let before = world.ships.get("s_1").unwrap().hp;
@@ -606,8 +694,20 @@ mod tests {
             "s_1",
             &[PowerupId::SmokeScreen, PowerupId::DecoyFlare],
         )]);
-        activate(&mut world, &"s_1".into(), PowerupId::SmokeScreen).expect("smoke");
-        activate(&mut world, &"s_1".into(), PowerupId::DecoyFlare).expect("decoy");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::SmokeScreen,
+            &mut test_rng(),
+        )
+        .expect("smoke");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::DecoyFlare,
+            &mut test_rng(),
+        )
+        .expect("decoy");
         assert_eq!(world.smoke_clouds.len(), 1);
         assert_eq!(world.decoys.len(), 1);
         // Tick well past both expiries.
@@ -631,8 +731,8 @@ mod tests {
         };
         let base = 15;
         let combined = effective_gun_cooldown_ticks(base, &state, &cfg, 0);
-        // 15 * 0.3 * 2.0 = 9. Helper rounds and clamps; expect exactly 9.
-        assert_eq!(combined, 9);
+        // 15 * 0.5 * 2.0 = 15. Helper rounds and clamps; expect exactly 15.
+        assert_eq!(combined, 15);
     }
 
     #[test]
@@ -650,7 +750,13 @@ mod tests {
         // Cooldown / ammo reset so a second fire goes through.
         world.ships.get_mut("s_1").unwrap().gun_cooldown = 0;
         // Activate long_range_salvo and fire — speed should now be boosted.
-        activate(&mut world, &"s_1".into(), PowerupId::LongRangeSalvo).expect("activate");
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::LongRangeSalvo,
+            &mut test_rng(),
+        )
+        .expect("activate");
         combat::fire(&mut world, &"s_1".into(), 90.0, 200.0).expect("fire");
         let buffed_speed = world.shells[0].vel.length();
         let buffed_ttl = world.shells[0].ttl_ticks;
@@ -668,36 +774,37 @@ mod tests {
     }
 
     #[test]
-    fn heavy_shell_doubles_splash_radius_and_increases_damage() {
+    fn heavy_shell_widens_splash_radius_and_increases_damage() {
         use crate::sim::combat;
-        // Two ships: shooter at (500,500), target at (600, 500). Splash radius is 15 by
-        // default — the target is well outside, so a normal shot does 0 damage. With
-        // heavy_shell active, the splash radius doubles to 30 and the target gets clipped.
-        // Wait: the standard splash range is 15 — 100u away is well outside. Heavy makes
-        // it 30 — still outside. So instead, place the target so it sits *inside* the
-        // heavy radius but *outside* the normal one. Splash centre is at the impact
-        // point, ~203u east of shooter for a 200u request.
+        // Splash radius is 15 by default; heavy_shell widens it to 15 * 1.5 = 22.5. Place the
+        // target so it sits *inside* the heavy radius but *outside* the normal one, so a
+        // heavy shot clips it where a normal shot would do nothing. Splash centre is the
+        // impact point, ~203u east of the shooter for a 200u request.
         let mut world = world_with(vec![
             ship_with_loadout("s_1", &[PowerupId::HeavyShell, PowerupId::ReinforcedHull]),
             Ship::new_at("s_2".into(), "b_2".into(), Vec2::new(0.0, 0.0), 0.0),
         ]);
-        // Position s_1 at origin and s_2 such that the splash centre lands 25u short of
-        // s_2 — outside the 15u normal splash, inside the 30u heavy splash.
         world.ships.get_mut("s_1").unwrap().pos = Vec2::new(500.0, 500.0);
-        // After 200u request, impact is ~203u east. Place s_2 at impact + 25u east.
+        // After a 200u request, impact is ~203u east. Place s_2 at impact + 18u east.
         let impact_x = 500.0
             + (200.0_f32 / (world.config.shell_speed * crate::sim::constants::DT)).ceil()
                 * world.config.shell_speed
                 * crate::sim::constants::DT;
-        world.ships.get_mut("s_2").unwrap().pos = Vec2::new(impact_x + 25.0, 500.0);
-        // Sanity: 25 > 15 (normal splash) and 25 < 30 (heavy splash).
-        activate(&mut world, &"s_1".into(), PowerupId::HeavyShell).expect("heavy");
+        world.ships.get_mut("s_2").unwrap().pos = Vec2::new(impact_x + 18.0, 500.0);
+        // Sanity: 18 > 15 (normal splash) and 18 < 22.5 (heavy splash).
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::HeavyShell,
+            &mut test_rng(),
+        )
+        .expect("heavy");
         combat::fire(&mut world, &"s_1".into(), 90.0, 200.0).expect("fire");
         while !world.shells.is_empty() {
             combat::step_shells(&mut world);
         }
-        // Heavy shell damage at 25/30 of the way out: frac = 1 - 25/30 ≈ 0.167; base damage
-        // is buffed to 25 * 1.5 = 37.5, rounded to 38; 0.167 * 38 ≈ 6.3 → 6 hp lost.
+        // Heavy shell damage at 18/22.5 of the way out: frac = 1 - 18/22.5 = 0.2; base damage
+        // is buffed to 25 * 1.3 = 32.5 → 33; 0.2 * 33 ≈ 6.6 → 7 hp lost.
         let s2_hp = world.ships.get("s_2").unwrap().hp;
         assert!(
             s2_hp < crate::sim::constants::HULL_HP,
@@ -714,8 +821,8 @@ mod tests {
             ..Default::default()
         };
         let reduced = apply_incoming_damage_reduction(25, &state, &cfg, 0);
-        // 25 * 0.4 = 10.0, rounds to 10.
-        assert_eq!(reduced, 10);
+        // 25 * 0.45 = 11.25, rounds to 11.
+        assert_eq!(reduced, 11);
         // Without the effect, raw damage passes through.
         state.reinforced_hull_expires_at = 0;
         assert_eq!(apply_incoming_damage_reduction(25, &state, &cfg, 5), 25);

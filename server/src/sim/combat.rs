@@ -176,18 +176,13 @@ pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
                 continue;
             }
             ship.hp = ship.hp.saturating_sub(dmg);
-            // Counter-battery trace: first hit while armed locks in the shooter for the
-            // next `counter_battery_reveal_ticks` reveal frames. Self-hits and hits from
-            // an unknown source don't trigger a trace (no useful info).
-            if ship.powerups.trace_armed_until > tick
-                && ship.powerups.trace_pending_reveals == 0
-                && shell.source_ship != *id
-            {
+            // Counter-battery trace: non-consuming. Every hit while armed (re)starts a
+            // `counter_battery_reveal_ticks`-long full-confidence track on the shooter.
+            // Self-hits and hits from an unknown source don't trigger a trace (no useful info).
+            if ship.powerups.trace_armed_until > tick && shell.source_ship != *id {
                 ship.powerups.trace_attacker = Some(shell.source_ship.clone());
-                ship.powerups.trace_pending_reveals = powerup_config.counter_battery_reveal_ticks;
-                // Trace fires once per arming — disarm immediately so a second incoming
-                // hit doesn't overwrite the attacker mid-reveal-sequence.
-                ship.powerups.trace_armed_until = 0;
+                ship.powerups.trace_reveal_until =
+                    tick + powerup_config.counter_battery_reveal_ticks as u64;
             }
             events.push(CombatEvent::Hit {
                 ship_id: id.clone(),
@@ -487,10 +482,11 @@ mod tests {
         let trace = &world.ships.get("s_2").unwrap().powerups;
         assert_eq!(trace.trace_attacker.as_deref(), Some("s_1"));
         assert!(
-            trace.trace_pending_reveals > 0,
-            "should have queued reveals"
+            trace.trace_reveal_until > world.tick,
+            "should have started a reveal track"
         );
-        // Trace consumed — second hit doesn't overwrite the attacker mid-reveal.
+        // Non-consuming: a later hit while still armed refreshes the track onto the new
+        // attacker (the arm window is not disarmed by a hit).
         s1.id = "s_3".into();
         s1.bot_id = "b_3".into();
         s1.gun_cooldown = 0;
@@ -509,8 +505,8 @@ mod tests {
                 .powerups
                 .trace_attacker
                 .as_deref(),
-            Some("s_1"),
-            "second hit must not overwrite mid-reveal attacker"
+            Some("s_3"),
+            "a hit while still armed refreshes the track onto the new attacker"
         );
     }
 

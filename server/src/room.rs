@@ -645,7 +645,7 @@ impl Room {
                 }
             }
             if let Some(powerup) = cmd.activate_powerup {
-                match powerups::activate(&mut self.world, &ship_id, powerup) {
+                match powerups::activate(&mut self.world, &ship_id, powerup, &mut self.rng) {
                     Ok(()) => {
                         powerup_activations.push((ship_id.clone(), powerup));
                         info!(
@@ -1335,21 +1335,30 @@ impl Room {
     }
 
     /// If this bot has a pending counter-battery trace reveal, append a synthetic precise
-    /// contact for the attacker to `contacts` and decrement the reveal counter. The
-    /// synthetic contact carries a `cbt_<index>` id and full confidence so bots can tell
-    /// it apart from a regular sensor return if they want to.
+    /// contact for the attacker to `contacts` while the reveal track is live. Non-consuming:
+    /// the track is time-bounded by `trace_reveal_until` (refreshed on each hit during the
+    /// armed window), so this just reads it rather than decrementing a counter. The synthetic
+    /// contact carries a `cbt_<index>` id and full confidence so bots can tell it apart from a
+    /// regular sensor return if they want to.
     fn consume_counter_battery_reveal(
         &mut self,
         ship_id: &ShipId,
         viewer_pos: Vec2,
         contacts: &mut Vec<ProtocolContact>,
     ) {
+        let tick = self.world.tick;
         let attacker_pos = {
             let ship = match self.world.ships.get(ship_id) {
                 Some(s) => s,
                 None => return,
             };
-            if ship.powerups.trace_pending_reveals == 0 {
+            if ship.powerups.trace_reveal_until <= tick {
+                // Track expired (or never started). Clear the stale attacker reference.
+                if ship.powerups.trace_attacker.is_some() {
+                    if let Some(s) = self.world.ships.get_mut(ship_id) {
+                        s.powerups.trace_attacker = None;
+                    }
+                }
                 return;
             }
             let attacker_id = match &ship.powerups.trace_attacker {
@@ -1384,17 +1393,9 @@ impl Room {
                 },
             );
         }
-        // Decrement reveals regardless of whether the attacker still exists — a missing
-        // attacker (e.g. disconnected) still counts down so the trace doesn't get stuck.
-        let ship = self
-            .world
-            .ships
-            .get_mut(ship_id)
-            .expect("ship still present");
-        ship.powerups.trace_pending_reveals = ship.powerups.trace_pending_reveals.saturating_sub(1);
-        if ship.powerups.trace_pending_reveals == 0 {
-            ship.powerups.trace_attacker = None;
-        }
+        // Non-consuming: the track is bounded by `trace_reveal_until` (checked above), so
+        // there's no counter to decrement here. A missing attacker (e.g. disconnected) simply
+        // produces no contact this tick while the track is live.
     }
 
     /// Coarse "would the viewer currently see this ship" check, used to gate

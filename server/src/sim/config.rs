@@ -63,6 +63,8 @@ pub struct PowerupConfig {
     // Repair drones
     pub repair_drones_duration_ticks: u32,
     pub repair_drones_hp_per_tick: u32,
+    /// HP healed instantly on activation, before per-tick regen begins.
+    pub repair_drones_instant_hp: u32,
     // Smoke screen
     pub smoke_screen_duration_ticks: u32,
     pub smoke_screen_radius: f32,
@@ -80,19 +82,27 @@ pub struct PowerupConfig {
     // AWACS scan
     pub awacs_duration_ticks: u32,
     pub awacs_range_mult: f32,
+    /// Half-width (units) of position jitter on silent-running contacts surfaced by AWACS.
+    pub awacs_silent_jitter: f32,
+    /// Confidence reported for silent-running contacts surfaced by AWACS.
+    pub awacs_silent_confidence: f32,
     // Silent running
     pub silent_running_duration_ticks: u32,
     pub silent_running_active_range_mult: f32,
     // Counter-battery trace
     pub counter_battery_arm_ticks: u32,
-    pub counter_battery_reveal_ticks: u8,
+    /// Duration (ticks) of the full-confidence track each hit (re)starts during the armed window.
+    pub counter_battery_reveal_ticks: u32,
     // EMP burst
     pub emp_burst_duration_ticks: u32,
     pub emp_burst_radius: f32,
     pub emp_gun_cooldown_mult: f32,
     // Decoy flare
     pub decoy_flare_duration_ticks: u32,
-    pub decoy_flare_distance: f32,
+    /// Minimum spawn distance ahead of the activator (units); actual distance is jittered.
+    pub decoy_flare_distance_min: f32,
+    /// Maximum spawn distance ahead of the activator (units); actual distance is jittered.
+    pub decoy_flare_distance_max: f32,
 }
 
 impl Default for PowerupConfig {
@@ -106,6 +116,7 @@ impl Default for PowerupConfig {
             reinforced_hull_damage_mult: constants::REINFORCED_HULL_DAMAGE_MULT,
             repair_drones_duration_ticks: constants::REPAIR_DRONES_DURATION_TICKS,
             repair_drones_hp_per_tick: constants::REPAIR_DRONES_HP_PER_TICK,
+            repair_drones_instant_hp: constants::REPAIR_DRONES_INSTANT_HP,
             smoke_screen_duration_ticks: constants::SMOKE_SCREEN_DURATION_TICKS,
             smoke_screen_radius: constants::SMOKE_SCREEN_RADIUS,
             rapid_fire_duration_ticks: constants::RAPID_FIRE_DURATION_TICKS,
@@ -118,6 +129,8 @@ impl Default for PowerupConfig {
             long_range_speed_mult: constants::LONG_RANGE_SPEED_MULT,
             awacs_duration_ticks: constants::AWACS_DURATION_TICKS,
             awacs_range_mult: constants::AWACS_RANGE_MULT,
+            awacs_silent_jitter: constants::AWACS_SILENT_JITTER,
+            awacs_silent_confidence: constants::AWACS_SILENT_CONFIDENCE,
             silent_running_duration_ticks: constants::SILENT_RUNNING_DURATION_TICKS,
             silent_running_active_range_mult: constants::SILENT_RUNNING_ACTIVE_RANGE_MULT,
             counter_battery_arm_ticks: constants::COUNTER_BATTERY_ARM_TICKS,
@@ -126,7 +139,8 @@ impl Default for PowerupConfig {
             emp_burst_radius: constants::EMP_BURST_RADIUS,
             emp_gun_cooldown_mult: constants::EMP_GUN_COOLDOWN_MULT,
             decoy_flare_duration_ticks: constants::DECOY_FLARE_DURATION_TICKS,
-            decoy_flare_distance: constants::DECOY_FLARE_DISTANCE,
+            decoy_flare_distance_min: constants::DECOY_FLARE_DISTANCE_MIN,
+            decoy_flare_distance_max: constants::DECOY_FLARE_DISTANCE_MAX,
         }
     }
 }
@@ -176,6 +190,12 @@ impl PowerupConfig {
         check_count(
             "powerups.repair_drones_hp_per_tick",
             self.repair_drones_hp_per_tick,
+            0,
+            1_000_000,
+        )?;
+        check_count(
+            "powerups.repair_drones_instant_hp",
+            self.repair_drones_instant_hp,
             0,
             1_000_000,
         )?;
@@ -240,6 +260,16 @@ impl PowerupConfig {
             1_000_000,
         )?;
         check_positive("powerups.awacs_range_mult", self.awacs_range_mult, 1_000.0)?;
+        check_non_negative(
+            "powerups.awacs_silent_jitter",
+            self.awacs_silent_jitter,
+            1_000_000.0,
+        )?;
+        check_non_negative(
+            "powerups.awacs_silent_confidence",
+            self.awacs_silent_confidence,
+            1.0,
+        )?;
         check_count(
             "powerups.silent_running_duration_ticks",
             self.silent_running_duration_ticks,
@@ -283,10 +313,20 @@ impl PowerupConfig {
             1_000_000,
         )?;
         check_positive(
-            "powerups.decoy_flare_distance",
-            self.decoy_flare_distance,
+            "powerups.decoy_flare_distance_min",
+            self.decoy_flare_distance_min,
             1_000_000.0,
         )?;
+        check_positive(
+            "powerups.decoy_flare_distance_max",
+            self.decoy_flare_distance_max,
+            1_000_000.0,
+        )?;
+        if self.decoy_flare_distance_min > self.decoy_flare_distance_max {
+            return Err(
+                "powerups.decoy_flare_distance_min must not exceed decoy_flare_distance_max".into(),
+            );
+        }
         Ok(())
     }
 }
