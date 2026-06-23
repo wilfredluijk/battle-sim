@@ -5,6 +5,8 @@
   import { latestWorld, splashes, view } from '../stores';
   import { draw, type Splash } from '../lib/renderer';
   import { fitCanvas } from '../lib/canvas';
+  import { room } from '../stores/admin';
+  import { MAP_WIDTH, MAP_HEIGHT, MAX_HP } from '../lib/constants';
   import type { WorldFrame } from '../types/protocol';
 
   let canvas: HTMLCanvasElement | null = $state(null);
@@ -18,6 +20,11 @@
 
   const unsubFrame = latestWorld.subscribe((v) => (currentFrame = v));
   const unsubSplashes = splashes.subscribe((v) => (currentSplashes = v));
+
+  // HP-bar scale follows the match's configured hull when known, so the canvas
+  // matches the BotCard meters instead of assuming a fixed 100-HP hull.
+  let currentMaxHp = MAX_HP;
+  const unsubRoom = room.subscribe((r) => (currentMaxHp = r?.config?.hull_hp ?? MAX_HP));
 
   // View toggle changes the canvas's CSS size; the pixel buffer must be re-synced AFTER
   // the layout settles. `await sveltetick()` defers to the next microtask once Svelte
@@ -43,7 +50,7 @@
 
     const loop = (): void => {
       rafId = requestAnimationFrame(loop);
-      draw(ctx, currentFrame, currentSplashes, performance.now());
+      draw(ctx, currentFrame, currentSplashes, performance.now(), MAP_WIDTH, MAP_HEIGHT, currentMaxHp);
     };
     rafId = requestAnimationFrame(loop);
   });
@@ -54,6 +61,7 @@
     unsubFrame();
     unsubSplashes();
     unsubView();
+    unsubRoom();
   });
 </script>
 

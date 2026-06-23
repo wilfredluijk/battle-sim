@@ -188,7 +188,7 @@ async def run_async(
                 if msg_type == "welcome":
                     try:
                         welcome = Welcome.from_dict(msg)
-                    except (KeyError, TypeError, ValueError) as exc:
+                    except (KeyError, IndexError, TypeError, ValueError) as exc:
                         log.warning("malformed welcome: %s (frame=%r)", exc, msg)
                         continue
                     bot.welcome = welcome
@@ -212,7 +212,7 @@ async def run_async(
                         gs_tick = int(msg["tick"])
                         pos = msg["starting_position"]
                         heading = float(msg["starting_heading_deg"])
-                    except (KeyError, TypeError, ValueError) as exc:
+                    except (KeyError, IndexError, TypeError, ValueError) as exc:
                         log.warning("malformed game_start: %s (frame=%r)", exc, msg)
                         continue
                     _safe_callback(
@@ -225,7 +225,7 @@ async def run_async(
                 elif msg_type == "tick":
                     try:
                         view = WorldView.from_dict(msg)
-                    except (KeyError, TypeError, ValueError) as exc:
+                    except (KeyError, IndexError, TypeError, ValueError) as exc:
                         log.warning("malformed tick: %s (frame=%r)", exc, msg)
                         continue
                     bot.last_tick = view.tick
@@ -241,7 +241,7 @@ async def run_async(
                 elif msg_type == "game_over":
                     try:
                         result = GameOver.from_dict(msg)
-                    except (KeyError, TypeError, ValueError) as exc:
+                    except (KeyError, IndexError, TypeError, ValueError) as exc:
                         log.warning("malformed game_over: %s (frame=%r)", exc, msg)
                         break
                     keep_running = _safe_callback_returning(bot.on_game_over, result)

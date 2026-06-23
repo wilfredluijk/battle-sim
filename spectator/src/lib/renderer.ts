@@ -2,6 +2,7 @@ import {
   ACTIVE_RADAR_RANGE,
   MAP_HEIGHT,
   MAP_WIDTH,
+  MAX_HP,
   SHIP_RADIUS,
   SPLASH_DRAW_MS,
 } from './constants';
@@ -35,6 +36,7 @@ export function draw(
   now: number,
   mapW: number = MAP_WIDTH,
   mapH: number = MAP_HEIGHT,
+  maxHp: number = MAX_HP,
 ): void {
   const canvas = ctx.canvas;
   const w = canvas.width;
@@ -99,7 +101,7 @@ export function draw(
   }
 
   for (const ship of latest.ships) {
-    drawShip(ctx, ship, scale);
+    drawShip(ctx, ship, scale, maxHp);
   }
 }
 
@@ -169,7 +171,12 @@ function drawShell(ctx: CanvasRenderingContext2D, shell: ShellSnapshot, scale: n
   ctx.stroke();
 }
 
-function drawShip(ctx: CanvasRenderingContext2D, ship: ShipSnapshot, scale: number): void {
+function drawShip(
+  ctx: CanvasRenderingContext2D,
+  ship: ShipSnapshot,
+  scale: number,
+  maxHp: number = MAX_HP,
+): void {
   const color = colorFor(ship.bot_name);
   const x = ship.pos[0];
   const y = ship.pos[1];
@@ -220,8 +227,8 @@ function drawShip(ctx: CanvasRenderingContext2D, ship: ShipSnapshot, scale: numb
     const barH = 4;
     ctx.fillStyle = 'rgba(255,255,255,0.15)';
     ctx.fillRect(-barW / 2, 4, barW, barH);
-    const pct = Math.max(0, Math.min(1, ship.hp / 100));
-    const hpFill = ship.hp > 60 ? '#58d68d' : ship.hp > 25 ? '#f4d35e' : '#ef6b6b';
+    const pct = Math.max(0, Math.min(1, ship.hp / maxHp));
+    const hpFill = pct > 0.6 ? '#58d68d' : pct > 0.25 ? '#f4d35e' : '#ef6b6b';
     ctx.fillStyle = hpFill;
     ctx.fillRect(-barW / 2, 4, barW * pct, barH);
   }
@@ -270,6 +277,7 @@ export function drawPerspective(
   contacts: Contact[],
   mapW: number = MAP_WIDTH,
   mapH: number = MAP_HEIGHT,
+  maxHp: number = MAX_HP,
 ): void {
   const canvas = ctx.canvas;
   const w = canvas.width;
@@ -303,7 +311,7 @@ export function drawPerspective(
   }
 
   // Own ship last, fully detailed, on top of the contact overlay.
-  drawShip(ctx, ownShip, scale);
+  drawShip(ctx, ownShip, scale, maxHp);
 }
 
 /**

@@ -215,17 +215,22 @@ TickEvent = Any  # HitEvent | ShellSplashEvent | PowerupActivatedEvent | unknown
 
 
 def _parse_event(d: Dict[str, Any]) -> TickEvent:
-    kind = d.get("type")
-    if kind == "hit":
-        return HitEvent(amount=int(d["amount"]))
-    if kind == "shell_splash":
-        pos = d["pos"]
-        return ShellSplashEvent(pos=(float(pos[0]), float(pos[1])))
-    if kind == "powerup_activated":
-        return PowerupActivatedEvent(
-            ship_id=str(d["ship_id"]),
-            powerup=str(d["powerup"]),
-        )
+    try:
+        kind = d.get("type")
+        if kind == "hit":
+            return HitEvent(amount=int(d["amount"]))
+        if kind == "shell_splash":
+            pos = d["pos"]
+            return ShellSplashEvent(pos=(float(pos[0]), float(pos[1])))
+        if kind == "powerup_activated":
+            return PowerupActivatedEvent(
+                ship_id=str(d["ship_id"]),
+                powerup=str(d["powerup"]),
+            )
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        # A known event type arrived malformed (missing/ill-typed field). Fall
+        # through to the raw-dict path so one bad event can't sink the whole tick.
+        return d
     return d  # forward-compatible: unknown event types stay as raw dicts
 
 

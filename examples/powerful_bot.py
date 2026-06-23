@@ -395,7 +395,7 @@ class PowerfulBot(Bot):
 
         # Low-ammo discipline: only shoot when we're confident.
         if view.me.ammo <= self.LOW_AMMO_THRESHOLD:
-            tick = view.last_tick
+            tick = view.tick
             if tick - target.last_ranged_tick > 4:
                 return False  # need a very fresh fix
             if rng > self._max_shell_range * 0.85:

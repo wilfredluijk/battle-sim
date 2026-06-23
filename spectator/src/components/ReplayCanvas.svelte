@@ -6,6 +6,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fitCanvas } from '../lib/canvas';
   import { draw, drawPerspective } from '../lib/renderer';
+  import { MAX_HP } from '../lib/constants';
   import {
     replayData,
     replayPerspective,
@@ -37,12 +38,13 @@
     }
     const mapW = data.header.map.width;
     const mapH = data.header.map.height;
+    const maxHp = data.header.sim_config?.hull_hp ?? MAX_HP;
     const frame = data.frames[Math.max(0, Math.min(tick, data.frames.length - 1))] ?? null;
 
     if (perspective === 'overall' || !perspectiveData) {
       // Replay frames are drawn directly (no splash interpolation, which assumes
       // monotonic time and would misbehave on a slider seek).
-      draw(ctx, frame, [], performance.now(), mapW, mapH);
+      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp);
       return;
     }
 
@@ -53,7 +55,7 @@
       perspectiveData.frames[
         Math.max(0, Math.min(tick, perspectiveData.frames.length - 1))
       ];
-    drawPerspective(ctx, ownShip, pf?.contacts ?? [], mapW, mapH);
+    drawPerspective(ctx, ownShip, pf?.contacts ?? [], mapW, mapH, maxHp);
   }
 
   onMount(() => {

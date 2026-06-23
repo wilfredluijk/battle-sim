@@ -1,4 +1,4 @@
-import { MAX_EVENTS } from './constants';
+import { MAX_EVENTS, SPLASH_DRAW_MS } from './constants';
 import { formatEvent } from './formatEvent';
 import type { Splash } from './renderer';
 import type { ShipSnapshot, TickEvent, WorldFrame } from '../types/protocol';
@@ -29,8 +29,10 @@ export interface ReconcileResult {
  * - Splashes: every `shell_splash` event spawns a new `Splash` keyed at `now` so the
  *   renderer can animate it.
  *
- * Pure: returns new collections, never mutates the inputs. Splashes from `prevSplashes`
- * are passed through unchanged; the renderer is what expires them by age.
+ * Pure: returns new collections, never mutates the inputs. Splashes older than their
+ * draw lifetime are dropped here so the array stays bounded even when no renderer is
+ * mounted to expire them (e.g. while the user is parked on the report or replay screen
+ * during a live match); the renderer also expires them by age while it's drawing.
  */
 export function reconcile(
   frame: WorldFrame,
@@ -71,7 +73,10 @@ export function reconcile(
 
   // New events go on top; truncate so the list never grows unbounded.
   const events = [...newLines.reverse(), ...prevEvents].slice(0, MAX_EVENTS);
-  const splashes = [...prevSplashes, ...newSplashes];
+  // Drop expired splashes so the array can't grow without bound off-screen.
+  const splashes = [...prevSplashes, ...newSplashes].filter(
+    (sp) => now - sp.startedAt <= SPLASH_DRAW_MS,
+  );
 
   return { bots: next, events, splashes };
 }
