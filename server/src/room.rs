@@ -2303,12 +2303,9 @@ impl Room {
             .unwrap_or(1)
     }
 
-    fn register_bot(
-        &mut self,
-        peer: SocketAddr,
-        name: String,
-        version: &str,
-    ) -> Result<BotRegistration, JoinError> {
+    /// Shared join guard for both the live (`register_bot`) and replay
+    /// (`register_replay_bot`) registration paths.
+    fn validate_join(&self, name: &str) -> Result<(), JoinError> {
         if self.state != RoomState::Lobby {
             return Err(JoinError::NotInLobby);
         }
@@ -2317,18 +2314,72 @@ impl Room {
         }
         // Defensive: net.rs already enforces the charset, but the room is the
         // authoritative gatekeeper for what ends up in replay logs and spectator UIs.
-        if protocol::validate_bot_name(&name).is_err() {
+        if protocol::validate_bot_name(name).is_err() {
             return Err(JoinError::InvalidName);
         }
         if self.bots.values().any(|b| b.name == name) {
             return Err(JoinError::DuplicateName);
         }
+        Ok(())
+    }
+
+    fn register_bot(
+        &mut self,
+        peer: SocketAddr,
+        name: String,
+        version: &str,
+    ) -> Result<BotRegistration, JoinError> {
+        self.validate_join(&name)?;
 
         let n = self.next_index;
         self.next_index += 1;
         let bot_id: BotId = format!("b_{n}");
         let ship_id: ShipId = format!("s_{n}");
 
+        Ok(self.insert_registered_bot(bot_id, ship_id, peer, name, version))
+    }
+
+    /// Register a bot with ids supplied by the caller rather than minted from `next_index`.
+    /// Used only when rebuilding a room from a replay header.
+    ///
+    /// The live run's ids are *not* guaranteed to start at `b_1` or be contiguous: lobby
+    /// churn (bots that join then leave before the match starts) advances `next_index` and
+    /// leaves gaps, so a recorded match's bots can be `b_12`, `b_14`, … Re-minting from
+    /// `b_1` on rebuild would not reproduce them — it drifted with "header expected `b_12`,
+    /// room assigned `b_1`" — so the recorded ids are reused verbatim. `next_index` is
+    /// advanced past each reused id to keep the "future mints don't collide" invariant
+    /// (the replay path never mints again, but the invariant should still hold).
+    pub(crate) fn register_replay_bot(
+        &mut self,
+        bot_id: BotId,
+        ship_id: ShipId,
+        peer: SocketAddr,
+        name: String,
+        version: &str,
+    ) -> Result<BotRegistration, JoinError> {
+        self.validate_join(&name)?;
+
+        if let Some(seq) = bot_id
+            .strip_prefix("b_")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            self.next_index = self.next_index.max(seq + 1);
+        }
+
+        Ok(self.insert_registered_bot(bot_id, ship_id, peer, name, version))
+    }
+
+    /// Spawn the ship, open the outbound channel (primed with `welcome`), and insert the
+    /// `BotEntry` for an already-assigned `(bot_id, ship_id)` pair. Shared by the live and
+    /// replay registration paths; assumes `validate_join` has already passed.
+    fn insert_registered_bot(
+        &mut self,
+        bot_id: BotId,
+        ship_id: ShipId,
+        peer: SocketAddr,
+        name: String,
+        version: &str,
+    ) -> BotRegistration {
         // Spawn a ship at the map center. The actual starting position is reset by
         // `game_start` (Phase 4.2) using the §5.6 ring layout once the bot count is final.
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
@@ -2380,11 +2431,11 @@ impl Room {
             "bot registered"
         );
 
-        Ok(BotRegistration {
+        BotRegistration {
             bot_id,
             ship_id,
             outbound: out_rx,
-        })
+        }
     }
 }
 

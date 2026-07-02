@@ -359,41 +359,29 @@ fn rebuild_room_with_outbound(
     // so `welcome` payloads and physics use the exact values the live run did.
     room.world.config = header.sim_config;
 
-    // The header's `bots` array may be in any order: logs written before the
-    // registration-order fix serialized it lexicographically by `BotId`, which interleaves
-    // `b_10` ahead of `b_2`. The room assigns ids sequentially as bots register, so
-    // register in numeric-id order — the only order in which the ids the room assigns line
-    // up with the ones the header recorded.
+    // Reuse the recorded ids verbatim. The room's live registration mints ids from a
+    // monotonic `next_index` that lobby churn advances, so a recorded match's bots are not
+    // guaranteed to start at `b_1` or be contiguous (e.g. `b_12`, `b_14`). Re-deriving ids
+    // on rebuild drifted from the header ("header expected `b_12`, room assigned `b_1`");
+    // `register_replay_bot` forces the recorded pair instead. Registering in numeric-id
+    // order keeps `next_index`, logs, and the `outbound` vec tidy — correctness no longer
+    // depends on it, since the ids are no longer derived from registration order.
     let mut ordered: Vec<&ReplayBot> = header.bots.iter().collect();
     ordered.sort_by_key(|b| bot_id_seq(&b.bot_id));
 
     let mut outbound = Vec::with_capacity(header.bots.len());
     for bot in ordered {
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        room.handle_event(RoomEvent::BotConnect {
-            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            name: bot.name.clone(),
-            version: "replay".into(),
-            reply: reply_tx,
-        });
-        // `handle_event` is synchronous and fills the reply before returning, so try_recv
-        // always succeeds here.
-        let reg = reply_rx
-            .try_recv()
-            .map_err(|_| ReplayError::Header("room dropped registration reply".into()))?
-            .map_err(|e| ReplayError::Header(format!("bot register failed: {}", e.as_str())))?;
-        if reg.bot_id != bot.bot_id {
-            return Err(ReplayError::Header(format!(
-                "bot id drift on rebuild: header expected `{}`, room assigned `{}`",
-                bot.bot_id, reg.bot_id
-            )));
-        }
-        if reg.ship_id != bot.ship_id {
-            return Err(ReplayError::Header(format!(
-                "ship id drift on rebuild: header expected `{}`, room assigned `{}`",
-                bot.ship_id, reg.ship_id
-            )));
-        }
+        let reg = room
+            .register_replay_bot(
+                bot.bot_id.clone(),
+                bot.ship_id.clone(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                bot.name.clone(),
+                "replay",
+            )
+            .map_err(|e| {
+                ReplayError::Header(format!("replay bot register failed: {}", e.as_str()))
+            })?;
         outbound.push((reg.bot_id.clone(), reg.outbound));
         // Re-apply the recorded loadout, if any, before `BotReady`. This way the room's
         // `start_match` mirrors the same selections onto the ship as the live run did.
@@ -1126,6 +1114,54 @@ mod tests {
 
         let room = rebuild_room_from_header(&header).expect("rebuild tolerates header order");
         assert_eq!(room.bot_count(), 11);
+    }
+
+    #[test]
+    fn rebuild_reuses_recorded_ids_with_offset_and_gaps() {
+        // Lobby churn in the live run advances the room's monotonic `next_index` and leaves
+        // gaps, so a recorded match's bots need not start at `b_1` or be contiguous. Rebuild
+        // must reuse the recorded ids verbatim rather than re-mint from `b_1` (which drifted:
+        // "header expected `b_12`, room assigned `b_1`").
+        let mut header = sample_header();
+        header.max_bots = 16;
+        header.bots = vec![
+            ReplayBot {
+                bot_id: "b_12".into(),
+                ship_id: "s_12".into(),
+                name: "alice".into(),
+                selected_powerups: vec![],
+                spawn_pos: [300.0, 500.0],
+                spawn_heading_deg: 90.0,
+            },
+            ReplayBot {
+                bot_id: "b_14".into(),
+                ship_id: "s_14".into(),
+                name: "bob".into(),
+                selected_powerups: vec![],
+                spawn_pos: [700.0, 500.0],
+                spawn_heading_deg: 270.0,
+            },
+        ];
+
+        let room = rebuild_room_from_header(&header).expect("rebuild reuses recorded ids");
+        assert_eq!(room.bot_count(), 2);
+        // Ships carry the recorded ids and their owning bot ids — not freshly minted ones.
+        let s12 = room
+            .world
+            .ships
+            .get("s_12")
+            .expect("recorded ship s_12 present");
+        assert_eq!(s12.bot_id, "b_12");
+        let s14 = room
+            .world
+            .ships
+            .get("s_14")
+            .expect("recorded ship s_14 present");
+        assert_eq!(s14.bot_id, "b_14");
+        assert!(
+            !room.world.ships.contains_key("s_1"),
+            "rebuild must not re-mint ids from b_1"
+        );
     }
 
     #[test]
