@@ -28,6 +28,8 @@ The simulation must produce bit-identical results given the same seed and comman
 - **Commands are applied in `bot_id` order, never in arrival order.** If you touch the tick loop, preserve the sort.
 - **Pin floats to `f32` consistently.** Don't mix `f64` partway through a calculation. The `glam` crate's `Vec2` (which is `f32`) is the standard.
 - **Physics step is fixed `dt = 0.1s`.** The wall clock is only used to *pace* the loop (sleep until next tick), never to *drive* the physics.
+- **Every mid-match world mutation is a replay input.** Anything that changes the world outside a bot command — a disconnect, an operator kick, a roster change — must be written to the replay log (extend `ReplayRecord`, bump the format version) and re-applied at the same tick during replay. If live and replay can diverge on it, it belongs in the log.
+- **Pending commands are consumed unconditionally at the top of the next `step_tick()`.** The `tick` field on a queued command does not gate consumption. Replay injection must happen exactly one step before the recorded tick — never "inject, then step N times to catch up".
 
 When in doubt: if the code path runs inside `step_tick()`, assume it must be deterministic.
 
@@ -40,6 +42,8 @@ The server never executes bot code. Bots are remote WebSocket clients. Anything 
 ### Sensor filtering is the bot's only view
 
 Bots receive a *filtered* `tick` message computed from their sensor mode. They must never receive ground-truth state. If you're tempted to add a field to the bot's `tick` payload "just for debugging," put it behind a server flag (`--debug-bot-omniscience`) that's off by default — and never on in tournament mode.
+
+This applies to **events**, not just contacts. Anything in the bot-facing `events` array must be anonymized exactly like contacts (no persistent ground-truth `ShipId`s — contacts are re-anonymized per tick for a reason) and gated by the *actual* sensor result for that viewer and tick. Do not write a parallel "is it visible" reimplementation next to `sensors.rs`; it will drift.
 
 Spectators get full ground truth. Don't conflate the two payloads.
 
@@ -69,9 +73,12 @@ system-design.md  Full design doc — source of truth for architecture (repo roo
 docs/
   PROTOCOL.md        Wire protocol spec, kept in sync with src/protocol.rs
   POWERUPS.md        Published powerup catalog and behaviour
+  REVIEW-FINDINGS.md Prioritized open findings from the 2026-07 review — check it
+                     before starting work in an area; your bug may already be filed
+                     with a fix sketch and acceptance criteria.
 ```
 
-When you change the wire protocol, update **all three** of: `server/src/protocol.rs`, `docs/PROTOCOL.md`, and the SDK. The protocol doc is the public contract; if it drifts from the code, players' bots break silently.
+When you change the wire protocol, update **all four** of: `server/src/protocol.rs`, `docs/PROTOCOL.md`, the SDK (`sdk-python/naval_sdk/protocol.py`), and the spectator types (`spectator/src/types/protocol.ts`). The protocol doc is the public contract; if it drifts from the code, players' bots break silently — and stale spectator types silently drop fields in the viewer.
 
 ---
 
@@ -134,12 +141,22 @@ The room is driven over a REST control plane (`/api/*`), not stdin — there is 
 - Async code uses `tokio`. Don't mix in `async-std` or `smol`.
 - Logging: `tracing` with structured fields (`tracing::info!(bot_id = %id, "connected")`), not `println!`.
 - Module boundary: `sim/` should not import from `net.rs` or `protocol.rs` directly. The room translates protocol messages into sim commands and back. This keeps the simulation testable without a network.
+- **Room modes are a matrix, not a line.** The room's effective state is `state` × mode flags (`mc_run`, and any future mode). Every operator event handler (`start`, `abort`, `reset`, `kick`) must behave sensibly in *every* cell of that matrix, and every transition back to `Lobby` must clear (or `debug_assert!` empty) all mode state. If you add a mode, audit each `handle_event` arm before merging.
+- **Don't publish dead tunables.** Every field exposed in `welcome.ship_specs` or the config schema must actually be read by the sim. Bot authors build strategy around published specs; operators assume tuning a knob does something.
 
 ### Python SDK
 
 - Type hints required on the public API. Internal helpers can skip them.
-- The SDK never panics on a malformed server message — it logs and continues. Bot authors will hit edge cases we didn't anticipate.
+- The SDK never panics on a malformed server message — it logs and continues. Bot authors will hit edge cases we didn't anticipate. Concretely: **every** field extraction *and conversion* from a server frame happens inside the message handler's `try` block. A conversion at the callback call site (e.g. indexing into a bound-but-unvalidated value) escapes the guard — that exact pattern has shipped a crash before.
+- **Server ticks reset to 0 every match.** Any SDK or helper state keyed off an absolute tick (cooldowns, staleness windows, timers) must be reset in `on_game_start`. If a helper class holds such state, give it a `reset()` method and call it — don't reason your way out of it in a comment.
+- **Match-scoped server state does not survive the lobby.** The server drops committed powerup loadouts (and `ready` flags) whenever the room returns to lobby. Anything the SDK sends "once" at `welcome` time but the server scopes per-match must be re-sent on every `lobby` message.
 - `raw_send(dict)` and `raw_recv()` escape hatches stay public. Power users need to bypass the typed API sometimes.
+
+### Spectator
+
+- **Never hardcode server-tunable values in components or the renderer** (map size, radar range, ammo, speeds, HP). Thread them from real data — `welcome`/room config for the live view, the replay header for the replay view. The values in `src/lib/constants.ts` are last-resort fallbacks only: they must equal the server defaults in `server/src/sim/constants.rs`, and the two files change together.
+- `spectator/dist/` is baked into the server binary via `include_str!`. Any change under `spectator/src/` must be accompanied by `npm run build` and the regenerated `dist/` in the same commit, then a server-crate rebuild.
+- Async stores that fetch (perspectives, replays): clear the displayed data before starting a fetch, and tag in-flight requests so a stale resolution can't overwrite newer state.
 
 ### Protocol changes
 
@@ -148,8 +165,9 @@ The wire protocol is an external contract. When changing it:
 1. Update `server/src/protocol.rs`.
 2. Update `docs/PROTOCOL.md` to match — same field names, same examples.
 3. Update the Python SDK's `protocol.py`.
-4. If the change is breaking, bump the version string sent in the `welcome` message and document the break in `docs/PROTOCOL.md` under a "Changelog" section.
-5. Run the example bots in `examples/` against the new server. They serve as integration tests.
+4. Update the spectator's `src/types/protocol.ts` (spectator, replay, and REST payload types live there too — stale entries silently drop data in the viewer).
+5. If the change is breaking, bump the version string sent in the `welcome` message and document the break in `docs/PROTOCOL.md` under a "Changelog" section.
+6. Run the example bots in `examples/` against the new server. They serve as integration tests.
 
 Additive changes (new optional field) are usually safe. Renames, type changes, and removed fields are breaking and need a version bump.
 
@@ -159,6 +177,8 @@ Additive changes (new optional field) are usually safe. Renames, type changes, a
 
 - **Unit tests** live next to the code (`#[cfg(test)] mod tests` in Rust, `tests/` for Python).
 - **Replay tests** are the single most valuable test category here. A replay test loads a recorded JSONL log, re-runs the simulation, and asserts the final world state matches the recorded final state byte-for-byte. If a refactor breaks determinism, replay tests catch it immediately. Add one whenever you fix a determinism bug.
+- **Replay tests must include irregular bots.** A replay test whose bots command every tick and never disconnect proves nothing about the paths where replays actually break. When touching replay or the tick loop, include scenarios with: a bot that skips ticks between commands, a bot that goes silent for many ticks, and (once supported in the log format) a mid-match disconnect.
+- **Test the failure, not just the exit.** A disconnect/violation test that accepts a transport error as success would also pass if the server crashed. Assert the specific error frame / close code the contract promises.
 - **Integration test**: `server/tests/two_bot_match.rs` spins up the server in-process, connects two scripted bots, and runs a full match to completion. Slow but high-signal — keep it green.
 
 Don't write tests that depend on wall-clock timing inside the simulation. If a test needs to "wait for a tick," step the simulation manually instead of sleeping.
