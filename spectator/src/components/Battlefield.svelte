@@ -22,9 +22,17 @@
   const unsubSplashes = splashes.subscribe((v) => (currentSplashes = v));
 
   // HP-bar scale follows the match's configured hull when known, so the canvas
-  // matches the BotCard meters instead of assuming a fixed 100-HP hull.
+  // matches the BotCard meters instead of assuming a fixed 100-HP hull. Map size follows
+  // the room's actual `--map WxH` (default 700×700) so bounds and the letterbox transform
+  // are correct on any map — the constants are only a pre-first-fetch fallback.
   let currentMaxHp = MAX_HP;
-  const unsubRoom = room.subscribe((r) => (currentMaxHp = r?.config?.hull_hp ?? MAX_HP));
+  let currentMapW = MAP_WIDTH;
+  let currentMapH = MAP_HEIGHT;
+  const unsubRoom = room.subscribe((r) => {
+    currentMaxHp = r?.config?.hull_hp ?? MAX_HP;
+    currentMapW = r?.map?.width ?? MAP_WIDTH;
+    currentMapH = r?.map?.height ?? MAP_HEIGHT;
+  });
 
   // View toggle changes the canvas's CSS size; the pixel buffer must be re-synced AFTER
   // the layout settles. `await sveltetick()` defers to the next microtask once Svelte
@@ -50,7 +58,7 @@
 
     const loop = (): void => {
       rafId = requestAnimationFrame(loop);
-      draw(ctx, currentFrame, currentSplashes, performance.now(), MAP_WIDTH, MAP_HEIGHT, currentMaxHp);
+      draw(ctx, currentFrame, currentSplashes, performance.now(), currentMapW, currentMapH, currentMaxHp);
     };
     rafId = requestAnimationFrame(loop);
   });

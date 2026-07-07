@@ -90,6 +90,12 @@ export interface AdminBotInfo {
 /** Balance parameters — a flat map of `SimConfig` keys to numbers. */
 export type SimConfig = Record<string, number>;
 
+/** Arena dimensions in world units (`GET /api/room` → `map`, replay header `map`). */
+export interface MapInfo {
+  width: number;
+  height: number;
+}
+
 /** Response shape of `GET /api/room`: room lifecycle state plus the active parameters. */
 export interface RoomInfo {
   room: string;
@@ -98,6 +104,8 @@ export interface RoomInfo {
   last_winner?: string | null;
   bots: AdminBotInfo[];
   config: SimConfig;
+  /** Arena size in world units. Set via `--map WxH` (default 700×700), not part of `config`. */
+  map?: MapInfo;
 }
 
 /** One tunable's metadata from `GET /api/config/schema`. */

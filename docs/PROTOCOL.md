@@ -347,7 +347,8 @@ A wrong password returns `401` with code `invalid_credentials`.
   "bots": [
     { "bot_id": "b_1", "name": "alice", "ship_id": "s_1", "ready": true, "alive": true }
   ],
-  "config": { "hull_hp": 100, "shell_speed": 70.0, "...": "..." }
+  "config": { "hull_hp": 100, "shell_speed": 70.0, "...": "..." },
+  "map": { "width": 700, "height": 700 }
 }
 ```
 
@@ -357,6 +358,7 @@ A wrong password returns `401` with code `invalid_credentials`.
 | `tick` | u64 | Current `world.tick`. |
 | `last_winner` | string \| null | `bot_id` of the most recent winner, or `null` for a draw / abort / fresh match. |
 | `config` | object | The active `SimConfig` — a flat map of every balance tunable to its current value. |
+| `map` | object | Arena size in world units: `{ "width", "height" }`. Set via `--map WxH` (default 700×700), not part of `config`. The live spectator view reads it to size its bounds. |
 
 ### 2.5.4 `GET /api/config/schema`
 

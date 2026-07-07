@@ -357,6 +357,10 @@ pub enum RoomEvent {
 pub struct RoomSnapshot {
     pub state: AdminState,
     pub config: SimConfig,
+    /// Arena dimensions in world units. Operator-set via `--map WxH` (not a `SimConfig`
+    /// balance parameter), so the spectator's live view must read it from here rather than
+    /// hardcoding a size.
+    pub map: MapInfo,
 }
 
 /// Per-bot statistics accumulated over a single match. Reset at `start_match`, frozen into
@@ -1642,6 +1646,10 @@ impl Room {
                 let _ = reply.send(RoomSnapshot {
                     state: self.admin_state_snapshot(),
                     config: self.world.config,
+                    map: MapInfo {
+                        width: self.world.width as u32,
+                        height: self.world.height as u32,
+                    },
                 });
             }
             RoomEvent::QueryReport { reply } => {
