@@ -18,6 +18,7 @@
   } from '../stores/admin';
   import { colorFor } from '../lib/palette';
   import { wilsonInterval } from '../lib/mcConfidence';
+  import { mcPanelPhase } from '../lib/mcPanelPhase';
   import type { McStartRequest, VarianceMode } from '../types/protocol';
 
   const isAdmin = $derived($adminToken != null);
@@ -33,14 +34,12 @@
   let spectatorThrottle = $state(5);
   let starting = $state(false);
   let stopping = $state(false);
+  // Local override: "New run" sets this so the setup form reappears even though the server
+  // keeps reporting the last completed run's status. Cleared once a run is actually running.
+  let showSetup = $state(false);
 
   // Derived: which state the panel is in.
-  const phase = $derived.by<'setup' | 'running' | 'completed'>(() => {
-    const status = $mcStatus;
-    if (status?.running) return 'running';
-    if (status && status.completed > 0) return 'completed';
-    return 'setup';
-  });
+  const phase = $derived(mcPanelPhase($mcStatus, showSetup));
 
   async function handleStart(): Promise<void> {
     if (starting) return;
@@ -54,6 +53,8 @@
         spectator_throttle: Math.max(0, Math.floor(spectatorThrottle)),
       };
       await startRun(cfg);
+      // A run is starting; drop the local override so we follow live status again.
+      showSetup = false;
     } catch {
       /* error surfaced in mcError */
     } finally {
@@ -456,7 +457,7 @@
           <button
             class="pm-start"
             type="button"
-            onclick={() => appMode.set('monte-carlo')}>
+            onclick={() => (showSetup = true)}>
             New run
           </button>
         </div>
