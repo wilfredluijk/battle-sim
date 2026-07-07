@@ -48,7 +48,7 @@ behavior changes in `docs/PROTOCOL.md`'s changelog.
 | F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [x] |
 | F-09 | 3 | Unclamped turn-rate ratio (Overdrive super-turn) | Medium | server | [x] |
 | F-10 | 3 | Replay ID collision truncates previous replay | Medium | server | [x] |
-| F-11 | 3 | Replay endpoints unbounded on corrupt logs | Medium | server | [ ] |
+| F-11 | 3 | Replay endpoints unbounded on corrupt logs | Medium | server | [x] |
 | F-12 | 3 | EMP debuff misreported as own powerup active | Medium | server | [ ] |
 | F-13 | 4 | MC panel dead-ends after a completed run | Medium | spectator | [ ] |
 | F-14 | 4 | Live view hardcodes 1000×1000 map | Medium | spectator | [ ] |

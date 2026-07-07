@@ -60,6 +60,14 @@ use crate::sim::{PowerupId, SimConfig};
 /// (a match where nobody dropped), so they still load and replay identically.
 pub const REPLAY_FORMAT_VERSION: u32 = 5;
 
+/// Hard ceiling on how many ticks a single replay record may advance the re-simulation.
+/// A real match ends at `MATCH_TIMEOUT_TICKS` (3000) plus a few post-end ticks; this bound
+/// is far above that but stops a truncated/corrupt log whose record claims an absurd tick
+/// (e.g. `10^12`) from stepping the world forever and allocating one frame per tick — a hung
+/// `spawn_blocking` thread and OOM triggered by a merely corrupt on-disk file. Exceeding it
+/// surfaces as [`ReplayError::Corrupt`] (HTTP 422), never a 500.
+pub const MAX_REPLAY_TICKS: u64 = 1_000_000;
+
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
 /// they `cat` the file.
@@ -502,6 +510,10 @@ pub enum ReplayError {
     Version(u32),
     /// A perspective capture named a bot id absent from the replay header.
     UnknownBot(String),
+    /// A tick/end/disconnect record references a tick so far ahead that re-simulating to it
+    /// would step the world past [`MAX_REPLAY_TICKS`] — a truncated or corrupt on-disk log,
+    /// not a real match. Reported as a 422, never a hung thread + OOM.
+    Corrupt(String),
 }
 
 impl std::fmt::Display for ReplayError {
@@ -517,6 +529,7 @@ impl std::fmt::Display for ReplayError {
             ReplayError::UnknownBot(id) => {
                 write!(f, "replay has no bot with id `{id}`")
             }
+            ReplayError::Corrupt(msg) => write!(f, "corrupt replay: {msg}"),
         }
     }
 }
@@ -549,7 +562,8 @@ fn advance_and_inject(
     target_tick: u64,
     commands: &[ReplayCommand],
     mut after_step: impl FnMut(&mut Room),
-) {
+) -> Result<(), ReplayError> {
+    guard_replay_target(room.world.tick, target_tick)?;
     // Step every empty tick that precedes the one the commands belong to. The `+ 1` form
     // avoids the underflow a bare `target_tick - 1` would hit on a corrupt `tick: 0` record.
     while room.world.tick + 1 < target_tick {
@@ -576,16 +590,39 @@ fn advance_and_inject(
         room.step_tick();
         after_step(room);
     }
+    Ok(())
 }
 
 /// Step `room` forward until `world.tick == target_tick`, running `after_step` after each
 /// step. Shared by the `End` and `Disconnect` record handlers (which advance the world but
 /// inject no commands) across all three replay drivers, so their timing stays in lockstep.
-fn advance_to(room: &mut Room, target_tick: u64, mut after_step: impl FnMut(&mut Room)) {
+fn advance_to(
+    room: &mut Room,
+    target_tick: u64,
+    mut after_step: impl FnMut(&mut Room),
+) -> Result<(), ReplayError> {
+    guard_replay_target(room.world.tick, target_tick)?;
     while room.world.tick < target_tick {
         room.step_tick();
         after_step(room);
     }
+    Ok(())
+}
+
+/// Reject a replay record whose target tick would step the world more than
+/// [`MAX_REPLAY_TICKS`] forward from where it is now. The endpoints re-simulate the whole
+/// match per request and allocate one frame per tick, so a corrupt log claiming
+/// `tick: 10^12` would otherwise hang a `spawn_blocking` thread and OOM. Only forward
+/// distance matters; already-reached/duplicate ticks are handled by the loop guards.
+fn guard_replay_target(current_tick: u64, target_tick: u64) -> Result<(), ReplayError> {
+    if target_tick.saturating_sub(current_tick) > MAX_REPLAY_TICKS {
+        return Err(ReplayError::Corrupt(format!(
+            "record targets tick {target_tick}, {} ticks past the current tick {current_tick}; \
+             exceeds the {MAX_REPLAY_TICKS}-tick sanity cap",
+            target_tick.saturating_sub(current_tick),
+        )));
+    }
+    Ok(())
 }
 
 /// Drive a replay end-to-end: read the file, rebuild the room, then tick at the recorded
@@ -639,18 +676,16 @@ pub async fn run_replay(
                 let next = iter.next();
                 match next {
                     Some(ReplayRecord::Tick(rec)) => {
-                        advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {});
+                        advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {})?;
                     }
                     Some(ReplayRecord::Disconnect(rec)) => {
-                        advance_to(&mut room, rec.tick, |_| {});
+                        advance_to(&mut room, rec.tick, |_| {})?;
                         room.remove_bot_and_ship(&rec.bot_id);
                     }
                     Some(ReplayRecord::End(end)) => {
                         // Run remaining ticks (if any) so the spectator sees the final
                         // state at the same world.tick the live run reached.
-                        while room.world.tick < end.tick {
-                            room.step_tick();
-                        }
+                        advance_to(&mut room, end.tick, |_| {})?;
                         info!(final_tick = end.tick, winner = ?end.winner, "replay finished");
                         break;
                     }
@@ -708,18 +743,18 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
             ReplayRecord::Tick(rec) => {
                 advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                })?;
             }
             ReplayRecord::Disconnect(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                })?;
                 room.remove_bot_and_ship(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                })?;
                 end = Some(rec);
                 break;
             }
@@ -788,18 +823,18 @@ pub fn capture_perspective(
             ReplayRecord::Tick(rec) => {
                 advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                })?;
             }
             ReplayRecord::Disconnect(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                })?;
                 room.remove_bot_and_ship(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                })?;
                 break;
             }
             ReplayRecord::Header(_) => {
@@ -1189,6 +1224,34 @@ mod tests {
         for (i, frame) in captured.frames.iter().enumerate() {
             assert_eq!(frame.tick, i as u64, "frame {i} carries the wrong tick");
         }
+    }
+
+    #[test]
+    fn capture_replay_rejects_absurd_end_tick_without_oom() {
+        // F-11: a corrupt/truncated log whose End tick is enormous must be rejected as a
+        // corrupt replay, not stepped 10^12 times (hung thread + OOM, one frame per tick).
+        let records = vec![
+            ReplayRecord::Header(Box::new(sample_header())),
+            ReplayRecord::End(ReplayEnd {
+                tick: u64::MAX,
+                winner: None,
+            }),
+        ];
+        let err = capture_replay(records).expect_err("absurd end tick must be rejected");
+        assert!(matches!(err, ReplayError::Corrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn capture_perspective_rejects_absurd_tick_without_oom() {
+        // Same guard on the per-bot perspective endpoint, via a corrupt Tick record.
+        let mut bad_tick = sample_tick();
+        bad_tick.tick = MAX_REPLAY_TICKS + 5;
+        let records = vec![
+            ReplayRecord::Header(Box::new(sample_header())),
+            ReplayRecord::Tick(bad_tick),
+        ];
+        let err = capture_perspective(records, "b_1").expect_err("absurd tick must be rejected");
+        assert!(matches!(err, ReplayError::Corrupt(_)), "got {err:?}");
     }
 
     #[test]

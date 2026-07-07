@@ -609,6 +609,9 @@ fn map_replay_error(e: replay::ReplayError) -> ApiError {
             "unknown_bot",
             format!("replay has no bot `{id}`"),
         ),
+        ReplayError::Corrupt(msg) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_replay", msg)
+        }
     }
 }
 
