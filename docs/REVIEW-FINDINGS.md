@@ -47,7 +47,7 @@ behavior changes in `docs/PROTOCOL.md`'s changelog.
 | F-07 | 3 | Lockstep MC still enforces wall-clock deadline | Medium | server | [x] |
 | F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [x] |
 | F-09 | 3 | Unclamped turn-rate ratio (Overdrive super-turn) | Medium | server | [x] |
-| F-10 | 3 | Replay ID collision truncates previous replay | Medium | server | [ ] |
+| F-10 | 3 | Replay ID collision truncates previous replay | Medium | server | [x] |
 | F-11 | 3 | Replay endpoints unbounded on corrupt logs | Medium | server | [ ] |
 | F-12 | 3 | EMP debuff misreported as own powerup active | Medium | server | [ ] |
 | F-13 | 4 | MC panel dead-ends after a completed run | Medium | spectator | [ ] |

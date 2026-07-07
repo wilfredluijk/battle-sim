@@ -16,10 +16,11 @@
 //! deserialized.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -219,15 +220,41 @@ impl std::fmt::Debug for ReplayWriter {
 
 impl ReplayWriter {
     /// Open `<dir>/<replay_id>.jsonl` for writing, creating the directory tree if needed.
+    ///
+    /// Opens with `create_new` so an existing file is **never truncated** — if
+    /// `<replay_id>.jsonl` already exists (a same-second id collision that slipped past the
+    /// monotonic counter, or a stale file on disk), it retries with `_2`, `_3`, … suffixes
+    /// and adopts the disambiguated id so downstream references (e.g. `game_over.replay_id`)
+    /// point at the file that was actually written.
     pub fn create_file(dir: &Path, replay_id: String) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{replay_id}.jsonl"));
-        let file = File::create(&path)?;
-        Ok(Self {
-            sink: Box::new(BufWriter::new(file)),
-            replay_id,
-            path: Some(path),
-        })
+        // A handful of retries is plenty: `make_replay_id`'s per-process counter already
+        // guarantees uniqueness for ids minted this run; this only guards against files left
+        // on disk by a previous process.
+        const MAX_SUFFIX: u32 = 1000;
+        for attempt in 1..=MAX_SUFFIX {
+            let candidate_id = if attempt == 1 {
+                replay_id.clone()
+            } else {
+                format!("{replay_id}_{attempt}")
+            };
+            let path = dir.join(format!("{candidate_id}.jsonl"));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        sink: Box::new(BufWriter::new(file)),
+                        replay_id: candidate_id,
+                        path: Some(path),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("could not find a free replay filename for `{replay_id}` after {MAX_SUFFIX} attempts"),
+        ))
     }
 
     /// Build a writer whose output is captured in a shared `Vec<u8>`. Returns the writer
@@ -328,15 +355,23 @@ pub fn read_records_from<R: BufRead>(reader: R) -> io::Result<Vec<ReplayRecord>>
     Ok(out)
 }
 
-/// Generate a replay identifier of the form `match_<room>_<unix_secs>`. The unix timestamp
-/// is a wall-clock read, so this MUST NOT be called inside the simulation — it's strictly
-/// for naming the file we're about to write.
+/// Per-process monotonic counter appended to every non-MC replay id so two matches started
+/// within the same wall-clock second still get distinct ids (and therefore distinct files).
+static REPLAY_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a replay identifier of the form `match_<room>_<unix_secs>_<seq>`. The unix
+/// timestamp is a wall-clock read, so this MUST NOT be called inside the simulation — it's
+/// strictly for naming the file we're about to write. `<seq>` is a per-process monotonic
+/// counter: 1-second timestamp resolution alone collides when a match is started, aborted,
+/// reset, and restarted inside one second (trivial via the REST API), and `create_file`
+/// would then truncate the earlier match's log. The counter makes ids unique regardless.
 pub fn make_replay_id(room: &str) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("match_{room}_{secs}")
+    let seq = REPLAY_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("match_{room}_{secs}_{seq}")
 }
 
 /// A bot's id paired with the receiver for the frames the room sends it.
@@ -1062,6 +1097,58 @@ mod tests {
     fn make_replay_id_starts_with_match_room() {
         let id = make_replay_id("main");
         assert!(id.starts_with("match_main_"), "got {id}");
+    }
+
+    #[test]
+    fn make_replay_id_is_unique_within_the_same_second() {
+        // F-10: two ids minted back-to-back (same wall-clock second) must differ, so the
+        // second match's log can't truncate the first's.
+        let a = make_replay_id("main");
+        let b = make_replay_id("main");
+        assert_ne!(a, b, "consecutive replay ids collided: {a}");
+    }
+
+    #[test]
+    fn create_file_never_truncates_an_existing_log() {
+        // F-10: opening a writer for an id whose file already exists must not clobber it —
+        // it lands on a suffixed filename instead, and the original bytes survive.
+        let dir = std::env::temp_dir().join(format!(
+            "battle_sim_replay_test_{}",
+            make_replay_id("collide")
+        ));
+        let id = "match_collide_fixed".to_string();
+
+        let mut first = ReplayWriter::create_file(&dir, id.clone()).expect("first writer");
+        first
+            .write(&ReplayRecord::End(ReplayEnd {
+                tick: 7,
+                winner: Some("b_1".into()),
+            }))
+            .expect("write first");
+        let first_path = first.path().expect("file-backed").to_path_buf();
+        drop(first);
+
+        // A second writer for the *same* id must not reuse the same file.
+        let second = ReplayWriter::create_file(&dir, id.clone()).expect("second writer");
+        assert_ne!(
+            second.replay_id(),
+            id,
+            "second writer reused the colliding id"
+        );
+        assert_ne!(
+            second.path().expect("file-backed"),
+            first_path,
+            "second writer opened the same file (would truncate)"
+        );
+
+        // The first log is intact.
+        let first_bytes = fs::read_to_string(&first_path).expect("read first log");
+        assert!(
+            first_bytes.contains("\"tick\":7"),
+            "first replay log was truncated: {first_bytes:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
