@@ -43,7 +43,10 @@
     const radarRange = data.header.sim_config?.active_radar_range ?? ACTIVE_RADAR_RANGE;
     const frame = data.frames[Math.max(0, Math.min(tick, data.frames.length - 1))] ?? null;
 
-    if (perspective === 'overall' || !perspectiveData) {
+    // Draw ground truth unless we have perspective data for the *currently selected* bot.
+    // Guarding on bot_id means a stale timeline (a slow fetch that resolved after the
+    // selector moved) never gets paired with a different bot's ship.
+    if (perspective === 'overall' || !perspectiveData || perspectiveData.bot_id !== perspective) {
       // Replay frames are drawn directly (no splash interpolation, which assumes
       // monotonic time and would misbehave on a slider seek).
       draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp, radarRange);
