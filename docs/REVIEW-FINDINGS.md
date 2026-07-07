@@ -41,9 +41,9 @@ behavior changes in `docs/PROTOCOL.md`'s changelog.
 | F-01 | 1 | Replay applies commands early on tick gaps | Critical | server | [x] |
 | F-02 | 1 | Mid-match disconnects missing from replay log | Critical | server | [x] |
 | F-03 | 1 | Operator abort wedges Monte Carlo runs | Critical | server | [x] |
-| F-04 | 2 | SDK loses powerup loadout after first match | High | sdk | [ ] |
-| F-05 | 2 | Gunner cooldown carries across matches | High | sdk | [ ] |
-| F-06 | 2 | Malformed `game_start` crashes SDK run loop | High | sdk | [ ] |
+| F-04 | 2 | SDK loses powerup loadout after first match | High | sdk | [x] |
+| F-05 | 2 | Gunner cooldown carries across matches | High | sdk | [x] |
+| F-06 | 2 | Malformed `game_start` crashes SDK run loop | High | sdk | [x] |
 | F-07 | 3 | Lockstep MC still enforces wall-clock deadline | Medium | server | [ ] |
 | F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [ ] |
 | F-09 | 3 | Unclamped turn-rate ratio (Overdrive super-turn) | Medium | server | [ ] |

@@ -39,9 +39,13 @@ class TrackingBot(Bot):
         # Monte-Carlo mode reuses this bot across matches and only sends
         # ``game_start`` (not a fresh ``welcome``) each time, resetting tick to 0.
         # Clear the carried-over tracker so stale contacts from the previous
-        # match don't survive as an immortal "ghost" the bot chases forever.
+        # match don't survive as an immortal "ghost" the bot chases forever, and
+        # reset the gunner so its absolute-tick cooldown doesn't gate every shot
+        # of the new match (ticks reset to 0 each match).
         if self.tracker is not None:
             self.tracker.reset()
+        if self.gunner is not None:
+            self.gunner.reset()
 
     def on_tick(self, view: WorldView) -> Command:
         assert self.tracker is not None and self.gunner is not None

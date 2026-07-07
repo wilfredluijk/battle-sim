@@ -161,6 +161,28 @@ async def run_async(
 
     async with websockets.connect(uri) as ws:
         bot._ws = ws
+
+        async def send_loadout_and_ready() -> None:
+            """Commit the powerup loadout (if any), then send `ready`.
+
+            The server scopes committed loadouts and `ready` flags per match and
+            drops them whenever the room returns to lobby, so this whole sequence
+            must be re-sent every time we (re-)enter a lobby — not just once at
+            `welcome`. `choose_powerups` needs the `Welcome`; reuse the stored one.
+            """
+            if bot.welcome is not None:
+                picks = _safe_callback_returning(bot.choose_powerups, bot.welcome)
+                if picks:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "select_powerups",
+                                "powerups": [str(p) for p in picks],
+                            }
+                        )
+                    )
+            await ws.send(json.dumps({"type": "ready"}))
+
         try:
             await ws.send(json.dumps({"type": "hello", "name": name, "version": version}))
 
@@ -194,23 +216,18 @@ async def run_async(
                     bot.welcome = welcome
                     _safe_callback(bot.on_welcome, welcome)
                     if not ready_sent:
-                        picks = _safe_callback_returning(bot.choose_powerups, welcome)
-                        if picks:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "select_powerups",
-                                        "powerups": [str(p) for p in picks],
-                                    }
-                                )
-                            )
-                        await ws.send(json.dumps({"type": "ready"}))
+                        await send_loadout_and_ready()
                         ready_sent = True
 
                 elif msg_type == "game_start":
                     try:
                         gs_tick = int(msg["tick"])
                         pos = msg["starting_position"]
+                        # Convert the position inside the `try`: indexing/converting
+                        # at the callback call site would escape this guard and let a
+                        # malformed frame (e.g. `"starting_position": 42`) crash the
+                        # run loop.
+                        start_pos = (float(pos[0]), float(pos[1]))
                         heading = float(msg["starting_heading_deg"])
                     except (KeyError, IndexError, TypeError, ValueError) as exc:
                         log.warning("malformed game_start: %s (frame=%r)", exc, msg)
@@ -218,7 +235,7 @@ async def run_async(
                     _safe_callback(
                         bot.on_game_start,
                         gs_tick,
-                        (float(pos[0]), float(pos[1])),
+                        start_pos,
                         heading,
                     )
 
@@ -262,7 +279,11 @@ async def run_async(
                         continue
                     _safe_callback(bot.on_lobby, lobby_tick)
                     if not ready_sent:
-                        await ws.send(json.dumps({"type": "ready"}))
+                        # Re-commit the loadout: the server drops committed
+                        # powerups on every return to lobby, so re-sending `ready`
+                        # alone would play match 2+ vanilla. The `ready_sent` guard
+                        # keeps a repeated `lobby` frame from double-sending.
+                        await send_loadout_and_ready()
                         ready_sent = True
 
                 elif msg_type == "error":

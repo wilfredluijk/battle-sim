@@ -96,15 +96,14 @@ class TacticalBot(Bot):
         """
         if self.tracker is not None:
             self.tracker.reset()
+        if self.gunner is not None:
+            self.gunner.reset()
         if self.evader is not None and hasattr(self.evader, "reset"):
             self.evader.reset()
         if hasattr(self.sensor_policy, "reset"):
             self.sensor_policy.reset()
         # Patrol cursor is match-scoped: a fresh match starts from corner 0.
         self._patrol_corner = 0
-        # Gunner's only mutable state is its fire-cooldown counter (keyed off the
-        # match tick); a reset to tick 0 makes it immediately fireable again, so
-        # it needs no explicit reset.
 
     def on_tick(self, view: WorldView) -> Command:
         if (
