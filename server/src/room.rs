@@ -1802,6 +1802,15 @@ impl Room {
         let deadline_ms = self.tick_deadline_ms;
         let send_time = self.tick_send_time;
         let world_tick = self.world.tick;
+        // Lockstep (Monte Carlo) mode paces the loop by bot responses, not the wall clock:
+        // the tick only advances once every registered bot's command is in (or the lockstep
+        // timeout backstop fires). Enforcing `tick_deadline_ms` here would reject every
+        // command from a bot slower than the deadline, so `pending_command` would never
+        // fill, `all_pending_commands_ready()` would never be true, and every tick would
+        // burn the full lockstep timeout — the opposite of lockstep's "as fast as the
+        // slowest bot" promise. Skip the wall-clock check in lockstep; keep the tick-based
+        // stale check below (it guards against confused/replayed bots regardless of pacing).
+        let in_lockstep = self.in_lockstep();
 
         let Some(entry) = self.bots.get_mut(&bot_id) else {
             warn!(room = %self.name, bot = %bot_id, "command from unknown bot, ignored");
@@ -1841,7 +1850,7 @@ impl Room {
                 return;
             }
 
-            if let Some(t) = send_time {
+            if let (false, Some(t)) = (in_lockstep, send_time) {
                 let elapsed = now.duration_since(t);
                 if elapsed.as_millis() > u128::from(deadline_ms) {
                     let err = protocol::error_msg(
