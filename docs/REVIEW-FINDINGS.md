@@ -38,9 +38,9 @@ behavior changes in `docs/PROTOCOL.md`'s changelog.
 
 | ID | Phase | Title | Severity | Component | Status |
 |------|---|---------------------------------------------------------|----------|-----------|--------|
-| F-01 | 1 | Replay applies commands early on tick gaps | Critical | server | [ ] |
-| F-02 | 1 | Mid-match disconnects missing from replay log | Critical | server | [ ] |
-| F-03 | 1 | Operator abort wedges Monte Carlo runs | Critical | server | [ ] |
+| F-01 | 1 | Replay applies commands early on tick gaps | Critical | server | [x] |
+| F-02 | 1 | Mid-match disconnects missing from replay log | Critical | server | [x] |
+| F-03 | 1 | Operator abort wedges Monte Carlo runs | Critical | server | [x] |
 | F-04 | 2 | SDK loses powerup loadout after first match | High | sdk | [ ] |
 | F-05 | 2 | Gunner cooldown carries across matches | High | sdk | [ ] |
 | F-06 | 2 | Malformed `game_start` crashes SDK run loop | High | sdk | [ ] |

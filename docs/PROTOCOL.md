@@ -460,7 +460,7 @@ every tick.
 
 ```json
 {
-  "header": { "version": 4, "replay_id": "...", "seed": 42, "map": { "...": "..." },
+  "header": { "version": 5, "replay_id": "...", "seed": 42, "map": { "...": "..." },
               "sim_config": { "...": "..." },
               "bots": [ { "bot_id": "b_1", "ship_id": "s_1", "name": "powerful",
                           "spawn_pos": [300.0, 500.0], "spawn_heading_deg": 90.0 } ] },
@@ -471,6 +471,15 @@ every tick.
 
 `frames` has `final_tick + 1` entries: index `0` is the starting layout, index `t` is the
 world after tick `t`. `end` is `null` for an incomplete log.
+
+**On-disk log format v5.** The JSONL log driving these endpoints carries `header`, `tick`,
+`disconnect`, and `end` records. A `disconnect` record —
+`{ "type": "disconnect", "tick": T, "bot_id": "b_2" }` — is written whenever a bot
+disconnects or is kicked mid-match (while the room is `running`); `T` is the last tick the
+ship participated in. Re-simulation removes the ship at exactly that point so the shared RNG
+stream and the recorded outcome stay bit-identical (the ship simply vanishes from later
+`frames`). Logs written before v5 (`"version"` 2–4) carry no `disconnect` records and still
+load — a match where nobody dropped is indistinguishable from an older log.
 
 ### 2.6.3 `GET /api/replays/{id}/perspective/{bot_id}`
 
@@ -644,6 +653,16 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-07-07 — replay records mid-match disconnects
+
+- Replay log format bumped to `v5`. The log gained a `disconnect` record
+  (`{ "type": "disconnect", "tick": T, "bot_id": "..." }`) written whenever a bot
+  disconnects or is kicked while the room is `running`. Re-simulation removes the ship at
+  tick `T` so the shared RNG stream and the recorded outcome stay bit-identical; previously
+  a dropped bot left a ghost ship in the replay and the re-simulated final state could
+  contradict the recorded `end`. See §2.6. v2–v4 logs carry no `disconnect` records and
+  still load. Bot and spectator wire protocols are unchanged.
 
 ## 2026-06-23 — more specific join-rejection codes
 

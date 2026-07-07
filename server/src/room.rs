@@ -27,8 +27,8 @@ use crate::protocol::{
     SpectatorEvent, SpectatorMsg, SpectatorShell, SpectatorShip, SpectatorSmokeCloud, TickEvent,
 };
 use crate::replay::{
-    self, ReplayBot, ReplayCommand, ReplayEnd, ReplayHeader, ReplayRecord, ReplayTick,
-    ReplayWriter, REPLAY_FORMAT_VERSION,
+    self, ReplayBot, ReplayCommand, ReplayDisconnect, ReplayEnd, ReplayHeader, ReplayRecord,
+    ReplayTick, ReplayWriter, REPLAY_FORMAT_VERSION,
 };
 use crate::sim::combat::{self, CombatEvent, FireError};
 use crate::sim::powerups::{self, ActivationError, PowerupId};
@@ -1170,6 +1170,20 @@ impl Room {
     /// bot so SDKs can rearm.
     fn transition_to_lobby(&mut self) {
         info!(room = %self.name, "returning to lobby for next match");
+        // A Monte Carlo run must never survive the return to lobby: a leftover `mc_run`
+        // would capture the next *normal* match's result and chain leftover MC matches with
+        // MC-derived seeds. Every abort path is expected to clear it (see the `OperatorAbort`
+        // handler and `mc_abort`); assert that in debug and clear defensively in release.
+        debug_assert!(
+            self.mc_run.is_none(),
+            "mc_run must be cleared before returning to lobby"
+        );
+        if self.mc_run.take().is_some() {
+            warn!(
+                room = %self.name,
+                "mc_run still set on lobby transition; clearing defensively",
+            );
+        }
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
         let config = self.world.config;
         self.world.tick = 0;
@@ -1215,15 +1229,16 @@ impl Room {
     /// Remove a bot from the room and delete its ship. Called both from the natural
     /// disconnect path (the connection task observed a close) and from operator kick.
     fn handle_bot_disconnect(&mut self, bot_id: BotId, reason: &'static str) {
-        if let Some(entry) = self.bots.remove(&bot_id) {
-            self.world.ships.remove(&entry.ship_id);
-            info!(
-                room = %self.name,
-                bot = %bot_id,
-                ship = %entry.ship_id,
-                reason,
-                "bot removed"
-            );
+        // A mid-match removal shifts the world (one fewer ship → fewer sensor RNG draws →
+        // the shared Pcg64 stream diverges → the match may end early). It's therefore a
+        // replay input: record it *before* mutating the world so replay re-applies the exact
+        // removal at the exact tick and stays byte-identical. Only meaningful while Running —
+        // a disconnect in lobby/ended doesn't affect any in-progress match's re-simulation.
+        if self.state == RoomState::Running && self.bots.contains_key(&bot_id) {
+            self.write_replay_disconnect(&bot_id);
+        }
+        if self.remove_bot_and_ship(&bot_id) {
+            info!(room = %self.name, bot = %bot_id, reason, "bot removed");
         }
         // A Monte Carlo run requires a stable roster; any disconnect aborts the run.
         // We finalize the controller state but do not force-abort the current match —
@@ -1231,6 +1246,20 @@ impl Room {
         // run state is gone and stop.
         if self.mc_run.is_some() {
             self.mc_abort("bot_disconnected");
+        }
+    }
+
+    /// Remove a bot and its ship from the world — the pure, replay-safe part of a
+    /// disconnect / kick. Touches only simulation-visible state (the bot roster and the ship
+    /// table) with no network side effects, so both the live handler and the replay driver
+    /// (via `ReplayRecord::Disconnect`) call it and stay byte-identical. Returns `true` if a
+    /// bot was actually present and removed.
+    pub fn remove_bot_and_ship(&mut self, bot_id: &BotId) -> bool {
+        if let Some(entry) = self.bots.remove(bot_id) {
+            self.world.ships.remove(&entry.ship_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -1605,7 +1634,25 @@ impl Room {
                 self.publish_admin_state();
             }
             RoomEvent::OperatorAbort { reply } => {
-                let result = self.abort_match();
+                let result = if self.mc_run.is_some() {
+                    // An operator abort during a Monte Carlo run must tear down the whole
+                    // run, not just the in-flight match. `abort_match` alone sets `Ended`
+                    // while leaving `mc_run` set: the post-game auto-return to lobby is gated
+                    // on `mc_run.is_none()` and MC chaining only fires from the `Running`
+                    // match-outcome branch, so the room would wedge in `Ended` forever with
+                    // `/api/montecarlo/status` still reporting `running: true`. `mc_abort`
+                    // ends the in-flight match (via `abort_match`), clears `mc_run`, and
+                    // publishes a final `running: false` status.
+                    let was_running = self.state == RoomState::Running;
+                    self.mc_abort("operator_abort");
+                    if was_running {
+                        Ok(())
+                    } else {
+                        Err(AbortError::NotRunning)
+                    }
+                } else {
+                    self.abort_match()
+                };
                 if let Err(ref e) = result {
                     warn!(room = %self.name, reason = e.as_str(), "operator abort refused");
                 }
@@ -2045,6 +2092,23 @@ impl Room {
         let record = ReplayRecord::Tick(ReplayTick { tick, commands });
         if let Err(e) = writer.write(&record) {
             warn!(room = %self.name, error = %e, "failed to write replay tick");
+        }
+    }
+
+    /// Record a mid-match disconnect / kick so replay re-applies the ship removal at the same
+    /// tick. `tick` is the current `world.tick` — the last tick the ship participated in;
+    /// replay steps to it, then removes the ship (see `ReplayRecord::Disconnect`).
+    fn write_replay_disconnect(&mut self, bot_id: &BotId) {
+        let tick = self.world.tick;
+        let Some(writer) = self.replay_writer.as_mut() else {
+            return;
+        };
+        let record = ReplayRecord::Disconnect(ReplayDisconnect {
+            tick,
+            bot_id: bot_id.clone(),
+        });
+        if let Err(e) = writer.write(&record) {
+            warn!(room = %self.name, error = %e, "failed to write replay disconnect");
         }
     }
 
