@@ -110,6 +110,17 @@ class Gunner:
         """Record that a shot was committed at ``tick``; starts the cooldown."""
         self._next_fire_tick = tick + self._cooldown
 
+    def reset(self) -> None:
+        """Clear match-scoped state (the fire-cooldown counter).
+
+        Server ticks reset to 0 every match while a bot instance persists across
+        matches in Monte-Carlo mode. ``_next_fire_tick`` is an *absolute* tick, so
+        a shot fired late in match 1 (e.g. ``note_fired(2990)`` → 3005) would gate
+        every shot in match 2 (tick 0 < 3005) until that stale threshold. Call this
+        from ``on_game_start``.
+        """
+        self._next_fire_tick = 0
+
     @property
     def next_fire_tick(self) -> int:
         return self._next_fire_tick

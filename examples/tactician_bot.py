@@ -61,10 +61,14 @@ class TacticianBot(Bot):
         # Monte-Carlo mode reuses this bot across matches; the server resets the
         # tick to 0 and sends only ``game_start``. Clear match-scoped state so a
         # carried-over track doesn't become an immortal "ghost" the bot chases
-        # forever, and reset the evader's state machine. Welcome-derived config
-        # (specs, map, helm) is preserved.
+        # forever, reset the gunner so its absolute-tick cooldown doesn't gate
+        # every shot of the new match (ticks reset to 0 each match), and reset the
+        # evader's state machine. Welcome-derived config (specs, map, helm) is
+        # preserved.
         if self.tracker is not None:
             self.tracker.reset()
+        if self.gunner is not None:
+            self.gunner.reset()
         self.evader.reset()
 
     def on_tick(self, view: WorldView) -> Command:

@@ -21,8 +21,8 @@ from naval_sdk.protocol import (
     Welcome,
     WorldView,
 )
-from naval_sdk.tactical import Intent, TacticalBot, TacticalContext
-from naval_sdk.tactical.tracker import Tracker
+from naval_sdk.tactical import Gunner, Intent, TacticalBot, TacticalContext
+from naval_sdk.tactical.tracker import Track, Tracker
 
 
 WELCOME_FRAME = {
@@ -419,3 +419,145 @@ def test_back_to_back_matches_not_pinned_to_saturated_command() -> None:
     ]
     assert not saturated, "bot is saturated against a ghost after tick reset"
     assert bot.tracker.tracks == [], "no ghost track may appear in a contact-free match"
+
+
+# ---------------------------------------------------------------------------
+# F-04 — powerup loadout must be re-committed after every lobby.
+#
+# The server drops committed loadouts on every return to lobby, so a bot that
+# only selects powerups once (at welcome) plays match 2+ vanilla. The SDK must
+# re-send `select_powerups` before `ready` after each lobby, with the same picks.
+# ---------------------------------------------------------------------------
+
+
+class _PowerupBot(RecordingBot):
+    PICKS = ["overdrive", "rapid_fire"]
+
+    def choose_powerups(self, welcome: Welcome) -> List[str]:
+        return list(self.PICKS)
+
+
+def test_powerups_recommitted_after_each_lobby(patched_connect):
+    fake = patched_connect(
+        [
+            WELCOME_FRAME,
+            GAME_START_FRAME,
+            TICK_FRAME,
+            GAME_OVER_FRAME,
+            LOBBY_FRAME,
+            GAME_START_FRAME,
+            TICK_FRAME,
+            GAME_OVER_FRAME,
+            LOBBY_FRAME,
+            GAME_START_FRAME,
+            TICK_FRAME,
+            GAME_OVER_FRAME,
+        ]
+    )
+
+    bot = _PowerupBot()
+    asyncio.run(run_async(bot, host="localhost", port=0))
+
+    # Every `ready` must be immediately preceded by a matching `select_powerups`.
+    types = [m.get("type") for m in fake.sent]
+    ready_indices = [i for i, t in enumerate(types) if t == "ready"]
+    assert len(ready_indices) == 3, "one ready per match (welcome + two lobbies)"
+    for i in ready_indices:
+        assert i >= 1 and types[i - 1] == "select_powerups", (
+            "select_powerups must precede every ready"
+        )
+        assert fake.sent[i - 1]["powerups"] == _PowerupBot.PICKS, (
+            "same picks re-sent each lobby"
+        )
+
+
+def test_no_powerups_sends_ready_only(patched_connect):
+    """A bot with the default (empty) choose_powerups sends `ready` with no loadout."""
+    fake = patched_connect([WELCOME_FRAME, GAME_START_FRAME, TICK_FRAME, GAME_OVER_FRAME])
+    bot = RecordingBot()
+    asyncio.run(run_async(bot, host="localhost", port=0))
+    types = [m.get("type") for m in fake.sent]
+    assert "select_powerups" not in types
+    assert types == ["hello", "ready", "command"]
+
+
+# ---------------------------------------------------------------------------
+# F-05 — Gunner cooldown must reset across matches (server ticks reset to 0).
+# ---------------------------------------------------------------------------
+
+
+def _active_track(pos=(100.0, 0.0)) -> Track:
+    return Track(
+        track_id=1,
+        kind="ship",
+        pos=pos,
+        observed_pos=pos,
+        vel=(0.0, 0.0),
+        last_seen_tick=0,
+        first_seen_tick=0,
+        last_active_tick=0,
+        confidence=1.0,
+        source="active",
+    )
+
+
+def test_gunner_reset_clears_stale_cooldown():
+    gunner = Gunner(_SPECS)
+    track = _active_track()
+    view = _mc_view(0, [], me_pos=(0.0, 0.0))
+
+    # Fire late in match 1 → cooldown threshold sits far in the future.
+    gunner.note_fired(2990)
+    assert gunner.solve(view.me, track, view) is None, (
+        "stale absolute-tick cooldown should still gate a shot at tick 0"
+    )
+
+    # New match at tick 0: without a reset the gunner refuses to fire all match.
+    gunner.reset()
+    assert gunner.solve(view.me, track, view) is not None, (
+        "after reset a valid track must yield a solution at tick 0"
+    )
+
+
+def test_tacticalbot_game_start_resets_gunner():
+    bot = _EngageBot()
+    bot.on_welcome(_mc_welcome())
+    assert bot.gunner is not None
+    bot.gunner.note_fired(2990)
+    assert bot.gunner.next_fire_tick == 2990 + _SPECS.gun_cooldown_ticks
+
+    bot.on_game_start(0, (500.0, 500.0), 0.0)
+    assert bot.gunner.next_fire_tick == 0, "on_game_start must reset the gunner cooldown"
+
+
+# ---------------------------------------------------------------------------
+# F-06 — malformed `game_start` must not crash the run loop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_pos", [42, [], ["x", "y"], None])
+def test_malformed_game_start_does_not_crash(patched_connect, bad_pos):
+    bad_frame = dict(GAME_START_FRAME)
+    if bad_pos is None:
+        del bad_frame["starting_position"]
+    else:
+        bad_frame["starting_position"] = bad_pos
+
+    fake = patched_connect(
+        [
+            WELCOME_FRAME,
+            bad_frame,  # must be logged and skipped, not crash
+            GAME_START_FRAME,  # a subsequent valid frame is still processed
+            TICK_FRAME,
+            GAME_OVER_FRAME,
+        ]
+    )
+
+    bot = RecordingBot()
+    # Must return normally (no exception escaping run_async).
+    asyncio.run(run_async(bot, host="localhost", port=0))
+
+    assert bot.game_starts == [0], "only the valid game_start reaches the callback"
+    assert bot.ticks == [1], "the loop kept running after the malformed frame"
+    types = [m.get("type") for m in fake.sent]
+    assert "command" in types
