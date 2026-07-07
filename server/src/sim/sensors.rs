@@ -34,6 +34,11 @@ pub struct Contact {
     /// Range from viewer; `None` for bearing-only sensors (passive).
     pub range: Option<f32>,
     pub confidence: f32,
+    /// Ground-truth `ShipId` this contact was generated from, or `None` for a decoy.
+    /// **Sim-internal only** — the room uses it to gate/anonymize per-tick events (e.g.
+    /// `powerup_activated`) against the *actual* sensor result. It is never translated
+    /// onto the wire: `translate_contact` drops it and assigns the anonymized `c_<n>` id.
+    pub source: Option<ShipId>,
 }
 
 /// Active-radar sweep from the perspective of `viewer_id` standing at `viewer_pos`. Sees
@@ -131,6 +136,7 @@ pub fn active_contacts(
             bearing_deg: compass_deg(to),
             range: Some(dist),
             confidence,
+            source: Some(id.clone()),
         });
     }
 
@@ -156,6 +162,7 @@ pub fn active_contacts(
             bearing_deg: compass_deg(to),
             range: Some(dist),
             confidence: 1.0,
+            source: None,
         });
     }
     out
@@ -227,6 +234,7 @@ pub fn passive_contacts(
             bearing_deg: bearing,
             range: None,
             confidence: if pinging { 0.85 } else { 0.5 },
+            source: Some(id.clone()),
         });
     }
 
@@ -254,6 +262,7 @@ pub fn passive_contacts(
             bearing_deg: bearing,
             range: None,
             confidence: 0.5,
+            source: None,
         });
     }
     out

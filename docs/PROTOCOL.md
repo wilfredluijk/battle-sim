@@ -161,7 +161,7 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
   "events": [
     { "type": "hit", "amount": 12 },
     { "type": "shell_splash", "pos": [220.0, 505.0] },
-    { "type": "powerup_activated", "ship_id": "s_2", "powerup": "smoke_screen" }
+    { "type": "powerup_activated", "contact_id": "c_a1", "powerup": "smoke_screen" }
   ]
 }
 ```
@@ -172,7 +172,7 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
 
 `contacts[].kind` is one of `"ship"`, `"shell"`, `"unknown"`.
 
-`events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range, plus `powerup_activated` events for the bot's own activations and any activation by a currently-visible ship.
+`events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range, plus `powerup_activated` events. A `powerup_activated` event carries a `contact_id`, **not** a `ship_id`: for the bot's own activation `contact_id` is omitted (`null`), and for another ship's activation it is the same per-tick anonymized `c_<n>` id that ship appears under in this frame's `contacts` — the event is emitted **only** when the activating ship actually shows up in this bot's sweep this tick (same visibility as a contact, soft counters included), and is re-anonymized every tick like contacts, so it cannot be used to track a specific opponent across ticks.
 
 `self.selected_powerups` and `self.powerup_status` are omitted (or sent as empty arrays) when the bot picked no powerups. `powerup_status[i].active_ticks_left` counts down each tick; check `used && active_ticks_left == 0` to know a pick is spent.
 
@@ -653,6 +653,20 @@ The server's release version is included in `welcome.version` (planned — curre
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-07-07 — `powerup_activated` no longer leaks a ground-truth ship id (breaking)
+
+- **Breaking (bot-facing).** The `powerup_activated` tick event's `ship_id` field is
+  replaced by `contact_id`. For the bot's own activation `contact_id` is omitted (`null`);
+  for another ship's activation it is the per-tick anonymized `c_<n>` id that ship appears
+  under in the same frame's `contacts`. The event is now emitted **only** when the
+  activating ship actually shows up in that viewer's sweep this tick — gated by the real
+  sensor result (soft counters like AWACS-vs-silent-running included), not a separate,
+  stronger visibility rule. Previously the event carried the persistent ground-truth
+  `ship_id`, letting a bot re-identify and track a specific opponent for the whole match,
+  and fired on ticks where the viewer's sweep saw nothing. The **spectator** `world`
+  event is unchanged and still carries the ground-truth `ship_id`. SDKs updated in step
+  (`PowerupActivatedEvent.contact_id: Optional[str]`).
 
 ## 2026-07-07 — replay records mid-match disconnects
 

@@ -45,7 +45,7 @@ behavior changes in `docs/PROTOCOL.md`'s changelog.
 | F-05 | 2 | Gunner cooldown carries across matches | High | sdk | [x] |
 | F-06 | 2 | Malformed `game_start` crashes SDK run loop | High | sdk | [x] |
 | F-07 | 3 | Lockstep MC still enforces wall-clock deadline | Medium | server | [x] |
-| F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [ ] |
+| F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [x] |
 | F-09 | 3 | Unclamped turn-rate ratio (Overdrive super-turn) | Medium | server | [ ] |
 | F-10 | 3 | Replay ID collision truncates previous replay | Medium | server | [ ] |
 | F-11 | 3 | Replay endpoints unbounded on corrupt logs | Medium | server | [ ] |

@@ -157,7 +157,10 @@ export interface Contact {
 /** A bot-facing combat event — the filtered form, distinct from the spectator `TickEvent`. */
 export type BotTickEvent =
   | { type: 'hit'; amount: number }
-  | { type: 'shell_splash'; pos: [number, number] };
+  | { type: 'shell_splash'; pos: [number, number] }
+  // Anonymized: `contact_id` is the per-tick `c_<n>` id the activating ship appears under in
+  // this frame's `contacts`, or absent for the viewer's own activation. Never a ship_id.
+  | { type: 'powerup_activated'; contact_id?: string; powerup: string };
 
 /** One bot in a replay header. */
 export interface ReplayBotInfo {
