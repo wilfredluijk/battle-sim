@@ -13,7 +13,8 @@ use tokio::sync::oneshot;
 use naval_server::monte_carlo::{McConfig, McStatus, VarianceMode};
 use naval_server::protocol::{FireCommand, SensorMode, ServerMsg};
 use naval_server::room::{
-    BotRegistration, JoinError, McStartError, PendingCommand, Room, RoomEvent,
+    AbortError, BotRegistration, JoinError, MatchReport, McStartError, PendingCommand, ResetError,
+    Room, RoomEvent, StartError, POST_GAME_LOBBY_TICKS,
 };
 
 fn test_peer() -> SocketAddr {
@@ -41,6 +42,174 @@ fn status(room: &mut Room) -> McStatus {
     let (tx, mut rx) = oneshot::channel();
     room.handle_event(RoomEvent::QueryMonteCarloStatus { reply: tx });
     rx.try_recv().expect("oneshot reply")
+}
+
+fn abort(room: &mut Room) -> Result<(), AbortError> {
+    let (tx, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::OperatorAbort { reply: tx });
+    rx.try_recv().expect("oneshot reply")
+}
+
+fn reset(room: &mut Room) -> Result<(), ResetError> {
+    let (tx, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::OperatorReset { reply: tx });
+    rx.try_recv().expect("oneshot reply")
+}
+
+fn start(room: &mut Room, name: &str) -> Result<(), StartError> {
+    let (tx, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::OperatorStart {
+        room: name.into(),
+        reply: tx,
+    });
+    rx.try_recv().expect("oneshot reply")
+}
+
+fn report(room: &mut Room) -> Option<MatchReport> {
+    let (tx, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::QueryReport { reply: tx });
+    rx.try_recv().expect("oneshot reply")
+}
+
+fn ready(room: &mut Room, bot_id: &str) {
+    room.handle_event(RoomEvent::BotReady {
+        bot_id: bot_id.to_string(),
+    });
+}
+
+/// Start an MC batch on a fresh 2-bot room and step until we're mid-way through match 1,
+/// so a subsequent abort lands during a live match. Returns the room, both bot handles, and
+/// their scripts.
+fn mc_room_midrun(
+    n_matches: u32,
+) -> (
+    Room,
+    BotRegistration,
+    BotRegistration,
+    ScriptedBot,
+    ScriptedBot,
+) {
+    let (mut room, mut r1, mut r2) = make_two_bot_room(1234);
+    let mut bot1 = ScriptedBot {
+        bot_id: r1.bot_id.clone(),
+        shoot: true,
+    };
+    let mut bot2 = ScriptedBot {
+        bot_id: r2.bot_id.clone(),
+        shoot: false,
+    };
+    drain(&mut r1);
+    drain(&mut r2);
+    ready(&mut room, &r1.bot_id);
+    ready(&mut room, &r2.bot_id);
+    let cfg = McConfig {
+        n_matches,
+        mc_seed: 42,
+        variance_mode: VarianceMode::Fixed,
+        per_tick_timeout_ms: None,
+        spectator_throttle: Some(0),
+        sim_config: None,
+    };
+    start_mc(&mut room, cfg).expect("mc start");
+    // A handful of ticks: enough to be unambiguously mid-match, few enough that match 1
+    // hasn't finished.
+    for _ in 0..10 {
+        bot1.process(&mut r1, &mut room);
+        bot2.process(&mut r2, &mut room);
+        room.step_tick();
+    }
+    (room, r1, r2, bot1, bot2)
+}
+
+/// F-03(a): an operator abort during a Monte Carlo run must tear down the whole run — not
+/// just the in-flight match — so the room recovers. Before the fix, `abort_match` left
+/// `mc_run` set: the post-game auto-return to lobby is gated on `mc_run.is_none()`, so the
+/// room sat in `Ended` forever with `/api/montecarlo/status` still reporting `running: true`.
+#[test]
+fn operator_abort_during_mc_run_unwedges_room() {
+    let (mut room, mut r1, mut r2, _b1, _b2) = mc_room_midrun(5);
+
+    assert!(status(&mut room).running, "MC run should be in progress");
+
+    abort(&mut room).expect("abort succeeds during a running MC match");
+
+    // The run is now reported stopped, with the operator reason surfaced.
+    let st = status(&mut room);
+    assert!(!st.running, "MC run must be marked stopped after the abort");
+    assert_eq!(
+        st.ended_reason.as_deref(),
+        Some("operator_abort"),
+        "status should surface the abort reason",
+    );
+
+    // The room auto-returns to lobby after the post-game pause: a `lobby` frame reaches the
+    // bots. Before the fix this never happened — the gate stayed closed on the stale run.
+    drain(&mut r1);
+    drain(&mut r2);
+    let mut saw_lobby = false;
+    for _ in 0..(POST_GAME_LOBBY_TICKS + 5) {
+        room.step_tick();
+        while let Ok(msg) = r1.outbound.try_recv() {
+            if matches!(msg, ServerMsg::Lobby { .. }) {
+                saw_lobby = true;
+            }
+        }
+    }
+    assert!(
+        saw_lobby,
+        "room should auto-return to lobby after aborting the MC run"
+    );
+    // And nothing resurrected the run.
+    assert!(!status(&mut room).running);
+}
+
+/// F-03(b): after aborting an MC run and resetting, a normal match must run as a normal
+/// match — no leftover `mc_run` capturing its result or chaining MC-seeded matches. Before
+/// the fix, `transition_to_lobby` never cleared `mc_run`, so the next match fed the stale run.
+#[test]
+fn abort_then_reset_then_normal_match_has_no_mc_chaining() {
+    let (mut room, mut r1, mut r2, mut bot1, mut bot2) = mc_room_midrun(5);
+
+    abort(&mut room).expect("abort during MC run");
+    assert!(!status(&mut room).running, "run stopped after abort");
+
+    // Reset (valid in Ended) cuts the pause and returns to lobby. Ready flags are cleared,
+    // so re-ready before starting a normal match.
+    reset(&mut room).expect("reset in ended");
+    drain(&mut r1);
+    drain(&mut r2);
+    ready(&mut room, &r1.bot_id);
+    ready(&mut room, &r2.bot_id);
+    start(&mut room, "test").expect("normal match start");
+
+    // Run the normal match to completion. Throughout, the MC status must stay stopped — a
+    // stale `mc_run` would report `running: true` and chain another match.
+    let mut ended_normally = false;
+    for _ in 0..3500 {
+        bot1.process(&mut r1, &mut room);
+        bot2.process(&mut r2, &mut room);
+        room.step_tick();
+        bot1.process(&mut r1, &mut room);
+        bot2.process(&mut r2, &mut room);
+        assert!(
+            !status(&mut room).running,
+            "a normal match must never run as (or resurrect) an MC run",
+        );
+        // The match-end report overwrites the stale `aborted` one with a real outcome.
+        if let Some(rep) = report(&mut room) {
+            if rep.outcome != "aborted" {
+                ended_normally = true;
+                break;
+            }
+        }
+    }
+    assert!(ended_normally, "the normal match should finish");
+    let rep = report(&mut room).expect("report after the normal match");
+    assert_ne!(
+        rep.outcome, "aborted",
+        "normal match report must not be the stale aborted MC report",
+    );
+    assert!(!status(&mut room).running, "no MC run after a normal match");
 }
 
 fn drain(reg: &mut BotRegistration) {

@@ -1170,6 +1170,20 @@ impl Room {
     /// bot so SDKs can rearm.
     fn transition_to_lobby(&mut self) {
         info!(room = %self.name, "returning to lobby for next match");
+        // A Monte Carlo run must never survive the return to lobby: a leftover `mc_run`
+        // would capture the next *normal* match's result and chain leftover MC matches with
+        // MC-derived seeds. Every abort path is expected to clear it (see the `OperatorAbort`
+        // handler and `mc_abort`); assert that in debug and clear defensively in release.
+        debug_assert!(
+            self.mc_run.is_none(),
+            "mc_run must be cleared before returning to lobby"
+        );
+        if self.mc_run.take().is_some() {
+            warn!(
+                room = %self.name,
+                "mc_run still set on lobby transition; clearing defensively",
+            );
+        }
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
         let config = self.world.config;
         self.world.tick = 0;
@@ -1620,7 +1634,25 @@ impl Room {
                 self.publish_admin_state();
             }
             RoomEvent::OperatorAbort { reply } => {
-                let result = self.abort_match();
+                let result = if self.mc_run.is_some() {
+                    // An operator abort during a Monte Carlo run must tear down the whole
+                    // run, not just the in-flight match. `abort_match` alone sets `Ended`
+                    // while leaving `mc_run` set: the post-game auto-return to lobby is gated
+                    // on `mc_run.is_none()` and MC chaining only fires from the `Running`
+                    // match-outcome branch, so the room would wedge in `Ended` forever with
+                    // `/api/montecarlo/status` still reporting `running: true`. `mc_abort`
+                    // ends the in-flight match (via `abort_match`), clears `mc_run`, and
+                    // publishes a final `running: false` status.
+                    let was_running = self.state == RoomState::Running;
+                    self.mc_abort("operator_abort");
+                    if was_running {
+                        Ok(())
+                    } else {
+                        Err(AbortError::NotRunning)
+                    }
+                } else {
+                    self.abort_match()
+                };
                 if let Err(ref e) = result {
                     warn!(room = %self.name, reason = e.as_str(), "operator abort refused");
                 }
