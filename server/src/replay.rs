@@ -51,7 +51,13 @@ use crate::sim::{PowerupId, SimConfig};
 /// Both fields are `serde(default)`, so v2/v3 logs (which lack them) still deserialize;
 /// the reader treats `version <= REPLAY_FORMAT_VERSION` as loadable and falls back to the
 /// rebuilt ring layout when the recorded spawns are absent/all-zero.
-pub const REPLAY_FORMAT_VERSION: u32 = 4;
+///
+/// v5 added the `Disconnect` record: a mid-match disconnect or operator kick removes the
+/// bot's ship from the world immediately, which shifts the shared RNG stream (fewer ships =
+/// fewer sensor draws) and can end the match early. Without it, replay kept a ghost ship and
+/// diverged from the recorded `End`. v4 and older logs simply carry no `Disconnect` records
+/// (a match where nobody dropped), so they still load and replay identically.
+pub const REPLAY_FORMAT_VERSION: u32 = 5;
 
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
@@ -64,6 +70,12 @@ pub const REPLAY_FORMAT_VERSION: u32 = 4;
 pub enum ReplayRecord {
     Header(Box<ReplayHeader>),
     Tick(ReplayTick),
+    /// A bot left mid-match (transport disconnect or operator kick) while the room was
+    /// `Running`. Written the instant the ship is removed. `tick` is the value of
+    /// `world.tick` at that instant — i.e. the last tick the ship participated in. Replay
+    /// steps the world to `tick`, then removes the ship, so every tick after it is computed
+    /// (and draws RNG) without that ship, matching the live run. See `advance_to`.
+    Disconnect(ReplayDisconnect),
     End(ReplayEnd),
 }
 
@@ -122,6 +134,12 @@ pub struct ReplayCommand {
     /// Powerup activation that drove this tick. `None` for ticks that did not activate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activate_powerup: Option<PowerupId>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplayDisconnect {
+    pub tick: u64,
+    pub bot_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -525,6 +543,16 @@ fn advance_and_inject(
     }
 }
 
+/// Step `room` forward until `world.tick == target_tick`, running `after_step` after each
+/// step. Shared by the `End` and `Disconnect` record handlers (which advance the world but
+/// inject no commands) across all three replay drivers, so their timing stays in lockstep.
+fn advance_to(room: &mut Room, target_tick: u64, mut after_step: impl FnMut(&mut Room)) {
+    while room.world.tick < target_tick {
+        room.step_tick();
+        after_step(room);
+    }
+}
+
 /// Drive a replay end-to-end: read the file, rebuild the room, then tick at the recorded
 /// `tick_hz` injecting commands and broadcasting spectator frames. Returns when the log
 /// is exhausted, the shutdown channel fires, or an error occurs.
@@ -577,6 +605,10 @@ pub async fn run_replay(
                 match next {
                     Some(ReplayRecord::Tick(rec)) => {
                         advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {});
+                    }
+                    Some(ReplayRecord::Disconnect(rec)) => {
+                        advance_to(&mut room, rec.tick, |_| {});
+                        room.remove_bot_and_ship(&rec.bot_id);
                     }
                     Some(ReplayRecord::End(end)) => {
                         // Run remaining ticks (if any) so the spectator sees the final
@@ -643,11 +675,16 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
                     drain_spectator_frames(&mut spec_rx, &mut frames);
                 });
             }
-            ReplayRecord::End(rec) => {
-                while room.world.tick < rec.tick {
-                    room.step_tick();
+            ReplayRecord::Disconnect(rec) => {
+                advance_to(&mut room, rec.tick, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                }
+                });
+                room.remove_bot_and_ship(&rec.bot_id);
+            }
+            ReplayRecord::End(rec) => {
+                advance_to(&mut room, rec.tick, |_| {
+                    drain_spectator_frames(&mut spec_rx, &mut frames);
+                });
                 end = Some(rec);
                 break;
             }
@@ -718,11 +755,16 @@ pub fn capture_perspective(
                     drain_perspective(&mut outbound, bot_id, &mut views);
                 });
             }
-            ReplayRecord::End(rec) => {
-                while room.world.tick < rec.tick {
-                    room.step_tick();
+            ReplayRecord::Disconnect(rec) => {
+                advance_to(&mut room, rec.tick, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                }
+                });
+                room.remove_bot_and_ship(&rec.bot_id);
+            }
+            ReplayRecord::End(rec) => {
+                advance_to(&mut room, rec.tick, |_| {
+                    drain_perspective(&mut outbound, bot_id, &mut views);
+                });
                 break;
             }
             ReplayRecord::Header(_) => {
