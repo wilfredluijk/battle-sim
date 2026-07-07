@@ -476,6 +476,55 @@ impl From<io::Error> for ReplayError {
     }
 }
 
+/// Advance `room` to exactly `target_tick`, arranging for `commands` to be consumed by the
+/// step that *produces* `target_tick` and no earlier.
+///
+/// F-01: `step_tick` unconditionally drains each bot's `pending_command` at the top of every
+/// step — the `PendingCommand.tick` field does not gate consumption. The writer omits ticks
+/// with no commands (see `write_replay_tick`), so consecutive records can straddle a tick
+/// gap (e.g. a record for tick 100 followed by one for tick 105 when every bot fell silent
+/// in between). Injecting first and then stepping the whole gap would consume `target_tick`'s
+/// commands on the *first* of those steps — up to N-1 ticks early, diverging live from
+/// replay for any match where a bot skipped a tick. So we step up to `target_tick - 1` with
+/// nothing queued, then inject, then step exactly once.
+///
+/// `after_step` runs after each `step_tick`; spectator/perspective capture drain their frame
+/// buffers there, and the live player passes a no-op. All three replay drivers funnel their
+/// tick records through this helper so their timing semantics can't drift apart again.
+fn advance_and_inject(
+    room: &mut Room,
+    target_tick: u64,
+    commands: &[ReplayCommand],
+    mut after_step: impl FnMut(&mut Room),
+) {
+    // Step every empty tick that precedes the one the commands belong to. The `+ 1` form
+    // avoids the underflow a bare `target_tick - 1` would hit on a corrupt `tick: 0` record.
+    while room.world.tick + 1 < target_tick {
+        room.step_tick();
+        after_step(room);
+    }
+    for cmd in commands {
+        room.inject_replay_command(
+            &cmd.bot_id,
+            PendingCommand {
+                tick: target_tick,
+                throttle: cmd.throttle,
+                rudder: cmd.rudder,
+                fire: cmd.fire,
+                sensor_mode: cmd.sensor_mode,
+                activate_powerup: cmd.activate_powerup,
+            },
+        );
+    }
+    // Produce `target_tick`, consuming the freshly injected commands. Guarded so a stray
+    // record whose tick we've already reached (duplicate or corrupt) never steps backwards
+    // or re-consumes an already-applied command.
+    if room.world.tick < target_tick {
+        room.step_tick();
+        after_step(room);
+    }
+}
+
 /// Drive a replay end-to-end: read the file, rebuild the room, then tick at the recorded
 /// `tick_hz` injecting commands and broadcasting spectator frames. Returns when the log
 /// is exhausted, the shutdown channel fires, or an error occurs.
@@ -527,23 +576,7 @@ pub async fn run_replay(
                 let next = iter.next();
                 match next {
                     Some(ReplayRecord::Tick(rec)) => {
-                        for cmd in rec.commands {
-                            let pending = PendingCommand {
-                                tick: rec.tick,
-                                throttle: cmd.throttle,
-                                rudder: cmd.rudder,
-                                fire: cmd.fire,
-                                sensor_mode: cmd.sensor_mode,
-                                activate_powerup: cmd.activate_powerup,
-                            };
-                            room.inject_replay_command(&cmd.bot_id, pending);
-                        }
-                        // Step until we reach the recorded tick. Empty-command ticks were
-                        // not written by the writer (it skips records with no commands),
-                        // so we may need to advance multiple ticks per record.
-                        while room.world.tick < rec.tick {
-                            room.step_tick();
-                        }
+                        advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {});
                     }
                     Some(ReplayRecord::End(end)) => {
                         // Run remaining ticks (if any) so the spectator sees the final
@@ -606,23 +639,9 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
     for record in iter {
         match record {
             ReplayRecord::Tick(rec) => {
-                for cmd in rec.commands {
-                    room.inject_replay_command(
-                        &cmd.bot_id,
-                        PendingCommand {
-                            tick: rec.tick,
-                            throttle: cmd.throttle,
-                            rudder: cmd.rudder,
-                            fire: cmd.fire,
-                            sensor_mode: cmd.sensor_mode,
-                            activate_powerup: cmd.activate_powerup,
-                        },
-                    );
-                }
-                while room.world.tick < rec.tick {
-                    room.step_tick();
+                advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                }
+                });
             }
             ReplayRecord::End(rec) => {
                 while room.world.tick < rec.tick {
@@ -695,23 +714,9 @@ pub fn capture_perspective(
     for record in iter {
         match record {
             ReplayRecord::Tick(rec) => {
-                for cmd in rec.commands {
-                    room.inject_replay_command(
-                        &cmd.bot_id,
-                        PendingCommand {
-                            tick: rec.tick,
-                            throttle: cmd.throttle,
-                            rudder: cmd.rudder,
-                            fire: cmd.fire,
-                            sensor_mode: cmd.sensor_mode,
-                            activate_powerup: cmd.activate_powerup,
-                        },
-                    );
-                }
-                while room.world.tick < rec.tick {
-                    room.step_tick();
+                advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                }
+                });
             }
             ReplayRecord::End(rec) => {
                 while room.world.tick < rec.tick {

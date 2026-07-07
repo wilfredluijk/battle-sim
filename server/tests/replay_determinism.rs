@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use tokio::sync::oneshot;
 
-use naval_server::protocol::{FireCommand, SensorMode, ServerMsg};
+use naval_server::protocol::{FireCommand, SensorMode, ServerMsg, SpectatorMsg};
 use naval_server::replay::{
     self, rebuild_room_from_header, ReplayRecord, ReplayWriter, REPLAY_FORMAT_VERSION,
 };
@@ -175,6 +175,122 @@ fn replay_produces_byte_identical_final_state() {
     assert_eq!(
         live_signature, replay_signature,
         "replay state diverged from live state"
+    );
+}
+
+/// Sim-relevant fields of every ship in a `SpectatorMsg::World`, sorted by id. Excludes the
+/// observability-only fields (`commands_per_sec`, `ready`) that can differ between the live
+/// run and a replay without indicating a determinism break.
+fn spectator_ship_sig(msg: &SpectatorMsg) -> String {
+    let SpectatorMsg::World {
+        tick,
+        ships,
+        shells,
+        ..
+    } = msg;
+    let mut ships: Vec<_> = ships
+        .iter()
+        .map(|s| {
+            (
+                s.id.clone(),
+                s.pos,
+                s.heading_deg,
+                s.speed,
+                s.hp,
+                s.ammo,
+                s.throttle,
+                s.rudder,
+                s.alive,
+            )
+        })
+        .collect();
+    ships.sort_by(|a, b| a.0.cmp(&b.0));
+    format!("tick={tick}\nships={ships:?}\nshells={shells:?}")
+}
+
+/// F-01: a replay log with tick gaps — ticks where *no* bot issued a command, which the
+/// writer omits — must re-simulate byte-identically. Bot 1 commands only every 3rd tick and
+/// bot 2 goes silent for a 40-tick stretch mid-match, so consecutive records straddle gaps.
+///
+/// Before the fix, `capture_replay` injected each record's commands and then stepped the
+/// whole gap, so `step_tick` (which drains `pending_command` unconditionally) consumed those
+/// commands up to N-1 ticks early — the replayed trajectory diverged from the live one. This
+/// test fails before the fix and passes after.
+#[test]
+fn replay_with_tick_gaps_is_byte_identical() {
+    let mut live = Room::new("test".into(), 1000.0, 1000.0, 4242, 10, 80, 4);
+    let (writer, buf) = ReplayWriter::in_memory("match_gap_4242".into());
+    live.set_replay_writer(writer);
+
+    let mut r1 = connect(&mut live, "alice").expect("alice connect");
+    let mut r2 = connect(&mut live, "bob").expect("bob connect");
+    drain(&mut r1);
+    drain(&mut r2);
+    live.handle_event(RoomEvent::BotReady {
+        bot_id: r1.bot_id.clone(),
+    });
+    live.handle_event(RoomEvent::BotReady {
+        bot_id: r2.bot_id.clone(),
+    });
+    start(&mut live, "test").expect("start");
+    drain(&mut r1);
+    drain(&mut r2);
+
+    // Drive 118 ticks. The step producing `t` reads controls queued when `world.tick == t-1`.
+    // Bot 1 commands only when `t % 3 == 1` (ticks 1, 4, ..., 118); bot 2 does likewise but
+    // stays silent through the 40..=80 window. Ticks where neither commands produce no
+    // replay record, so the log has gaps of ~3 plus bot 2's long silence — exactly the shape
+    // that broke replay before F-01. The final tick (118) commands bot 1, so the last record
+    // is at tick 118 and `capture_replay` stops there, matching the live snapshot below.
+    for t in 1u64..=118 {
+        let now = live.world.tick; // == t - 1
+        if t % 3 == 1 {
+            // Vary the controls each command so early consumption visibly diverges.
+            let throttle = if (t / 3) % 2 == 0 { 0.9 } else { -0.7 };
+            let rudder = (((t as f32) * 0.017).sin()).clamp(-1.0, 1.0);
+            live.handle_event(RoomEvent::BotCommand {
+                bot_id: r1.bot_id.clone(),
+                command: cmd(now, throttle, rudder, SensorMode::Active, None),
+            });
+            if !(40..=80).contains(&t) {
+                live.handle_event(RoomEvent::BotCommand {
+                    bot_id: r2.bot_id.clone(),
+                    command: cmd(now, -0.5, -rudder, SensorMode::Passive, None),
+                });
+            }
+        }
+        live.step_tick();
+        drain(&mut r1);
+        drain(&mut r2);
+    }
+
+    let live_final = live.spectator_world_snapshot();
+    let live_sig = spectator_ship_sig(&live_final);
+    drop(live.take_replay_writer()); // flush
+
+    let bytes = buf.lock().unwrap().clone();
+    let records = replay::read_records_from(Cursor::new(bytes)).expect("read records back");
+
+    // The log must actually contain a gap, otherwise the test proves nothing.
+    let tick_ticks: Vec<u64> = records
+        .iter()
+        .filter_map(|r| match r {
+            ReplayRecord::Tick(t) => Some(t.tick),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        tick_ticks.windows(2).any(|w| w[1] - w[0] > 1),
+        "test setup: expected a tick gap in the log, got records at {tick_ticks:?}"
+    );
+
+    let captured = replay::capture_replay(records).expect("capture replay");
+    let replay_final = captured.frames.last().expect("at least one frame");
+    let replay_sig = spectator_ship_sig(replay_final);
+
+    assert_eq!(
+        live_sig, replay_sig,
+        "replay diverged from live across a tick gap"
     );
 }
 
