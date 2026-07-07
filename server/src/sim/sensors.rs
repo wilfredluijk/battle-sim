@@ -58,9 +58,10 @@ pub fn active_contacts(
     let powerup_cfg = world.config.powerups;
     let viewer_state = world.ships.get(viewer_id).map(|s| &s.powerups);
 
-    // EMP forces the affected ship's active radar to return nothing this tick.
+    // EMP forces the debuffed ship's active radar to return nothing this tick. This reads the
+    // enemy-inflicted debuff window, not the viewer's own `emp_burst` powerup state.
     if let Some(state) = viewer_state {
-        if state.is_active(PowerupId::EmpBurst, tick) {
+        if state.is_emp_debuffed(tick) {
             return Vec::new();
         }
     }
@@ -630,7 +631,7 @@ mod tests {
     fn emp_burst_empties_active_radar_for_affected_ship() {
         let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         let mut viewer = ship("s_1", 500.0, 500.0);
-        viewer.powerups.emp_expires_at = 100;
+        viewer.powerups.emp_debuff_until = 100;
         world.insert_ship(viewer);
         world.insert_ship(ship("s_2", 700.0, 500.0));
         let mut rng = Pcg64::seed_from_u64(7);

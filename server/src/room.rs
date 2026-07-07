@@ -4303,6 +4303,82 @@ mod tests {
     }
 
     #[test]
+    fn empd_victim_status_does_not_show_own_emp_burst_active() {
+        // F-12: a victim holding an unused emp_burst that gets EMP'd must not report its own
+        // powerup as active in powerup_status, while the debuff (radar blackout) still applies.
+        let mut room = test_room();
+        let mut atk = connect(&mut room, "atk").expect("atk");
+        let mut vic = connect(&mut room, "vic").expect("vic");
+        let _ = atk.outbound.try_recv();
+        let _ = vic.outbound.try_recv();
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: atk.bot_id.clone(),
+            powerups: vec![PowerupId::EmpBurst, PowerupId::Overdrive],
+        });
+        // The victim also holds an unused emp_burst — the exact conflation scenario.
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: vic.bot_id.clone(),
+            powerups: vec![PowerupId::EmpBurst, PowerupId::Overdrive],
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: atk.bot_id.clone(),
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: vic.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        while atk.outbound.try_recv().is_ok() {}
+        while vic.outbound.try_recv().is_ok() {}
+
+        // Within emp_burst_radius (130u); attacker fires its EMP.
+        room.world.ships.get_mut(&atk.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        room.world.ships.get_mut(&vic.ship_id).unwrap().pos = Vec2::new(540.0, 500.0);
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: atk.bot_id.clone(),
+            command: cmd_activate(0, PowerupId::EmpBurst),
+        });
+        room.step_tick();
+
+        // Victim's own emp_burst reads used:false with no active window, despite being EMP'd.
+        let ServerMsg::Tick { self_state, .. } = next_tick(&mut vic) else {
+            panic!("expected Tick for victim");
+        };
+        let vic_emp = self_state
+            .powerup_status
+            .iter()
+            .find(|p| p.id == PowerupId::EmpBurst)
+            .expect("victim's emp_burst in status");
+        assert!(!vic_emp.used, "victim never activated its own emp_burst");
+        assert_eq!(
+            vic_emp.active_ticks_left, 0,
+            "victim's own emp_burst must not read as active just because it was EMP'd",
+        );
+        // The debuff itself is in effect (active-radar blackout window).
+        assert!(room
+            .world
+            .ships
+            .get(&vic.ship_id)
+            .unwrap()
+            .powerups
+            .is_emp_debuffed(room.world.tick));
+
+        // Attacker's own status: emp_burst used, with an active countdown.
+        let ServerMsg::Tick { self_state, .. } = next_tick(&mut atk) else {
+            panic!("expected Tick for attacker");
+        };
+        let atk_emp = self_state
+            .powerup_status
+            .iter()
+            .find(|p| p.id == PowerupId::EmpBurst)
+            .expect("attacker's emp_burst in status");
+        assert!(atk_emp.used, "attacker activated its emp_burst");
+        assert!(
+            atk_emp.active_ticks_left > 0,
+            "attacker's own emp_burst should report an active countdown",
+        );
+    }
+
+    #[test]
     fn powerup_activation_not_revealed_when_target_outside_actual_sweep() {
         // The pre-fix visibility gate was a parallel reimplementation *stronger* than the
         // real sensor model: it treated AWACS as a hard counter to silent_running, so a
