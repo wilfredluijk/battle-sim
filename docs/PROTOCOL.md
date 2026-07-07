@@ -654,6 +654,15 @@ The server's release version is included in `welcome.version` (planned — curre
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
 
+## 2026-07-07 — turn-rate ratio clamped (physics behavior change)
+
+- The heading turn rate is `turn_rate_max * rudder * min(|speed| / max_forward, 1.0)` — the
+  speed ratio is now clamped to 1.0. Previously, when Overdrive expired while the ship was
+  still above the un-boosted `max_forward`, the ratio exceeded 1.0 and the ship turned faster
+  than `turn_rate_max` for a few ticks (an exploitable "super-turn on expiry"). No wire-shape
+  change, but simulation output differs, so replay logs recorded before this fix will not
+  re-simulate byte-identically.
+
 ## 2026-07-07 — `powerup_activated` no longer leaks a ground-truth ship id (breaking)
 
 - **Breaking (bot-facing).** The `powerup_activated` tick event's `ship_id` field is
