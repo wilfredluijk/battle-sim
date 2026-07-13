@@ -357,6 +357,10 @@ pub enum RoomEvent {
 pub struct RoomSnapshot {
     pub state: AdminState,
     pub config: SimConfig,
+    /// Arena dimensions in world units. Operator-set via `--map WxH` (not a `SimConfig`
+    /// balance parameter), so the spectator's live view must read it from here rather than
+    /// hardcoding a size.
+    pub map: MapInfo,
 }
 
 /// Per-bot statistics accumulated over a single match. Reset at `start_match`, frozen into
@@ -752,11 +756,23 @@ impl Room {
             // contact in *before* the natural ones so it's near the front of the list.
             // Done in-place rather than in `sensors::active_contacts` so the trace works
             // regardless of the bot's current sensor mode.
-            let mut contacts: Vec<ProtocolContact> = sim_contacts
-                .into_iter()
-                .enumerate()
-                .map(|(i, c)| translate_contact(i, c))
-                .collect();
+            // Translate each sensor contact to its anonymized wire form, and remember which
+            // anonymized id each *real* ship landed on this tick. That map is the single
+            // source of truth for gating `powerup_activated` events below — no parallel
+            // "is it visible" reimplementation that could drift from `sensors.rs`.
+            let mut contact_id_by_ship: BTreeMap<ShipId, String> = BTreeMap::new();
+            let mut contacts: Vec<ProtocolContact> = Vec::with_capacity(sim_contacts.len());
+            for (i, c) in sim_contacts.into_iter().enumerate() {
+                let source = c.source.clone();
+                let proto = translate_contact(i, c);
+                if let Some(src) = source {
+                    // First contact for a ship wins (a ship appears at most once per sweep).
+                    contact_id_by_ship
+                        .entry(src)
+                        .or_insert_with(|| proto.id.clone());
+                }
+                contacts.push(proto);
+            }
             self.consume_counter_battery_reveal(&ship_id, viewer_pos, &mut contacts);
 
             let mut events = filter_events_for_bot(
@@ -766,14 +782,21 @@ impl Room {
                 &self.world.config,
                 &combat_events,
             );
-            // Activation events: always show your own; for others, only if the activating
-            // ship would currently be a contact for the viewer.
+            // Activation events are anonymized exactly like contacts. Your own activation is
+            // always confirmed (no contact id — you are not a contact to yourself). Another
+            // ship's activation is revealed only when that ship actually showed up in *this*
+            // viewer's sweep this tick, tagged with the same per-tick `c_<n>` id the bot sees
+            // in `contacts` — never the ground-truth ShipId, which would let a bot track a
+            // specific opponent across ticks.
             for (acting_ship_id, powerup) in &powerup_activations {
-                let visible = acting_ship_id == &ship_id
-                    || self.is_ship_visible_to(&ship_id, viewer_pos, sensor_mode, acting_ship_id);
-                if visible {
+                if acting_ship_id == &ship_id {
                     events.push(TickEvent::PowerupActivated {
-                        ship_id: acting_ship_id.clone(),
+                        contact_id: None,
+                        powerup: *powerup,
+                    });
+                } else if let Some(contact_id) = contact_id_by_ship.get(acting_ship_id) {
+                    events.push(TickEvent::PowerupActivated {
+                        contact_id: Some(contact_id.clone()),
                         powerup: *powerup,
                     });
                 }
@@ -1427,80 +1450,6 @@ impl Room {
         // produces no contact this tick while the track is live.
     }
 
-    /// Coarse "would the viewer currently see this ship" check, used to gate
-    /// `PowerupActivated` events. Mirrors the sensor module's range rules without
-    /// re-running the RNG: any ship inside the relevant range counts as visible. Smoke
-    /// blocks for active; silent_running hides from passive.
-    fn is_ship_visible_to(
-        &self,
-        viewer_ship_id: &ShipId,
-        viewer_pos: Vec2,
-        sensor_mode: SensorMode,
-        target_ship_id: &ShipId,
-    ) -> bool {
-        let Some(target) = self.world.ships.get(target_ship_id) else {
-            return false;
-        };
-        if !target.alive {
-            return false;
-        }
-        let tick = self.world.tick;
-        let config = &self.world.config;
-        let dist = target.pos.distance(viewer_pos);
-        match sensor_mode {
-            SensorMode::Active => {
-                let viewer = self.world.ships.get(viewer_ship_id);
-                if let Some(v) = viewer {
-                    if v.powerups.is_active(PowerupId::EmpBurst, tick) {
-                        return false;
-                    }
-                }
-                let awacs = viewer
-                    .map(|v| v.powerups.is_active(PowerupId::AwacsScan, tick))
-                    .unwrap_or(false);
-                let base_range = config.active_radar_range;
-                let radar_range = if awacs {
-                    base_range * config.powerups.awacs_range_mult
-                } else {
-                    base_range
-                };
-                let effective_range =
-                    if target.powerups.is_active(PowerupId::SilentRunning, tick) && !awacs {
-                        radar_range * config.powerups.silent_running_active_range_mult
-                    } else {
-                        radar_range
-                    };
-                if dist > effective_range {
-                    return false;
-                }
-                // Smoke blocks active sight when target is in a cloud the viewer isn't in.
-                for cloud in &self.world.smoke_clouds {
-                    if cloud.expires_at <= tick {
-                        continue;
-                    }
-                    let target_in = target.pos.distance(cloud.pos) <= cloud.radius;
-                    if !target_in {
-                        continue;
-                    }
-                    let viewer_in = viewer_pos.distance(cloud.pos) <= cloud.radius;
-                    if !viewer_in {
-                        return false;
-                    }
-                }
-                true
-            }
-            SensorMode::Passive => {
-                if target.powerups.is_active(PowerupId::SilentRunning, tick) {
-                    return false;
-                }
-                let nearby = config.passive_hear_nearby_range;
-                let active_hear = config.passive_hear_active_range;
-                let pinging = self.previous_active_pingers.contains(target_ship_id);
-                dist <= nearby || (pinging && dist <= active_hear)
-            }
-        }
-    }
-
     /// Translate an `ActivationError` into a typed protocol error frame.
     fn send_activation_error(&mut self, bot_id: &BotId, id: PowerupId, err: ActivationError) {
         let (code, msg): (&str, String) = match err {
@@ -1697,6 +1646,10 @@ impl Room {
                 let _ = reply.send(RoomSnapshot {
                     state: self.admin_state_snapshot(),
                     config: self.world.config,
+                    map: MapInfo {
+                        width: self.world.width as u32,
+                        height: self.world.height as u32,
+                    },
                 });
             }
             RoomEvent::QueryReport { reply } => {
@@ -1802,6 +1755,15 @@ impl Room {
         let deadline_ms = self.tick_deadline_ms;
         let send_time = self.tick_send_time;
         let world_tick = self.world.tick;
+        // Lockstep (Monte Carlo) mode paces the loop by bot responses, not the wall clock:
+        // the tick only advances once every registered bot's command is in (or the lockstep
+        // timeout backstop fires). Enforcing `tick_deadline_ms` here would reject every
+        // command from a bot slower than the deadline, so `pending_command` would never
+        // fill, `all_pending_commands_ready()` would never be true, and every tick would
+        // burn the full lockstep timeout — the opposite of lockstep's "as fast as the
+        // slowest bot" promise. Skip the wall-clock check in lockstep; keep the tick-based
+        // stale check below (it guards against confused/replayed bots regardless of pacing).
+        let in_lockstep = self.in_lockstep();
 
         let Some(entry) = self.bots.get_mut(&bot_id) else {
             warn!(room = %self.name, bot = %bot_id, "command from unknown bot, ignored");
@@ -1841,7 +1803,7 @@ impl Room {
                 return;
             }
 
-            if let Some(t) = send_time {
+            if let (false, Some(t)) = (in_lockstep, send_time) {
                 let elapsed = now.duration_since(t);
                 if elapsed.as_millis() > u128::from(deadline_ms) {
                     let err = protocol::error_msg(
@@ -4244,5 +4206,255 @@ mod tests {
             AdminServerMsg::State(state) => assert_eq!(state.bots.len(), 1),
             other => panic!("expected State, got {other:?}"),
         }
+    }
+
+    // ----- F-08: powerup_activated events are anonymized like contacts -----
+
+    fn cmd_activate(tick: u64, powerup: PowerupId) -> PendingCommand {
+        PendingCommand {
+            tick,
+            throttle: 0.0,
+            rudder: 0.0,
+            sensor_mode: SensorMode::Passive,
+            fire: None,
+            activate_powerup: Some(powerup),
+        }
+    }
+
+    /// Pull the next `Tick` frame off a bot's outbound queue, skipping any other frames.
+    fn next_tick(reg: &mut BotRegistration) -> ServerMsg {
+        while let Ok(msg) = reg.outbound.try_recv() {
+            if matches!(msg, ServerMsg::Tick { .. }) {
+                return msg;
+            }
+        }
+        panic!("no tick frame queued");
+    }
+
+    #[test]
+    fn powerup_activation_event_uses_anonymized_contact_id_not_ship_id() {
+        let mut room = test_room();
+        let mut a = connect(&mut room, "a").expect("a");
+        let mut b = connect(&mut room, "b").expect("b");
+        let _ = a.outbound.try_recv();
+        let _ = b.outbound.try_recv();
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: a.bot_id.clone(),
+            powerups: vec![PowerupId::Overdrive, PowerupId::RapidFire],
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: a.bot_id.clone(),
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: b.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        while a.outbound.try_recv().is_ok() {}
+        while b.outbound.try_recv().is_ok() {}
+
+        // A and B within active radar range (200u); B sweeps actively so it sees A.
+        room.world.ships.get_mut(&a.ship_id).unwrap().pos = Vec2::new(400.0, 500.0);
+        room.world.ships.get_mut(&b.ship_id).unwrap().pos = Vec2::new(600.0, 500.0);
+        room.bots.get_mut(&b.bot_id).unwrap().sensor_mode = SensorMode::Active;
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: a.bot_id.clone(),
+            command: cmd_activate(0, PowerupId::Overdrive),
+        });
+        room.step_tick();
+
+        // B's frame: exactly one activation event, carrying an anonymized contact id that
+        // also appears in B's contacts — never A's ground-truth ship id.
+        let ServerMsg::Tick {
+            contacts, events, ..
+        } = next_tick(&mut b)
+        else {
+            panic!("expected Tick for b");
+        };
+        let activated: Vec<(Option<String>, PowerupId)> = events
+            .iter()
+            .filter_map(|e| match e {
+                TickEvent::PowerupActivated {
+                    contact_id,
+                    powerup,
+                } => Some((contact_id.clone(), *powerup)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activated.len(), 1, "B should see exactly one activation");
+        let (contact_id, powerup) = &activated[0];
+        assert_eq!(*powerup, PowerupId::Overdrive);
+        let cid = contact_id
+            .as_ref()
+            .expect("an enemy activation must carry a contact id");
+        assert_ne!(
+            cid, &a.ship_id,
+            "the event must never leak the ground-truth ship id"
+        );
+        assert!(
+            contacts.iter().any(|c| &c.id == cid),
+            "contact_id {cid} must match a contact B actually sees this tick",
+        );
+
+        // A's own frame: activation confirmed with no contact id (you aren't your own contact).
+        let ServerMsg::Tick { events, .. } = next_tick(&mut a) else {
+            panic!("expected Tick for a");
+        };
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TickEvent::PowerupActivated { contact_id: None, powerup }
+                    if *powerup == PowerupId::Overdrive
+            )),
+            "A should receive its own activation with contact_id None",
+        );
+    }
+
+    #[test]
+    fn empd_victim_status_does_not_show_own_emp_burst_active() {
+        // F-12: a victim holding an unused emp_burst that gets EMP'd must not report its own
+        // powerup as active in powerup_status, while the debuff (radar blackout) still applies.
+        let mut room = test_room();
+        let mut atk = connect(&mut room, "atk").expect("atk");
+        let mut vic = connect(&mut room, "vic").expect("vic");
+        let _ = atk.outbound.try_recv();
+        let _ = vic.outbound.try_recv();
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: atk.bot_id.clone(),
+            powerups: vec![PowerupId::EmpBurst, PowerupId::Overdrive],
+        });
+        // The victim also holds an unused emp_burst — the exact conflation scenario.
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: vic.bot_id.clone(),
+            powerups: vec![PowerupId::EmpBurst, PowerupId::Overdrive],
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: atk.bot_id.clone(),
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: vic.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        while atk.outbound.try_recv().is_ok() {}
+        while vic.outbound.try_recv().is_ok() {}
+
+        // Within emp_burst_radius (130u); attacker fires its EMP.
+        room.world.ships.get_mut(&atk.ship_id).unwrap().pos = Vec2::new(500.0, 500.0);
+        room.world.ships.get_mut(&vic.ship_id).unwrap().pos = Vec2::new(540.0, 500.0);
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: atk.bot_id.clone(),
+            command: cmd_activate(0, PowerupId::EmpBurst),
+        });
+        room.step_tick();
+
+        // Victim's own emp_burst reads used:false with no active window, despite being EMP'd.
+        let ServerMsg::Tick { self_state, .. } = next_tick(&mut vic) else {
+            panic!("expected Tick for victim");
+        };
+        let vic_emp = self_state
+            .powerup_status
+            .iter()
+            .find(|p| p.id == PowerupId::EmpBurst)
+            .expect("victim's emp_burst in status");
+        assert!(!vic_emp.used, "victim never activated its own emp_burst");
+        assert_eq!(
+            vic_emp.active_ticks_left, 0,
+            "victim's own emp_burst must not read as active just because it was EMP'd",
+        );
+        // The debuff itself is in effect (active-radar blackout window).
+        assert!(room
+            .world
+            .ships
+            .get(&vic.ship_id)
+            .unwrap()
+            .powerups
+            .is_emp_debuffed(room.world.tick));
+
+        // Attacker's own status: emp_burst used, with an active countdown.
+        let ServerMsg::Tick { self_state, .. } = next_tick(&mut atk) else {
+            panic!("expected Tick for attacker");
+        };
+        let atk_emp = self_state
+            .powerup_status
+            .iter()
+            .find(|p| p.id == PowerupId::EmpBurst)
+            .expect("attacker's emp_burst in status");
+        assert!(atk_emp.used, "attacker activated its emp_burst");
+        assert!(
+            atk_emp.active_ticks_left > 0,
+            "attacker's own emp_burst should report an active countdown",
+        );
+    }
+
+    #[test]
+    fn powerup_activation_not_revealed_when_target_outside_actual_sweep() {
+        // The pre-fix visibility gate was a parallel reimplementation *stronger* than the
+        // real sensor model: it treated AWACS as a hard counter to silent_running, so a
+        // silent runner between base and doubled radar range leaked activation events even
+        // though the actual sweep returned no contact. Now the event is gated on the real
+        // sweep result, so it stays hidden.
+        let mut room = test_room();
+        let mut a = connect(&mut room, "a").expect("a");
+        let mut b = connect(&mut room, "b").expect("b");
+        let _ = a.outbound.try_recv();
+        let _ = b.outbound.try_recv();
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: a.bot_id.clone(),
+            powerups: vec![PowerupId::SilentRunning, PowerupId::Overdrive],
+        });
+        room.handle_event(RoomEvent::BotSelectPowerups {
+            bot_id: b.bot_id.clone(),
+            powerups: vec![PowerupId::AwacsScan, PowerupId::RapidFire],
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: a.bot_id.clone(),
+        });
+        room.handle_event(RoomEvent::BotReady {
+            bot_id: b.bot_id.clone(),
+        });
+        start(&mut room, "test").expect("start");
+        while a.outbound.try_recv().is_ok() {}
+        while b.outbound.try_recv().is_ok() {}
+
+        // A silent-running at 500u from B (beyond base 350u, inside the AWACS-doubled 700u).
+        // The soft counter only surfaces a silent runner inside base range → no contact.
+        room.world.ships.get_mut(&a.ship_id).unwrap().pos = Vec2::new(100.0, 500.0);
+        room.world.ships.get_mut(&b.ship_id).unwrap().pos = Vec2::new(600.0, 500.0);
+        room.world
+            .ships
+            .get_mut(&a.ship_id)
+            .unwrap()
+            .powerups
+            .silent_running_expires_at = 1000;
+        room.world
+            .ships
+            .get_mut(&b.ship_id)
+            .unwrap()
+            .powerups
+            .awacs_expires_at = 1000;
+        room.bots.get_mut(&b.bot_id).unwrap().sensor_mode = SensorMode::Active;
+
+        room.handle_event(RoomEvent::BotCommand {
+            bot_id: a.bot_id.clone(),
+            command: cmd_activate(0, PowerupId::Overdrive),
+        });
+        room.step_tick();
+
+        let ServerMsg::Tick {
+            contacts, events, ..
+        } = next_tick(&mut b)
+        else {
+            panic!("expected Tick for b");
+        };
+        assert!(
+            !contacts.iter().any(|c| c.id.starts_with("c_")),
+            "silent runner beyond base range must not be a sweep contact: {contacts:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TickEvent::PowerupActivated { .. })),
+            "B must not receive an activation for a target outside its actual sweep",
+        );
     }
 }

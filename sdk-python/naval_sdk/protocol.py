@@ -204,10 +204,13 @@ class ShellSplashEvent:
 @dataclass(frozen=True)
 class PowerupActivatedEvent:
     """Reported when a ship activates a powerup. Always emitted for the bot's own
-    activations; emitted for other bots only when the activating ship is currently a
-    sensor contact."""
+    activations (``contact_id`` is ``None`` — you are not a contact to yourself); emitted
+    for another ship only when that ship shows up in this bot's sensor sweep this tick, in
+    which case ``contact_id`` is the same per-tick anonymized ``c_<n>`` id it appears under
+    in ``contacts``. Never the ground-truth ship id — the event is re-anonymized every
+    tick, so it can't be used to track a specific opponent across ticks."""
 
-    ship_id: str
+    contact_id: Optional[str]
     powerup: str
 
 
@@ -223,8 +226,9 @@ def _parse_event(d: Dict[str, Any]) -> TickEvent:
             pos = d["pos"]
             return ShellSplashEvent(pos=(float(pos[0]), float(pos[1])))
         if kind == "powerup_activated":
+            raw_contact = d.get("contact_id")
             return PowerupActivatedEvent(
-                ship_id=str(d["ship_id"]),
+                contact_id=None if raw_contact is None else str(raw_contact),
                 powerup=str(d["powerup"]),
             )
     except (AttributeError, KeyError, IndexError, TypeError, ValueError):

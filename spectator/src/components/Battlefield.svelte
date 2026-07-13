@@ -6,7 +6,7 @@
   import { draw, type Splash } from '../lib/renderer';
   import { fitCanvas } from '../lib/canvas';
   import { room } from '../stores/admin';
-  import { MAP_WIDTH, MAP_HEIGHT, MAX_HP } from '../lib/constants';
+  import { MAP_WIDTH, MAP_HEIGHT, MAX_HP, ACTIVE_RADAR_RANGE } from '../lib/constants';
   import type { WorldFrame } from '../types/protocol';
 
   let canvas: HTMLCanvasElement | null = $state(null);
@@ -22,9 +22,21 @@
   const unsubSplashes = splashes.subscribe((v) => (currentSplashes = v));
 
   // HP-bar scale follows the match's configured hull when known, so the canvas
-  // matches the BotCard meters instead of assuming a fixed 100-HP hull.
+  // matches the BotCard meters instead of assuming a fixed 100-HP hull. Map size follows
+  // the room's actual `--map WxH` (default 700×700) so bounds and the letterbox transform
+  // are correct on any map — the constants are only a pre-first-fetch fallback.
   let currentMaxHp = MAX_HP;
-  const unsubRoom = room.subscribe((r) => (currentMaxHp = r?.config?.hull_hp ?? MAX_HP));
+  let currentMapW = MAP_WIDTH;
+  let currentMapH = MAP_HEIGHT;
+  // Radar-ring radius follows the operator-tunable `active_radar_range` so the drawn ring
+  // matches what bots can actually see; the constant is only a pre-first-fetch fallback.
+  let currentRadarRange = ACTIVE_RADAR_RANGE;
+  const unsubRoom = room.subscribe((r) => {
+    currentMaxHp = r?.config?.hull_hp ?? MAX_HP;
+    currentMapW = r?.map?.width ?? MAP_WIDTH;
+    currentMapH = r?.map?.height ?? MAP_HEIGHT;
+    currentRadarRange = r?.config?.active_radar_range ?? ACTIVE_RADAR_RANGE;
+  });
 
   // View toggle changes the canvas's CSS size; the pixel buffer must be re-synced AFTER
   // the layout settles. `await sveltetick()` defers to the next microtask once Svelte
@@ -50,7 +62,16 @@
 
     const loop = (): void => {
       rafId = requestAnimationFrame(loop);
-      draw(ctx, currentFrame, currentSplashes, performance.now(), MAP_WIDTH, MAP_HEIGHT, currentMaxHp);
+      draw(
+        ctx,
+        currentFrame,
+        currentSplashes,
+        performance.now(),
+        currentMapW,
+        currentMapH,
+        currentMaxHp,
+        currentRadarRange,
+      );
     };
     rafId = requestAnimationFrame(loop);
   });

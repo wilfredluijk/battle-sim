@@ -344,6 +344,9 @@ struct RoomResponse {
     #[serde(flatten)]
     state: AdminState,
     config: SimConfig,
+    /// Arena dimensions in world units (from `--map WxH`; default 700×700). Additive field —
+    /// the live spectator view reads it to size its bounds/letterbox instead of hardcoding.
+    map: protocol::MapInfo,
 }
 
 /// Public: current room state plus the active balance parameters. Drives both the
@@ -353,6 +356,7 @@ async fn get_room(State(state): State<AppState>) -> Result<Json<RoomResponse>, A
     Ok(Json(RoomResponse {
         state: snap.state,
         config: snap.config,
+        map: snap.map,
     }))
 }
 
@@ -609,6 +613,9 @@ fn map_replay_error(e: replay::ReplayError) -> ApiError {
             "unknown_bot",
             format!("replay has no bot `{id}`"),
         ),
+        ReplayError::Corrupt(msg) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_replay", msg)
+        }
     }
 }
 

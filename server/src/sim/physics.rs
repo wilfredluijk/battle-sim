@@ -60,8 +60,12 @@ pub fn step_ship(ship: &mut Ship, config: &SimConfig, width: f32, height: f32, t
 
     // 2. Heading: turn rate scales linearly with |speed| / max_forward. We use the
     //    (possibly boosted) max_forward so the linear-with-speed curve still tops out at
-    //    `turn_rate_max` when the ship is at its (boosted) top speed.
-    let turn_rate = turn_rate_max * ship.rudder * (ship.speed.abs() / max_forward);
+    //    `turn_rate_max` when the ship is at its (boosted) top speed. Clamp the ratio to
+    //    1.0: when Overdrive *expires* the ship can still be moving faster than the now-lower
+    //    max_forward for a few ticks, which without the clamp yields a turn rate above
+    //    `turn_rate_max` (an exploitable "super-turn on expiry").
+    let speed_ratio = (ship.speed.abs() / max_forward).min(1.0);
+    let turn_rate = turn_rate_max * ship.rudder * speed_ratio;
     ship.heading_deg = wrap_deg(ship.heading_deg + turn_rate * DT);
 
     // 3. Position: advance along heading vector.
@@ -164,6 +168,26 @@ mod tests {
         assert!(
             (delta - expected).abs() < 1e-4,
             "heading delta = {delta}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn over_speed_ship_does_not_super_turn() {
+        // F-09: after Overdrive expires the ship can still be moving faster than the now
+        // un-boosted max_forward for several ticks. The turn-rate ratio must clamp to 1.0 so
+        // the ship turns at most `turn_rate_max`, never faster (the "super-turn on expiry").
+        let cfg = SimConfig::default();
+        let mut s = ship_at(Vec2::new(500.0, 500.0), 0.0);
+        s.speed = cfg.max_forward_speed * 1.6; // e.g. 14.4 vs base 9.0
+        s.throttle = 1.0; // still commanding full ahead
+        s.rudder = 1.0;
+        let h0 = s.heading_deg;
+        step_ship(&mut s, &cfg, W, H, 0);
+        let delta = s.heading_deg - h0;
+        let expected = constants::TURN_RATE_DEG_PER_S * constants::DT;
+        assert!(
+            (delta - expected).abs() < 1e-4,
+            "over-speed ship turned {delta}, expected exactly {expected} (no super-turn)",
         );
     }
 

@@ -6,7 +6,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fitCanvas } from '../lib/canvas';
   import { draw, drawPerspective } from '../lib/renderer';
-  import { MAX_HP } from '../lib/constants';
+  import { MAX_HP, ACTIVE_RADAR_RANGE } from '../lib/constants';
   import {
     replayData,
     replayPerspective,
@@ -39,12 +39,17 @@
     const mapW = data.header.map.width;
     const mapH = data.header.map.height;
     const maxHp = data.header.sim_config?.hull_hp ?? MAX_HP;
+    // Radar ring follows the tunable range recorded in the replay header, not a hardcode.
+    const radarRange = data.header.sim_config?.active_radar_range ?? ACTIVE_RADAR_RANGE;
     const frame = data.frames[Math.max(0, Math.min(tick, data.frames.length - 1))] ?? null;
 
-    if (perspective === 'overall' || !perspectiveData) {
+    // Draw ground truth unless we have perspective data for the *currently selected* bot.
+    // Guarding on bot_id means a stale timeline (a slow fetch that resolved after the
+    // selector moved) never gets paired with a different bot's ship.
+    if (perspective === 'overall' || !perspectiveData || perspectiveData.bot_id !== perspective) {
       // Replay frames are drawn directly (no splash interpolation, which assumes
       // monotonic time and would misbehave on a slider seek).
-      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp);
+      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp, radarRange);
       return;
     }
 
@@ -55,7 +60,7 @@
       perspectiveData.frames[
         Math.max(0, Math.min(tick, perspectiveData.frames.length - 1))
       ];
-    drawPerspective(ctx, ownShip, pf?.contacts ?? [], mapW, mapH, maxHp);
+    drawPerspective(ctx, ownShip, pf?.contacts ?? [], mapW, mapH, maxHp, radarRange);
   }
 
   onMount(() => {

@@ -207,12 +207,16 @@ pub enum TickEvent {
     ShellSplash {
         pos: Pos,
     },
-    /// A powerup was activated. Sent to the activating bot for any activation, and to
-    /// other bots only if the activating ship is currently a sensor contact (subject to
-    /// the same filtering as ship contacts). Counter-battery trace reveals come in via
-    /// regular `contacts`, not this event.
+    /// A powerup was activated. Sent to the activating bot for every own activation
+    /// (`contact_id` is `null` — you are not a contact to yourself), and to other bots
+    /// only when the activating ship actually appeared in that viewer's sensor sweep this
+    /// tick — tagged with the same per-tick anonymized `c_<n>` contact id the bot sees in
+    /// `contacts`. Never carries a ground-truth `ship_id`: like contacts, the event is
+    /// re-anonymized every tick so a bot can't track a specific opponent across ticks.
+    /// Counter-battery trace reveals come in via regular `contacts`, not this event.
     PowerupActivated {
-        ship_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        contact_id: Option<String>,
         powerup: PowerupId,
     },
 }

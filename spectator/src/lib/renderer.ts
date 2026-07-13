@@ -37,6 +37,7 @@ export function draw(
   mapW: number = MAP_WIDTH,
   mapH: number = MAP_HEIGHT,
   maxHp: number = MAX_HP,
+  radarRange: number = ACTIVE_RADAR_RANGE,
 ): void {
   const canvas = ctx.canvas;
   const w = canvas.width;
@@ -58,7 +59,7 @@ export function draw(
   for (const ship of latest.ships) {
     if (!ship.alive || ship.sensor_mode !== 'active') continue;
     ctx.beginPath();
-    ctx.arc(ship.pos[0], ship.pos[1], ACTIVE_RADAR_RANGE, 0, Math.PI * 2);
+    ctx.arc(ship.pos[0], ship.pos[1], radarRange, 0, Math.PI * 2);
     const col = colorFor(ship.bot_name);
     ctx.fillStyle = withAlpha(col, 0.06);
     ctx.fill();
@@ -278,6 +279,7 @@ export function drawPerspective(
   mapW: number = MAP_WIDTH,
   mapH: number = MAP_HEIGHT,
   maxHp: number = MAX_HP,
+  radarRange: number = ACTIVE_RADAR_RANGE,
 ): void {
   const canvas = ctx.canvas;
   const w = canvas.width;
@@ -298,7 +300,7 @@ export function drawPerspective(
   if (ownShip.alive && ownShip.sensor_mode === 'active') {
     const col = colorFor(ownShip.bot_name);
     ctx.beginPath();
-    ctx.arc(ownShip.pos[0], ownShip.pos[1], ACTIVE_RADAR_RANGE, 0, Math.PI * 2);
+    ctx.arc(ownShip.pos[0], ownShip.pos[1], radarRange, 0, Math.PI * 2);
     ctx.fillStyle = withAlpha(col, 0.06);
     ctx.fill();
     ctx.strokeStyle = withAlpha(col, 0.3);

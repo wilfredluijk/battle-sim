@@ -90,6 +90,12 @@ export interface AdminBotInfo {
 /** Balance parameters — a flat map of `SimConfig` keys to numbers. */
 export type SimConfig = Record<string, number>;
 
+/** Arena dimensions in world units (`GET /api/room` → `map`, replay header `map`). */
+export interface MapInfo {
+  width: number;
+  height: number;
+}
+
 /** Response shape of `GET /api/room`: room lifecycle state plus the active parameters. */
 export interface RoomInfo {
   room: string;
@@ -98,6 +104,8 @@ export interface RoomInfo {
   last_winner?: string | null;
   bots: AdminBotInfo[];
   config: SimConfig;
+  /** Arena size in world units. Set via `--map WxH` (default 700×700), not part of `config`. */
+  map?: MapInfo;
 }
 
 /** One tunable's metadata from `GET /api/config/schema`. */
@@ -157,7 +165,10 @@ export interface Contact {
 /** A bot-facing combat event — the filtered form, distinct from the spectator `TickEvent`. */
 export type BotTickEvent =
   | { type: 'hit'; amount: number }
-  | { type: 'shell_splash'; pos: [number, number] };
+  | { type: 'shell_splash'; pos: [number, number] }
+  // Anonymized: `contact_id` is the per-tick `c_<n>` id the activating ship appears under in
+  // this frame's `contacts`, or absent for the viewer's own activation. Never a ship_id.
+  | { type: 'powerup_activated'; contact_id?: string; powerup: string };
 
 /** One bot in a replay header. */
 export interface ReplayBotInfo {

@@ -130,10 +130,18 @@ pub struct PowerupState {
     pub trace_reveal_until: u64,
     /// Ship that last hit this one during the armed window. Drives the reveal track.
     pub trace_attacker: Option<ShipId>,
-    /// EMP slow window. While `world.tick < emp_expires_at`, the ship's gun cooldown is
-    /// multiplied by `emp_gun_cooldown_mult` (stacks with rapid_fire) and active radar
-    /// returns no contacts (passive sensors still work).
-    pub emp_expires_at: u64,
+    /// EMP *debuff* window: this ship has been hit by an enemy `EmpBurst`. While
+    /// `world.tick < emp_debuff_until`, the ship's gun cooldown is multiplied by
+    /// `emp_gun_cooldown_mult` (stacks with rapid_fire) and its active radar returns no
+    /// contacts (passive sensors still work). This is a state *inflicted by an opponent* —
+    /// deliberately distinct from `emp_self_expires_at` so a victim's `powerup_status` never
+    /// reports its own (unused) `emp_burst` as active just because it got EMP'd.
+    pub emp_debuff_until: u64,
+    /// This ship's *own* `EmpBurst` activation window, used only for `powerup_status`
+    /// reporting (so the activator sees a countdown like every other powerup). `EmpBurst` is
+    /// offensive — it debuffs enemies, not the caster — so this window has no gameplay effect
+    /// on the caster; the debuff lives in `emp_debuff_until` on each target.
+    pub emp_self_expires_at: u64,
 }
 
 impl PowerupState {
@@ -153,7 +161,8 @@ impl PowerupState {
         self.trace_armed_until = 0;
         self.trace_reveal_until = 0;
         self.trace_attacker = None;
-        self.emp_expires_at = 0;
+        self.emp_debuff_until = 0;
+        self.emp_self_expires_at = 0;
     }
 
     /// Whether `id` is currently active for this ship at `tick`.
@@ -168,13 +177,22 @@ impl PowerupState {
             PowerupId::AwacsScan => self.awacs_expires_at,
             PowerupId::SilentRunning => self.silent_running_expires_at,
             PowerupId::CounterBatteryTrace => self.trace_armed_until,
-            PowerupId::EmpBurst => self.emp_expires_at,
+            // The *own-activation* window (not the enemy-inflicted debuff, which lives in
+            // `emp_debuff_until` and is read via `is_emp_debuffed`).
+            PowerupId::EmpBurst => self.emp_self_expires_at,
             // Smoke screen / decoy flare are world-level, not ship-level — they're "active"
             // for the activating bot's purposes once placed, but the live entity lives on
             // World, not Ship. The room reads them off the world when building tick state.
             PowerupId::SmokeScreen | PowerupId::DecoyFlare => 0,
         };
         expires > tick
+    }
+
+    /// Whether this ship is currently EMP-*debuffed* by an enemy `EmpBurst` at `tick`. This
+    /// is the gameplay effect (gun-cooldown penalty + active-radar blackout); it is separate
+    /// from `is_active(EmpBurst, …)`, which reports the ship's *own* powerup for status.
+    pub fn is_emp_debuffed(&self, tick: u64) -> bool {
+        self.emp_debuff_until > tick
     }
 
     /// Ticks remaining until `id` expires, or `0` if not active.
@@ -189,7 +207,7 @@ impl PowerupState {
             PowerupId::AwacsScan => self.awacs_expires_at,
             PowerupId::SilentRunning => self.silent_running_expires_at,
             PowerupId::CounterBatteryTrace => self.trace_armed_until,
-            PowerupId::EmpBurst => self.emp_expires_at,
+            PowerupId::EmpBurst => self.emp_self_expires_at,
             PowerupId::SmokeScreen | PowerupId::DecoyFlare => 0,
         };
         if expires > tick {
@@ -290,10 +308,16 @@ pub fn activate(
             let emp_expires = tick + config.emp_burst_duration_ticks as u64;
             for target in &targets {
                 if let Some(target_ship) = world.ships.get_mut(target) {
-                    if target_ship.powerups.emp_expires_at < emp_expires {
-                        target_ship.powerups.emp_expires_at = emp_expires;
+                    // Inflict the debuff on the *target*, never the caster.
+                    if target_ship.powerups.emp_debuff_until < emp_expires {
+                        target_ship.powerups.emp_debuff_until = emp_expires;
                     }
                 }
+            }
+            // Record the caster's own activation window purely for `powerup_status` (the
+            // caster is never EMP-debuffed by its own burst).
+            if let Some(caster) = world.ships.get_mut(ship_id) {
+                caster.powerups.emp_self_expires_at = emp_expires;
             }
         }
         PowerupId::SmokeScreen => {
@@ -459,7 +483,7 @@ pub fn effective_gun_cooldown_ticks(
     if state.is_active(PowerupId::RapidFire, tick) {
         effective *= config.rapid_fire_cooldown_mult;
     }
-    if state.is_active(PowerupId::EmpBurst, tick) {
+    if state.is_emp_debuffed(tick) {
         effective *= config.emp_gun_cooldown_mult;
     }
     let rounded = effective.round() as i64;
@@ -635,10 +659,38 @@ mod tests {
         )
         .expect("activate");
         let dur = world.config.powerups.emp_burst_duration_ticks as u64;
-        assert_eq!(world.ships.get("s_2").unwrap().powerups.emp_expires_at, dur);
-        assert_eq!(world.ships.get("s_3").unwrap().powerups.emp_expires_at, 0);
-        // Activator does not EMP itself.
-        assert_eq!(world.ships.get("s_1").unwrap().powerups.emp_expires_at, 0);
+        // In-range enemy is debuffed; out-of-range enemy is not.
+        assert_eq!(
+            world.ships.get("s_2").unwrap().powerups.emp_debuff_until,
+            dur
+        );
+        assert_eq!(world.ships.get("s_3").unwrap().powerups.emp_debuff_until, 0);
+        // Activator does not debuff itself...
+        assert_eq!(world.ships.get("s_1").unwrap().powerups.emp_debuff_until, 0);
+        assert!(!world.ships.get("s_1").unwrap().powerups.is_emp_debuffed(0));
+        // ...but records its own activation window for status reporting.
+        assert_eq!(
+            world.ships.get("s_1").unwrap().powerups.emp_self_expires_at,
+            dur
+        );
+    }
+
+    #[test]
+    fn emp_debuff_does_not_mark_victims_own_powerup_active() {
+        // F-12: a victim holding an *unused* emp_burst that gets EMP'd must not report its own
+        // powerup as active. The debuff (radar/gun) reads emp_debuff_until; powerup_status
+        // reads is_active(EmpBurst)/ticks_remaining which key off emp_self_expires_at.
+        let mut victim = ship_with_loadout("s_v", &[PowerupId::EmpBurst, PowerupId::Overdrive]);
+        victim.powerups.emp_debuff_until = 40; // hit by an enemy EMP through tick 40
+                                               // The victim never activated its own emp_burst.
+        assert_eq!(victim.powerups.emp_self_expires_at, 0);
+        // Own powerup reporting: not active, no ticks remaining.
+        assert!(!victim.powerups.is_active(PowerupId::EmpBurst, 0));
+        assert_eq!(victim.powerups.ticks_remaining(PowerupId::EmpBurst, 0), 0);
+        // But the debuff is in effect (radar blackout / gun penalty).
+        assert!(victim.powerups.is_emp_debuffed(0));
+        assert!(victim.powerups.is_emp_debuffed(39));
+        assert!(!victim.powerups.is_emp_debuffed(40));
     }
 
     #[test]
@@ -724,9 +776,10 @@ mod tests {
         let cfg = PowerupConfig::default();
         let state = PowerupState {
             selected: vec![PowerupId::RapidFire, PowerupId::EmpBurst],
-            // Activate both effects "by hand" to test the cooldown helper in isolation.
+            // Activate rapid_fire and inflict an EMP debuff "by hand" to test the cooldown
+            // helper in isolation (the gun penalty keys off the debuff window).
             rapid_fire_expires_at: 100,
-            emp_expires_at: 100,
+            emp_debuff_until: 100,
             ..Default::default()
         };
         let base = 15;

@@ -16,10 +16,11 @@
 //! deserialized.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,14 @@ use crate::sim::{PowerupId, SimConfig};
 /// diverged from the recorded `End`. v4 and older logs simply carry no `Disconnect` records
 /// (a match where nobody dropped), so they still load and replay identically.
 pub const REPLAY_FORMAT_VERSION: u32 = 5;
+
+/// Hard ceiling on how many ticks a single replay record may advance the re-simulation.
+/// A real match ends at `MATCH_TIMEOUT_TICKS` (3000) plus a few post-end ticks; this bound
+/// is far above that but stops a truncated/corrupt log whose record claims an absurd tick
+/// (e.g. `10^12`) from stepping the world forever and allocating one frame per tick — a hung
+/// `spawn_blocking` thread and OOM triggered by a merely corrupt on-disk file. Exceeding it
+/// surfaces as [`ReplayError::Corrupt`] (HTTP 422), never a 500.
+pub const MAX_REPLAY_TICKS: u64 = 1_000_000;
 
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
@@ -219,15 +228,41 @@ impl std::fmt::Debug for ReplayWriter {
 
 impl ReplayWriter {
     /// Open `<dir>/<replay_id>.jsonl` for writing, creating the directory tree if needed.
+    ///
+    /// Opens with `create_new` so an existing file is **never truncated** — if
+    /// `<replay_id>.jsonl` already exists (a same-second id collision that slipped past the
+    /// monotonic counter, or a stale file on disk), it retries with `_2`, `_3`, … suffixes
+    /// and adopts the disambiguated id so downstream references (e.g. `game_over.replay_id`)
+    /// point at the file that was actually written.
     pub fn create_file(dir: &Path, replay_id: String) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{replay_id}.jsonl"));
-        let file = File::create(&path)?;
-        Ok(Self {
-            sink: Box::new(BufWriter::new(file)),
-            replay_id,
-            path: Some(path),
-        })
+        // A handful of retries is plenty: `make_replay_id`'s per-process counter already
+        // guarantees uniqueness for ids minted this run; this only guards against files left
+        // on disk by a previous process.
+        const MAX_SUFFIX: u32 = 1000;
+        for attempt in 1..=MAX_SUFFIX {
+            let candidate_id = if attempt == 1 {
+                replay_id.clone()
+            } else {
+                format!("{replay_id}_{attempt}")
+            };
+            let path = dir.join(format!("{candidate_id}.jsonl"));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        sink: Box::new(BufWriter::new(file)),
+                        replay_id: candidate_id,
+                        path: Some(path),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("could not find a free replay filename for `{replay_id}` after {MAX_SUFFIX} attempts"),
+        ))
     }
 
     /// Build a writer whose output is captured in a shared `Vec<u8>`. Returns the writer
@@ -328,15 +363,23 @@ pub fn read_records_from<R: BufRead>(reader: R) -> io::Result<Vec<ReplayRecord>>
     Ok(out)
 }
 
-/// Generate a replay identifier of the form `match_<room>_<unix_secs>`. The unix timestamp
-/// is a wall-clock read, so this MUST NOT be called inside the simulation — it's strictly
-/// for naming the file we're about to write.
+/// Per-process monotonic counter appended to every non-MC replay id so two matches started
+/// within the same wall-clock second still get distinct ids (and therefore distinct files).
+static REPLAY_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a replay identifier of the form `match_<room>_<unix_secs>_<seq>`. The unix
+/// timestamp is a wall-clock read, so this MUST NOT be called inside the simulation — it's
+/// strictly for naming the file we're about to write. `<seq>` is a per-process monotonic
+/// counter: 1-second timestamp resolution alone collides when a match is started, aborted,
+/// reset, and restarted inside one second (trivial via the REST API), and `create_file`
+/// would then truncate the earlier match's log. The counter makes ids unique regardless.
 pub fn make_replay_id(room: &str) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("match_{room}_{secs}")
+    let seq = REPLAY_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("match_{room}_{secs}_{seq}")
 }
 
 /// A bot's id paired with the receiver for the frames the room sends it.
@@ -467,6 +510,10 @@ pub enum ReplayError {
     Version(u32),
     /// A perspective capture named a bot id absent from the replay header.
     UnknownBot(String),
+    /// A tick/end/disconnect record references a tick so far ahead that re-simulating to it
+    /// would step the world past [`MAX_REPLAY_TICKS`] — a truncated or corrupt on-disk log,
+    /// not a real match. Reported as a 422, never a hung thread + OOM.
+    Corrupt(String),
 }
 
 impl std::fmt::Display for ReplayError {
@@ -482,6 +529,7 @@ impl std::fmt::Display for ReplayError {
             ReplayError::UnknownBot(id) => {
                 write!(f, "replay has no bot with id `{id}`")
             }
+            ReplayError::Corrupt(msg) => write!(f, "corrupt replay: {msg}"),
         }
     }
 }
@@ -514,7 +562,8 @@ fn advance_and_inject(
     target_tick: u64,
     commands: &[ReplayCommand],
     mut after_step: impl FnMut(&mut Room),
-) {
+) -> Result<(), ReplayError> {
+    guard_replay_target(room.world.tick, target_tick)?;
     // Step every empty tick that precedes the one the commands belong to. The `+ 1` form
     // avoids the underflow a bare `target_tick - 1` would hit on a corrupt `tick: 0` record.
     while room.world.tick + 1 < target_tick {
@@ -541,16 +590,39 @@ fn advance_and_inject(
         room.step_tick();
         after_step(room);
     }
+    Ok(())
 }
 
 /// Step `room` forward until `world.tick == target_tick`, running `after_step` after each
 /// step. Shared by the `End` and `Disconnect` record handlers (which advance the world but
 /// inject no commands) across all three replay drivers, so their timing stays in lockstep.
-fn advance_to(room: &mut Room, target_tick: u64, mut after_step: impl FnMut(&mut Room)) {
+fn advance_to(
+    room: &mut Room,
+    target_tick: u64,
+    mut after_step: impl FnMut(&mut Room),
+) -> Result<(), ReplayError> {
+    guard_replay_target(room.world.tick, target_tick)?;
     while room.world.tick < target_tick {
         room.step_tick();
         after_step(room);
     }
+    Ok(())
+}
+
+/// Reject a replay record whose target tick would step the world more than
+/// [`MAX_REPLAY_TICKS`] forward from where it is now. The endpoints re-simulate the whole
+/// match per request and allocate one frame per tick, so a corrupt log claiming
+/// `tick: 10^12` would otherwise hang a `spawn_blocking` thread and OOM. Only forward
+/// distance matters; already-reached/duplicate ticks are handled by the loop guards.
+fn guard_replay_target(current_tick: u64, target_tick: u64) -> Result<(), ReplayError> {
+    if target_tick.saturating_sub(current_tick) > MAX_REPLAY_TICKS {
+        return Err(ReplayError::Corrupt(format!(
+            "record targets tick {target_tick}, {} ticks past the current tick {current_tick}; \
+             exceeds the {MAX_REPLAY_TICKS}-tick sanity cap",
+            target_tick.saturating_sub(current_tick),
+        )));
+    }
+    Ok(())
 }
 
 /// Drive a replay end-to-end: read the file, rebuild the room, then tick at the recorded
@@ -604,18 +676,16 @@ pub async fn run_replay(
                 let next = iter.next();
                 match next {
                     Some(ReplayRecord::Tick(rec)) => {
-                        advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {});
+                        advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {})?;
                     }
                     Some(ReplayRecord::Disconnect(rec)) => {
-                        advance_to(&mut room, rec.tick, |_| {});
+                        advance_to(&mut room, rec.tick, |_| {})?;
                         room.remove_bot_and_ship(&rec.bot_id);
                     }
                     Some(ReplayRecord::End(end)) => {
                         // Run remaining ticks (if any) so the spectator sees the final
                         // state at the same world.tick the live run reached.
-                        while room.world.tick < end.tick {
-                            room.step_tick();
-                        }
+                        advance_to(&mut room, end.tick, |_| {})?;
                         info!(final_tick = end.tick, winner = ?end.winner, "replay finished");
                         break;
                     }
@@ -673,18 +743,18 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
             ReplayRecord::Tick(rec) => {
                 advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                })?;
             }
             ReplayRecord::Disconnect(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                })?;
                 room.remove_bot_and_ship(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                })?;
                 end = Some(rec);
                 break;
             }
@@ -753,18 +823,18 @@ pub fn capture_perspective(
             ReplayRecord::Tick(rec) => {
                 advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                })?;
             }
             ReplayRecord::Disconnect(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                })?;
                 room.remove_bot_and_ship(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                })?;
                 break;
             }
             ReplayRecord::Header(_) => {
@@ -1065,6 +1135,58 @@ mod tests {
     }
 
     #[test]
+    fn make_replay_id_is_unique_within_the_same_second() {
+        // F-10: two ids minted back-to-back (same wall-clock second) must differ, so the
+        // second match's log can't truncate the first's.
+        let a = make_replay_id("main");
+        let b = make_replay_id("main");
+        assert_ne!(a, b, "consecutive replay ids collided: {a}");
+    }
+
+    #[test]
+    fn create_file_never_truncates_an_existing_log() {
+        // F-10: opening a writer for an id whose file already exists must not clobber it —
+        // it lands on a suffixed filename instead, and the original bytes survive.
+        let dir = std::env::temp_dir().join(format!(
+            "battle_sim_replay_test_{}",
+            make_replay_id("collide")
+        ));
+        let id = "match_collide_fixed".to_string();
+
+        let mut first = ReplayWriter::create_file(&dir, id.clone()).expect("first writer");
+        first
+            .write(&ReplayRecord::End(ReplayEnd {
+                tick: 7,
+                winner: Some("b_1".into()),
+            }))
+            .expect("write first");
+        let first_path = first.path().expect("file-backed").to_path_buf();
+        drop(first);
+
+        // A second writer for the *same* id must not reuse the same file.
+        let second = ReplayWriter::create_file(&dir, id.clone()).expect("second writer");
+        assert_ne!(
+            second.replay_id(),
+            id,
+            "second writer reused the colliding id"
+        );
+        assert_ne!(
+            second.path().expect("file-backed"),
+            first_path,
+            "second writer opened the same file (would truncate)"
+        );
+
+        // The first log is intact.
+        let first_bytes = fs::read_to_string(&first_path).expect("read first log");
+        assert!(
+            first_bytes.contains("\"tick\":7"),
+            "first replay log was truncated: {first_bytes:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn capture_replay_yields_one_frame_per_tick() {
         let records = vec![
             ReplayRecord::Header(Box::new(sample_header())),
@@ -1102,6 +1224,34 @@ mod tests {
         for (i, frame) in captured.frames.iter().enumerate() {
             assert_eq!(frame.tick, i as u64, "frame {i} carries the wrong tick");
         }
+    }
+
+    #[test]
+    fn capture_replay_rejects_absurd_end_tick_without_oom() {
+        // F-11: a corrupt/truncated log whose End tick is enormous must be rejected as a
+        // corrupt replay, not stepped 10^12 times (hung thread + OOM, one frame per tick).
+        let records = vec![
+            ReplayRecord::Header(Box::new(sample_header())),
+            ReplayRecord::End(ReplayEnd {
+                tick: u64::MAX,
+                winner: None,
+            }),
+        ];
+        let err = capture_replay(records).expect_err("absurd end tick must be rejected");
+        assert!(matches!(err, ReplayError::Corrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn capture_perspective_rejects_absurd_tick_without_oom() {
+        // Same guard on the per-bot perspective endpoint, via a corrupt Tick record.
+        let mut bad_tick = sample_tick();
+        bad_tick.tick = MAX_REPLAY_TICKS + 5;
+        let records = vec![
+            ReplayRecord::Header(Box::new(sample_header())),
+            ReplayRecord::Tick(bad_tick),
+        ];
+        let err = capture_perspective(records, "b_1").expect_err("absurd tick must be rejected");
+        assert!(matches!(err, ReplayError::Corrupt(_)), "got {err:?}");
     }
 
     #[test]

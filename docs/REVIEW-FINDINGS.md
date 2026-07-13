@@ -44,16 +44,16 @@ behavior changes in `docs/PROTOCOL.md`'s changelog.
 | F-04 | 2 | SDK loses powerup loadout after first match | High | sdk | [x] |
 | F-05 | 2 | Gunner cooldown carries across matches | High | sdk | [x] |
 | F-06 | 2 | Malformed `game_start` crashes SDK run loop | High | sdk | [x] |
-| F-07 | 3 | Lockstep MC still enforces wall-clock deadline | Medium | server | [ ] |
-| F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [ ] |
-| F-09 | 3 | Unclamped turn-rate ratio (Overdrive super-turn) | Medium | server | [ ] |
-| F-10 | 3 | Replay ID collision truncates previous replay | Medium | server | [ ] |
-| F-11 | 3 | Replay endpoints unbounded on corrupt logs | Medium | server | [ ] |
-| F-12 | 3 | EMP debuff misreported as own powerup active | Medium | server | [ ] |
-| F-13 | 4 | MC panel dead-ends after a completed run | Medium | spectator | [ ] |
-| F-14 | 4 | Live view hardcodes 1000×1000 map | Medium | spectator | [ ] |
-| F-15 | 4 | Radar ring ignores tunable `active_radar_range` | Medium | spectator | [ ] |
-| F-16 | 4 | Replay perspective switch shows mismatched data | Medium | spectator | [ ] |
+| F-07 | 3 | Lockstep MC still enforces wall-clock deadline | Medium | server | [x] |
+| F-08 | 3 | `PowerupActivated` leaks ground-truth ShipId | Medium | server | [x] |
+| F-09 | 3 | Unclamped turn-rate ratio (Overdrive super-turn) | Medium | server | [x] |
+| F-10 | 3 | Replay ID collision truncates previous replay | Medium | server | [x] |
+| F-11 | 3 | Replay endpoints unbounded on corrupt logs | Medium | server | [x] |
+| F-12 | 3 | EMP debuff misreported as own powerup active | Medium | server | [x] |
+| F-13 | 4 | MC panel dead-ends after a completed run | Medium | spectator | [x] |
+| F-14 | 4 | Live view hardcodes 1000×1000 map | Medium | spectator | [x] |
+| F-15 | 4 | Radar ring ignores tunable `active_radar_range` | Medium | spectator | [x] |
+| F-16 | 4 | Replay perspective switch shows mismatched data | Medium | spectator | [x] |
 | F-17 | 5 | Sensor-side powerup windows one tick short | Low | server | [ ] |
 | F-18 | 5 | `wrap_deg` can emit heading exactly 360.0 | Low | server | [ ] |
 | F-19 | 5 | Decoys trivially fingerprintable | Low | server | [ ] |

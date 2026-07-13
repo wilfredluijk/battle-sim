@@ -187,6 +187,11 @@ Instantaneous AoE centered on you. All *enemy* ships within 130 u get their gun
 cooldown × 2 and their active radar disabled (returns empty contacts) for the window.
 Wider but shorter than before — 100 u was only a third of weapon range, too conditional.
 
+The EMP debuff you *inflict* is tracked separately from your own `emp_burst` powerup
+state: being EMP'd by an opponent never makes your own (unused) `emp_burst` read as active
+in `powerup_status`. On the caster side, `powerup_status` shows `emp_burst` as `used` with
+an active countdown for the duration; the debuff itself only ever applies to targets.
+
 - Radius: **130 units** · Duration: **40 ticks** · Cooldown × **2.0**
 - Synergy: `rapid_fire` (lock them, then beat them).
 - Counter to: `rapid_fire` opponents, `awacs_scan` opponents.

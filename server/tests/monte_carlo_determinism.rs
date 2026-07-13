@@ -212,6 +212,60 @@ fn abort_then_reset_then_normal_match_has_no_mc_chaining() {
     assert!(!status(&mut room).running, "no MC run after a normal match");
 }
 
+/// F-07: in lockstep (Monte Carlo) mode the wall-clock `tick_deadline_ms` must not reject
+/// commands. Lockstep paces the loop by bot responses, so a bot slower than the deadline
+/// still has its command accepted and applied on the next step. Before the fix every such
+/// command got a `late_command` error, `pending_command` never filled, and every tick burned
+/// the full lockstep timeout with ships drifting on stale controls.
+#[test]
+fn lockstep_mode_accepts_command_after_wall_clock_deadline() {
+    // Room deadline is 80ms (see make_two_bot_room). We deliberately exceed it.
+    let (mut room, mut r1, mut r2, _b1, _b2) = mc_room_midrun(5);
+    assert!(status(&mut room).running, "MC run should be in progress");
+
+    // Fresh tick frame just went out (mc_room_midrun ends on step_tick), so tick_send_time
+    // is "now". Drain outbounds so any late_command error we might get is unambiguous.
+    drain(&mut r1);
+    drain(&mut r2);
+
+    // Wait well past the wall-clock deadline. In live mode this would be rejected as late.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Send a command for the victim bot (r2), echoing the current tick, with a distinctive
+    // throttle so we can observe it being applied.
+    let world_tick = room.world.tick;
+    room.handle_event(RoomEvent::BotCommand {
+        bot_id: r2.bot_id.clone(),
+        command: PendingCommand {
+            tick: world_tick,
+            throttle: 0.7,
+            rudder: 0.0,
+            sensor_mode: SensorMode::Passive,
+            fire: None,
+            activate_powerup: None,
+        },
+    });
+
+    // No late_command error must have been produced.
+    while let Ok(msg) = r2.outbound.try_recv() {
+        if let ServerMsg::Error { code, .. } = msg {
+            assert_ne!(
+                code,
+                naval_server::protocol::error_code::LATE_COMMAND,
+                "lockstep mode must not reject a command on the wall-clock deadline",
+            );
+        }
+    }
+
+    // The command was queued; stepping applies it to the ship.
+    room.step_tick();
+    let throttle = room.world.ships.get(&r2.ship_id).unwrap().throttle;
+    assert!(
+        (throttle - 0.7).abs() < 1e-6,
+        "late-but-lockstep command should have been applied; throttle = {throttle}",
+    );
+}
+
 fn drain(reg: &mut BotRegistration) {
     while reg.outbound.try_recv().is_ok() {}
 }

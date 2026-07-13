@@ -295,8 +295,10 @@ Things that happened in your vicinity this tick. Bots see three kinds:
 - `ShellSplashEvent` — a shell exploded within sensor range. The bot
   doesn't get to see whose shell it was, only where it went off.
 - `PowerupActivatedEvent` — a ship activated a powerup. Always emitted
-  for your own activations; emitted for other ships only when they are
-  currently a sensor contact of yours. See [Powerups](#powerups).
+  for your own activations (`contact_id` is `None`); emitted for other
+  ships only when they show up in your sweep this tick, tagged with the
+  same anonymized `contact_id` (`c_<n>`) they appear under in
+  `view.contacts`. See [Powerups](#powerups).
 
 You don't get a `Death` event for yourself — when your HP reaches
 zero, the next message you receive is `game_over`. Other ships'
@@ -454,16 +456,17 @@ match.
 
 ### Observing other ships activate
 
-When another ship activates a powerup *and* you currently have it as
-a sensor contact, you get a `PowerupActivatedEvent` in
-`view.events`:
+When another ship activates a powerup *and* it shows up in your sweep
+this tick, you get a `PowerupActivatedEvent` in `view.events`. Its
+`contact_id` matches the id that ship appears under in `view.contacts`
+this tick (it's `None` for your own activations):
 
 ```python
 from naval_sdk.protocol import PowerupActivatedEvent
 
 for ev in view.events:
     if isinstance(ev, PowerupActivatedEvent):
-        log.info("contact %s popped %s", ev.ship_id, ev.powerup)
+        log.info("contact %s popped %s", ev.contact_id, ev.powerup)
 ```
 
 `ship_id` matches the ship id from your contact list. Your own

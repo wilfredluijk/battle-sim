@@ -25,6 +25,12 @@ export const replayError = writable<string | null>(null);
 // Perspective re-runs are cached so flipping back to a bot is instant.
 const perspectiveCache = new Map<string, CapturedPerspective>();
 let currentReplayId: string | null = null;
+// Bumped every time a different replay is opened (or the viewer is exited). An in-flight
+// perspective fetch captures the epoch at request time; if it changed by the time the fetch
+// resolves, a *different* replay is now loaded and the resolution is dropped — otherwise a
+// late fetch from the previous replay would poison the freshly-cleared cache (and the bot-id
+// guard alone can't catch it when both replays share a bot id).
+let replayEpoch = 0;
 
 /** Highest tick index in the loaded timeline (`0` when nothing is loaded). */
 export function finalTick(): number {
@@ -36,6 +42,8 @@ export function finalTick(): number {
 export async function openReplay(id: string): Promise<void> {
   replayLoading.set(true);
   replayError.set(null);
+  // Invalidate any perspective fetch already in flight for a previous replay before we start.
+  replayEpoch += 1;
   try {
     const data = await fetchReplay(id);
     currentReplayId = id;
@@ -68,19 +76,33 @@ export async function selectPerspective(p: Perspective): Promise<void> {
     return;
   }
   if (!currentReplayId) return;
+  // Clear stale data before the fetch: otherwise the canvas draws the newly-selected bot's
+  // ship with the *previous* bot's contacts until the new timeline arrives. Falling back to
+  // null renders ground truth during the load — never a mismatched pairing.
+  replayPerspectiveData.set(null);
   replayLoading.set(true);
   replayError.set(null);
+  // Snapshot the identity of the fetch so a resolution that outlives its replay is dropped.
+  const epoch = replayEpoch;
+  const requestReplayId = currentReplayId;
   try {
-    const data = await fetchPerspective(currentReplayId, p);
+    const data = await fetchPerspective(requestReplayId, p);
+    // A different replay was opened while this was in flight — drop it entirely so it can't
+    // poison the new replay's cache or overwrite its view.
+    if (replayEpoch !== epoch) return;
     perspectiveCache.set(p, data);
-    // The user may have changed the selector while the request was in flight.
+    // The user may also have changed the selector within the same replay.
     if (get(replayPerspective) === p) replayPerspectiveData.set(data);
   } catch (e) {
+    // Only surface the error if it belongs to the currently-loaded replay/selection.
+    if (replayEpoch !== epoch) return;
     replayError.set(e instanceof Error ? e.message : 'failed to load perspective');
-    replayPerspective.set('overall');
-    replayPerspectiveData.set(null);
+    if (get(replayPerspective) === p) {
+      replayPerspective.set('overall');
+      replayPerspectiveData.set(null);
+    }
   } finally {
-    replayLoading.set(false);
+    if (replayEpoch === epoch) replayLoading.set(false);
   }
 }
 
@@ -124,5 +146,7 @@ export function exitReplay(): void {
   replayError.set(null);
   perspectiveCache.clear();
   currentReplayId = null;
+  // Invalidate any perspective fetch still in flight so it can't write after we've left.
+  replayEpoch += 1;
   appMode.set('live');
 }
