@@ -403,6 +403,25 @@ A wrong password returns `401` with code `invalid_credentials`.
 | `tick_hz` | integer | Wall-clock playback/tick rate. Physics always uses 0.1 seconds per step. |
 | `replay_mode` | boolean | CLI replay playback; mutations and bot connections return HTTP 409. |
 
+The room response also publishes these administrator-only diagnostics (no participant credentials):
+
+| Field | Meaning |
+|---|---|
+| `capabilities.monte_carlo` | Offline analysis is available; false in tournament and replay modes. |
+| `capabilities.manage_match` | Match mutations are available; false in replay mode. |
+| `capabilities.tournament` | Tournament rules are enabled. |
+| `match_id` | Identifier of the current/latest match; empty before the first start. |
+| `config_hash` | Hash teams must acknowledge for the active rules. |
+| `match_timeout_ticks`, `tick_deadline_ms` | Configured maximum duration and command deadline. Use `tick_hz` for the match clock. |
+| `expected_teams` | Enabled identities from the participant roster, or an empty array in local development. Tokens are never returned. |
+| `roster_error` | Safe roster-reading error, or null. An unavailable roster must not be shown as zero expected teams. |
+| `bots[].connected` | Explicit transport state; a retained hull does not imply a connection. |
+| `bots[].forfeited` | Mid-match disconnect or kick eliminated this team while retaining its hull. |
+| `bots[].disconnect_reason` | Connection close, heartbeat timeout, revoked credential, protocol/rate limit, or operator kick; null while connected. |
+| `bots[].readiness_blocker` | Human-readable readiness blocker, or null when ready. Readiness acknowledges the current rules. |
+
+Clients must stop protected polling when signed out, discard responses from earlier sessions, and distinguish expired authentication (401) from connection failures. A healthy background connection does not make replay playback a live match.
+
 ### 2.5.4 `GET /api/config/schema`
 
 Describes each tunable so a UI can render a form. `integer` fields must be sent as whole numbers in `PUT /api/room/config`.
@@ -451,7 +470,9 @@ The post-match summary. `404` with code `no_report` until the first match has fi
 | `outcome` | `"winner"` \| `"draw"` \| `"aborted"` | How the match ended. |
 | `winner` / `winner_name` | string \| null | The winning `bot_id` and name; `null` for a draw or abort. |
 | `duration_ticks` / `duration_seconds` | u64 / f32 | Match length. |
-| `bots[].accuracy` | f32 | `hits_landed / shots_fired`, in `[0, 1]`; `0` when the bot never fired. |
+| `bots[].accuracy` | f32 | `hits_landed / shots_fired`; may exceed 1 when one splash hits multiple ships. Display as **Hits per shot**, not conventional accuracy. `0` when the bot never fired. |
+
+`end_reason` is `operator_abort`, `timeout`, `last_survivor`, or `no_survivors`. A timeout draw may have surviving ships. `bots[].forfeited` distinguishes forfeits from combat destruction. Reports and exports contain training statistics; their row order is not a competition ranking.
 
 ### 2.5.7 `POST /api/room/kick`
 
@@ -464,8 +485,7 @@ Returns `404` with code `unknown_bot` when no bot holds that id.
 ## 2.6 Replay viewer — `/api/replays/*` (REST)
 
 Read-only routes that back the spectator's replay viewer. They re-run a recorded match
-server-side and return the reconstructed timeline as JSON. No JWT is required, but — like
-`/spectate` — they require an administrator bearer token on every request, including loopback (`401` otherwise), because replays expose ground-truth state.
+server-side and return the reconstructed timeline as JSON. Like `/spectate`, they require an administrator bearer token on every request, including loopback (`401` otherwise), because replays expose ground-truth state.
 
 | Method & path | Success | Purpose |
 |---|---|---|
@@ -494,8 +514,9 @@ returns `404` `replay_not_found`; a log older than the current replay format ret
 ]
 ```
 
-`final_tick` and `winner_name` are `null` for a log with no `end` record (an incomplete
-match) or a draw / aborted match.
+`final_tick` is null only when no end record exists. `winner_name` is null for draws, aborts and incomplete matches. `outcome` distinguishes `winner`, `draw`, `aborted`, `incomplete`, and `unknown`. An older end record without a winner or explicit outcome is `unknown`; do not infer a draw. Optional `end_reason` supplies the recorded reason.
+
+New v7 end records carry optional `outcome` and `end_reason` metadata. These fields do not change simulation inputs or the format version. Older records still deserialize, and unknown historical outcomes remain unknown.
 
 ### 2.6.2 `GET /api/replays/{id}`
 

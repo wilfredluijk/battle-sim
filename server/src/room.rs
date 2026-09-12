@@ -77,6 +77,7 @@ pub enum RoomState {
 struct BotEntry {
     ingress: CommandSlot,
     disconnected: bool,
+    disconnect_reason: Option<String>,
     bot_id: BotId,
     ship_id: ShipId,
     name: String,
@@ -297,6 +298,10 @@ pub enum RoomEvent {
     BotDisconnect {
         bot_id: BotId,
     },
+    BotDisconnectReason {
+        bot_id: BotId,
+        reason: &'static str,
+    },
     /// Operator-issued `room start <name>`. Replies with `Ok(())` if the room
     /// transitioned to `Running`, otherwise the reason it could not.
     OperatorStart {
@@ -363,6 +368,10 @@ pub struct RoomSnapshot {
     pub map: MapInfo,
     pub tick_hz: u32,
     pub replay_mode: bool,
+    pub tournament: bool,
+    pub match_id: String,
+    pub config_hash: String,
+    pub tick_deadline_ms: u64,
 }
 
 /// Per-bot statistics accumulated over a single match. Reset at `start_match`, frozen into
@@ -386,6 +395,7 @@ pub struct MatchReport {
     pub replay_id: Option<String>,
     /// `"winner"`, `"draw"`, or `"aborted"`.
     pub outcome: String,
+    pub end_reason: String,
     pub winner: Option<BotId>,
     pub winner_name: Option<String>,
     pub duration_ticks: u64,
@@ -400,13 +410,14 @@ pub struct BotReport {
     pub name: String,
     pub shots_fired: u32,
     pub hits_landed: u32,
-    /// `hits_landed / shots_fired`, in `[0, 1]`; `0.0` when the bot never fired.
+    /// Hit events per shot; can exceed 1 because a splash may hit several ships.
     pub accuracy: f32,
     pub damage_dealt: u32,
     pub damage_taken: u32,
     pub kills: u32,
     pub final_hp: u32,
     pub survived: bool,
+    pub forfeited: bool,
 }
 
 #[derive(Debug)]
@@ -1024,6 +1035,7 @@ impl Room {
                     kills: stats.kills,
                     final_hp: ship.map(|s| s.hp).unwrap_or(0),
                     survived: ship.map(|s| s.alive).unwrap_or(false),
+                    forfeited: entry.disconnected,
                 }
             })
             .collect();
@@ -1031,6 +1043,20 @@ impl Room {
             room: self.name.clone(),
             replay_id: self.replay_id.clone(),
             outcome: outcome.into(),
+            end_reason: if aborted {
+                "operator_abort"
+            } else if self.starting_bot_count >= 2
+                && self.world.ships.values().filter(|s| s.alive).count() <= 1
+            {
+                if winner.is_some() {
+                    "last_survivor"
+                } else {
+                    "no_survivors"
+                }
+            } else {
+                "timeout"
+            }
+            .into(),
             winner,
             winner_name,
             duration_ticks,
@@ -1334,6 +1360,9 @@ impl Room {
         }
         if self.state == RoomState::Running {
             self.forfeit_bot(&bot_id);
+            if let Some(entry) = self.bots.get_mut(&bot_id) {
+                entry.disconnect_reason = Some(reason.into());
+            }
         } else {
             self.remove_bot_and_ship(&bot_id);
         }
@@ -1356,6 +1385,7 @@ impl Room {
     pub fn forfeit_bot(&mut self, bot_id: &BotId) {
         if let Some(entry) = self.bots.get_mut(bot_id) {
             entry.disconnected = true;
+            entry.disconnect_reason = Some("disconnected during match".into());
             entry.ready = false;
             entry.pending_command = None;
             entry.ingress.close();
@@ -1390,6 +1420,10 @@ impl Room {
             },
             tick_hz: self.tick_hz,
             replay_mode: false,
+            tournament: self.tournament,
+            match_id: self.match_id.clone(),
+            config_hash: self.config_hash(),
+            tick_deadline_ms: self.tick_deadline_ms,
         }
     }
 
@@ -1407,6 +1441,16 @@ impl Room {
                 name: entry.name.clone(),
                 ship_id: entry.ship_id.clone(),
                 ready: entry.ready,
+                connected: !entry.disconnected,
+                forfeited: entry.disconnected,
+                disconnect_reason: entry.disconnect_reason.clone(),
+                readiness_blocker: if entry.disconnected {
+                    Some("Disconnected".into())
+                } else if !entry.ready {
+                    Some("Waiting for acknowledgement of the current rules".into())
+                } else {
+                    None
+                },
                 alive: self
                     .world
                     .ships
@@ -1465,6 +1509,8 @@ impl Room {
             let end = ReplayRecord::End(ReplayEnd {
                 tick: final_tick,
                 winner: winner.clone(),
+                outcome: self.last_report.as_ref().map(|r| r.outcome.clone()),
+                end_reason: self.last_report.as_ref().map(|r| r.end_reason.clone()),
             });
             if let Err(e) = writer.write(&end) {
                 warn!(room = %self.name, error = %e, "failed to write replay end record");
@@ -1676,6 +1722,9 @@ impl Room {
             }
             RoomEvent::BotCommand { bot_id, command } => {
                 self.handle_bot_command(bot_id, command);
+            }
+            RoomEvent::BotDisconnectReason { bot_id, reason } => {
+                self.handle_bot_disconnect(bot_id, reason);
             }
             RoomEvent::BotDisconnect { bot_id } => {
                 if self.bots.contains_key(&bot_id) {
@@ -2599,6 +2648,7 @@ impl Room {
             BotEntry {
                 ingress: ingress.clone(),
                 disconnected: false,
+                disconnect_reason: None,
                 bot_id: bot_id.clone(),
                 ship_id: ship_id.clone(),
                 name: name.clone(),
@@ -3819,6 +3869,57 @@ mod tests {
     }
 
     #[test]
+    fn admin_review_retained_hull_reports_forfeit_and_reason() {
+        let (mut room, r1, _r2) = started_two_bot_room();
+        room.handle_bot_disconnect(r1.bot_id.clone(), "credentials revoked");
+        assert!(room.world.ships.contains_key(&r1.ship_id));
+        let snap = room.snapshot();
+        let bot = snap
+            .state
+            .bots
+            .iter()
+            .find(|b| b.bot_id == r1.bot_id)
+            .unwrap();
+        assert!(!bot.connected);
+        assert!(bot.forfeited);
+        assert_eq!(
+            bot.disconnect_reason.as_deref(),
+            Some("credentials revoked")
+        );
+        let report = room.build_match_report(None, true);
+        assert!(
+            report
+                .bots
+                .iter()
+                .find(|b| b.bot_id == r1.bot_id)
+                .unwrap()
+                .forfeited
+        );
+    }
+
+    #[test]
+    fn admin_review_timeout_draw_keeps_survivors_and_hit_ratio() {
+        let (mut room, r1, _r2) = started_two_bot_room();
+        room.world.tick = MATCH_TIMEOUT_TICKS - 1;
+        room.match_stats.get_mut(&r1.bot_id).unwrap().shots_fired = 2;
+        room.match_stats.get_mut(&r1.bot_id).unwrap().hits_landed = 3;
+        room.step_tick();
+        let report = room.last_report.as_ref().unwrap();
+        assert_eq!(report.outcome, "draw");
+        assert_eq!(report.end_reason, "timeout");
+        assert!(report.bots.iter().all(|b| b.survived));
+        assert_eq!(
+            report
+                .bots
+                .iter()
+                .find(|b| b.bot_id == r1.bot_id)
+                .unwrap()
+                .accuracy,
+            1.5
+        );
+    }
+
+    #[test]
     fn aborted_match_reports_aborted_outcome() {
         let (mut room, _r1, _r2) = started_two_bot_room();
         room.step_tick();
@@ -3827,6 +3928,7 @@ mod tests {
         rx.try_recv().expect("reply").expect("abort ok");
         let report = room.last_report.clone().expect("report after abort");
         assert_eq!(report.outcome, "aborted");
+        assert_eq!(report.end_reason, "operator_abort");
         assert!(report.winner.is_none());
     }
 

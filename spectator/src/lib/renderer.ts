@@ -18,6 +18,15 @@ import type {
   WorldFrame,
 } from '../types/protocol';
 
+export interface DrawOptions {
+  radar?: boolean;
+  labels?: boolean;
+  trails?: boolean;
+  selected?: string | null;
+  projector?: boolean;
+  history?: Map<string, [number, number][]>;
+}
+
 export interface Splash {
   x: number;
   y: number;
@@ -38,6 +47,7 @@ export function draw(
   mapH: number = MAP_HEIGHT,
   maxHp: number = MAX_HP,
   radarRange: number = ACTIVE_RADAR_RANGE,
+  options: DrawOptions = {},
 ): void {
   const canvas = ctx.canvas;
   const w = canvas.width;
@@ -57,7 +67,7 @@ export function draw(
 
   // Active radar rings beneath everything else.
   for (const ship of latest.ships) {
-    if (!ship.alive || ship.sensor_mode !== 'active') continue;
+    if (options.radar === false || !ship.alive || ship.sensor_mode !== 'active') continue;
     ctx.beginPath();
     ctx.arc(ship.pos[0], ship.pos[1], radarRange, 0, Math.PI * 2);
     const col = colorFor(ship.bot_name);
@@ -102,7 +112,18 @@ export function draw(
   }
 
   for (const ship of latest.ships) {
-    drawShip(ctx, ship, scale, maxHp);
+    if (options.trails) {
+      const points = options.history?.get(ship.id) ?? [];
+      ctx.beginPath();
+      points.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+      ctx.strokeStyle = withAlpha(colorFor(ship.bot_name), 0.45);
+      ctx.lineWidth = 2 / scale; ctx.stroke();
+    }
+    if (options.selected === ship.id) {
+      ctx.beginPath(); ctx.arc(ship.pos[0], ship.pos[1], SHIP_RADIUS * 2, 0, Math.PI * 2);
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3 / scale; ctx.stroke();
+    }
+    drawShip(ctx, ship, scale, maxHp, options);
   }
 }
 
@@ -177,6 +198,7 @@ function drawShip(
   ship: ShipSnapshot,
   scale: number,
   maxHp: number = MAX_HP,
+  options: DrawOptions = {},
 ): void {
   const color = colorFor(ship.bot_name);
   const x = ship.pos[0];
@@ -218,14 +240,16 @@ function drawShip(
   ctx.save();
   ctx.translate(x, y + labelOffsetY);
   ctx.scale(1 / scale, 1 / scale);
-  ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+  const pixelRatio = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1;
+  const labelSize = (options.projector ? 18 : 13) * pixelRatio;
+  ctx.font = `${labelSize}px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
   ctx.textAlign = 'center';
   ctx.fillStyle = ship.alive ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.4)';
-  ctx.fillText(ship.bot_name, 0, 0);
+  if (options.labels !== false) ctx.fillText(`${ship.id.replace('s_', '')} · ${ship.bot_name}`, 0, 0);
 
   if (ship.alive) {
-    const barW = 36;
-    const barH = 4;
+    const barW = (options.projector ? 60 : 42) * pixelRatio;
+    const barH = (options.projector ? 7 : 5) * pixelRatio;
     ctx.fillStyle = 'rgba(255,255,255,0.15)';
     ctx.fillRect(-barW / 2, 4, barW, barH);
     const pct = Math.max(0, Math.min(1, ship.hp / maxHp));

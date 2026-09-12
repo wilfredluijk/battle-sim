@@ -38,12 +38,12 @@ describe('reconcile', () => {
     expect(state.bots.get('s3')?.firstSeenOrder).toBe(2);
   });
 
-  it('marks bots not in the current frame as disconnected and keeps them in the map', () => {
+  it('never infers connection status from a present or absent hull', () => {
     let state = reconcile(frame(1, [ship('s1'), ship('s2')]), new Map(), [], [], 0);
     state = reconcile(frame(2, [ship('s1')]), state.bots, state.events, state.splashes, 0);
 
-    expect(state.bots.get('s1')?.connected).toBe(true);
-    expect(state.bots.get('s2')?.connected).toBe(false);
+    expect(state.bots.get('s1')?.connected).toBeNull();
+    expect(state.bots.get('s2')?.connected).toBeNull();
     // s2's last-known snapshot is still available so the sidebar can show its final state.
     expect(state.bots.get('s2')?.ship.id).toBe('s2');
   });

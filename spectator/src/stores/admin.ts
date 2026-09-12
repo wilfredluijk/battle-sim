@@ -67,66 +67,78 @@ export const mcError = writable<string | null>(null);
  * Begin polling the control plane. Fetches the config schema once, then polls room state
  * on an interval. Returns a teardown function that stops the loop.
  */
-export function startControlPlane(): () => void {
-  let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let prevState: string | null = null;
+export const sessionExpired = writable(false);
+export const roomUpdatedAt = writable(0);
+export const configDraft = writable<SimConfig | null>(null);
+export const actionNotice = writable<string | null>(null);
 
-  api
-    .fetchConfigSchema()
-    .then((fields) => configSchema.set(fields))
-    .catch(() => {
-      /* schema is best-effort; the form falls back to whatever the server reports */
-    });
-
-  const poll = async (): Promise<void> => {
-    if (stopped) return;
-    try {
-      const info = await api.fetchRoom();
-      if (stopped) return;
-      room.set(info);
-      roomError.set(null);
-
-      // A running → not-running transition means a match just finished: surface its
-      // report. A new match (→ running) clears the report screen.
-      if (prevState === 'running' && info.state !== 'running') {
-        showReport.set(true);
-      } else if (info.state === 'running') {
-        showReport.set(false);
-      }
-      prevState = info.state;
-
-      if (info.state === 'running') {
-        report.set(null);
-      } else {
-        try {
-          report.set(await api.fetchReport());
-        } catch {
-          /* keep the previous report on a transient failure */
-        }
-      }
-    } catch (e) {
-      if (!stopped) {
-        roomError.set(e instanceof Error ? e.message : 'room unavailable');
-      }
-    }
-    if (!stopped) timer = setTimeout(poll, POLL_MS);
-  };
-  void poll();
-
-  return () => {
-    stopped = true;
-    if (timer != null) clearTimeout(timer);
-  };
+export function expireSession(): void {
+  sessionExpired.set(true);
+  adminToken.set(null);
 }
 
-/** Re-fetch room state immediately so the UI reflects an action without waiting a poll. */
-async function refreshRoom(): Promise<void> {
-  try {
-    room.set(await api.fetchRoom());
+export function startControlPlane(): () => void {
+  let generation = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const unsubscribe = adminToken.subscribe(token => {
+    const epoch = ++generation;
+    clearTimeout(timer);
+    room.set(null);
+    roomUpdatedAt.set(0);
     roomError.set(null);
-  } catch {
-    /* the next scheduled poll will retry */
+    configSchema.set([]);
+    configDraft.set(null);
+    report.set(null);
+    showReport.set(false);
+    actionNotice.set(null);
+    mcStatus.set(null);
+    let previous: string | null = null;
+    if (!token) return;
+    const current = () => epoch === generation && get(adminToken) === token;
+    const poll = async () => {
+      try {
+        const info = await api.fetchRoom();
+        if (!current()) return;
+        room.set(info);
+        roomUpdatedAt.set(Date.now());
+        roomError.set(null);
+        if (previous === 'running' && info.state !== 'running') showReport.set(true);
+        if (info.state === 'running') showReport.set(false);
+        previous = info.state;
+        if (!get(configSchema).length) {
+          const fields = await api.fetchConfigSchema();
+          if (!current()) return;
+          configSchema.set(fields);
+        }
+        if (info.state !== 'running') {
+          const latest = await api.fetchReport();
+          if (!current()) return;
+          report.set(latest);
+        }
+      } catch (e) {
+        if (!current()) return;
+        if (e instanceof ApiError && e.status === 401) { expireSession(); return; }
+        roomError.set(e instanceof Error ? e.message : 'Server unavailable');
+      }
+      if (current()) timer = setTimeout(poll, POLL_MS);
+    };
+    void poll();
+  });
+  return () => { ++generation; clearTimeout(timer); unsubscribe(); };
+}
+
+async function refreshRoom(): Promise<void> {
+  const token = get(adminToken);
+  try {
+    const info = await api.fetchRoom();
+    if (token !== get(adminToken)) return;
+    room.set(info);
+    roomUpdatedAt.set(Date.now());
+    roomError.set(null);
+  } catch (e) {
+    if (token !== get(adminToken)) return;
+    if (e instanceof ApiError && e.status === 401) expireSession();
+    else roomError.set('Action completed; refreshing server state…');
   }
 }
 
@@ -135,10 +147,12 @@ async function withToken<T>(fn: (token: string) => Promise<T>): Promise<T> {
   const token = get(adminToken);
   if (!token) throw new ApiError(401, 'unauthorized', 'log in as admin first');
   try {
-    return await fn(token);
+    const result = await fn(token);
+    if (token !== get(adminToken)) throw new Error('Session changed while the action was pending.');
+    return result;
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401) {
-      adminToken.set(null);
+    if (token === get(adminToken) && e instanceof ApiError && e.status === 401) {
+      expireSession();
     }
     throw e;
   }
@@ -150,12 +164,12 @@ async function withToken<T>(fn: (token: string) => Promise<T>): Promise<T> {
 
 export async function loginAdmin(password: string): Promise<void> {
   const { token } = await api.login(password);
+  sessionExpired.set(false);
   adminToken.set(token);
-  configSchema.set(await api.fetchConfigSchema());
-  await refreshRoom();
 }
 
 export function logoutAdmin(): void {
+  sessionExpired.set(false);
   adminToken.set(null);
 }
 
@@ -165,6 +179,7 @@ export async function applyConfig(config: SimConfig): Promise<void> {
 }
 
 export async function startMatch(): Promise<void> {
+  if (get(configDraft)) throw new Error('Apply or discard the draft rules before starting.');
   await withToken(api.startMatch);
   await refreshRoom();
 }
@@ -204,28 +219,25 @@ const MC_POLL_IDLE_MS = 2500;
  */
 export function startMonteCarloPolling(): () => void {
   let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const poll = async (): Promise<void> => {
-    if (stopped) return;
-    let nextDelay = MC_POLL_IDLE_MS;
-    try {
-      const status = await api.fetchMonteCarloStatus();
-      if (stopped) return;
-      mcStatus.set(status);
-      nextDelay = status.running ? MC_POLL_RUNNING_MS : MC_POLL_IDLE_MS;
-    } catch {
-      // Server unreachable; back off to the idle cadence and retry. The room store's
-      // own error handling already surfaces "server unreachable" via roomError.
+  let timer: ReturnType<typeof setTimeout>;
+  const poll = async () => {
+    let delay = MC_POLL_IDLE_MS;
+    const token = get(adminToken);
+    if (token && get(room)?.capabilities?.monte_carlo) {
+      try {
+        const status = await api.fetchMonteCarloStatus();
+        if (!stopped && token === get(adminToken)) {
+          mcStatus.set(status);
+          delay = status.running ? MC_POLL_RUNNING_MS : MC_POLL_IDLE_MS;
+        }
+      } catch (e) {
+        if (token === get(adminToken) && e instanceof ApiError && e.status === 401) expireSession();
+      }
     }
-    if (!stopped) timer = setTimeout(poll, nextDelay);
+    if (!stopped) timer = setTimeout(poll, delay);
   };
   void poll();
-
-  return () => {
-    stopped = true;
-    if (timer != null) clearTimeout(timer);
-  };
+  return () => { stopped = true; clearTimeout(timer); };
 }
 
 export async function startMonteCarlo(config: McStartRequest): Promise<void> {

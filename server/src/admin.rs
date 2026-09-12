@@ -42,6 +42,14 @@ pub struct AdminBotInfo {
     pub ship_id: String,
     pub ready: bool,
     pub alive: bool,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub forfeited: bool,
+    #[serde(default)]
+    pub disconnect_reason: Option<String>,
+    #[serde(default)]
+    pub readiness_blocker: Option<String>,
 }
 
 pub mod admin_error_code {
@@ -72,6 +80,10 @@ mod tests {
             tick: 0,
             last_winner: Some("b_1".into()),
             bots: vec![AdminBotInfo {
+                connected: true,
+                forfeited: false,
+                disconnect_reason: None,
+                readiness_blocker: None,
                 bot_id: "b_1".into(),
                 name: "alice".into(),
                 ship_id: "s_1".into(),

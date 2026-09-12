@@ -90,6 +90,7 @@ export class WsClient {
     this.socket = ws;
 
     ws.onopen = () => {
+      if (this.closed || this.socket !== ws) return;
       const token = storedToken();
       if (token) ws.send(JSON.stringify({ type: 'authenticate', token }));
       this.emitStatus({ connected: false, message: token ? 'authenticating…' : 'log in as admin' });
@@ -98,11 +99,13 @@ export class WsClient {
       // onclose fires next and handles the retry; do not double-schedule.
     };
     ws.onclose = () => {
+      if (this.closed || this.socket !== ws) return;
       this.socket = null;
       this.emitStatus({ connected: false, message: 'disconnected — retrying' });
       this.scheduleReconnect();
     };
     ws.onmessage = (ev: MessageEvent) => {
+      if (this.closed || this.socket !== ws) return;
       let msg: unknown;
       try {
         msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data));

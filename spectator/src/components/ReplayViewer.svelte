@@ -1,9 +1,12 @@
 <!-- Replay viewer: a paused-by-default battlefield with a scrubbable timeline, event
      markers, a per-bot perspective selector, and an exit back to the live screen. -->
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import ReplayCanvas from './ReplayCanvas.svelte';
   import {
     advanceTick,
+    replayError,
+    stepFrame,
     exitReplay,
     replayData,
     replayLoading,
@@ -17,6 +20,17 @@
     togglePlay,
   } from '../stores/replay';
 
+  import { eventText, clockText } from '../lib/presentation';
+  let bookmarks = $state<number[]>([]);
+  const names = $derived(new Map($replayData?.header.bots.map(b => [b.ship_id, b.name]) ?? []));
+  const currentEvents = $derived($replayData?.frames[$replayTick]?.events ?? []);
+  function eventJump(direction: number) {
+    const ticks = [...new Set($replayMarkers.map(m => m.tick))];
+    const target = direction < 0 ? ticks.filter(t => t < $replayTick).slice(-1)[0] : ticks.find(t => t > $replayTick);
+    if (target != null) { replayPlaying.set(false); seekTo(target); }
+  }
+  function step(delta: number) { replayPlaying.set(false); stepFrame(delta); }
+  onDestroy(() => replayPlaying.set(false));
   const SPEEDS = [0.25, 0.5, 1, 2, 4];
 
   // Playback ticker — alive only while playing, re-created when speed changes. The cleanup
@@ -64,6 +78,7 @@
     </label>
   </div>
 
+  {#if $replayError}<p class="config-err" role="alert">{$replayError}. Showing overall ground truth. Choose a perspective to retry.</p>{/if}
   <div class="rv-stage">
     <ReplayCanvas />
   </div>
@@ -112,6 +127,12 @@
     </label>
   </div>
 
+  <div class="rv-debrief">
+    <button class="topbar-btn" onclick={() => eventJump(-1)}>Previous event</button><button class="topbar-btn" onclick={() => step(-1)} aria-label="Previous frame">−1 frame</button><button class="topbar-btn" onclick={() => step(1)} aria-label="Next frame">+1 frame</button><button class="topbar-btn" onclick={() => eventJump(1)}>Next event</button>
+    <button class="topbar-btn" onclick={() => { if (!bookmarks.includes($replayTick)) bookmarks = [...bookmarks, $replayTick].sort((a,b) => a-b); }}>Bookmark</button>
+    {#each bookmarks as mark (mark)}<button class="topbar-btn" onclick={() => { replayPlaying.set(false); seekTo(mark); }}>{clockText(mark / ($replayData?.header.tick_hz ?? 1))}</button>{/each}
+    {#each currentEvents as event, i (i)}<span>{eventText(event, names)}</span>{/each}
+  </div>
   <div class="rv-legend" aria-hidden="true">
     <span><i class="rv-dot rv-marker-fired"></i> shot fired</span>
     <span><i class="rv-dot rv-marker-hit"></i> hit</span>

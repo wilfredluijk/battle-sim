@@ -150,6 +150,10 @@ pub struct ReplayDisconnect {
 pub struct ReplayEnd {
     pub tick: u64,
     pub winner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +177,8 @@ pub struct ReplaySummary {
     /// Winning bot's display name. `None` for a draw, an aborted match, or a log with no
     /// `end` record.
     pub winner_name: Option<String>,
+    pub outcome: String,
+    pub end_reason: Option<String>,
 }
 
 /// A full offline re-run of a replay: the header plus the ground-truth spectator frame at
@@ -1073,6 +1079,20 @@ fn read_replay_summary(path: &Path) -> io::Result<ReplaySummary> {
         },
         final_tick: end.as_ref().map(|e| e.tick),
         winner_name,
+        outcome: end
+            .as_ref()
+            .map(|e| {
+                e.outcome.clone().unwrap_or_else(|| {
+                    if e.winner.is_some() {
+                        "winner"
+                    } else {
+                        "unknown"
+                    }
+                    .into()
+                })
+            })
+            .unwrap_or_else(|| "incomplete".into()),
+        end_reason: end.as_ref().and_then(|e| e.end_reason.clone()),
     })
 }
 
@@ -1165,10 +1185,14 @@ mod tests {
             ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::Tick(sample_tick()),
             ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 1843,
                 winner: Some("b_1".into()),
             }),
             ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 3000,
                 winner: None,
             }),
@@ -1190,6 +1214,8 @@ mod tests {
             .expect("write tick");
         writer
             .write(&ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 9,
                 winner: None,
             }))
@@ -1212,6 +1238,8 @@ mod tests {
             "{}\n\n{}\n",
             serde_json::to_string(&ReplayRecord::Header(Box::new(sample_header()))).unwrap(),
             serde_json::to_string(&ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 1,
                 winner: None
             }))
@@ -1240,6 +1268,8 @@ mod tests {
             ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::Tick(sample_tick()),
             ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 10,
                 winner: None,
             }),
@@ -1261,6 +1291,8 @@ mod tests {
             ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::Tick(sample_tick()),
             ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 10,
                 winner: None,
             }),
@@ -1279,12 +1311,41 @@ mod tests {
         let records = vec![
             ReplayRecord::Header(Box::new(sample_header())),
             ReplayRecord::End(ReplayEnd {
+                outcome: None,
+                end_reason: None,
                 tick: 1,
                 winner: None,
             }),
         ];
         let err = capture_perspective(records, "b_404").expect_err("unknown bot");
         assert!(matches!(err, ReplayError::UnknownBot(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn admin_review_replay_outcomes_preserve_unknown_history() {
+        let path = std::env::temp_dir().join(format!("replay-outcome-{}.jsonl", unique_suffix()));
+        let header =
+            serde_json::to_string(&ReplayRecord::Header(Box::new(sample_header()))).unwrap();
+        for (end, expected) in [
+            ("", "incomplete"),
+            (r#"{"type":"end","tick":10,"winner":null}"#, "unknown"),
+            (
+                r#"{"type":"end","tick":10,"winner":null,"outcome":"aborted","end_reason":"operator_abort"}"#,
+                "aborted",
+            ),
+            (
+                r#"{"type":"end","tick":10,"winner":null,"outcome":"draw","end_reason":"timeout"}"#,
+                "draw",
+            ),
+        ] {
+            std::fs::write(&path, format!("{header}\n{end}\n")).unwrap();
+            let summary = read_replay_summary(&path).unwrap();
+            assert_eq!(summary.outcome, expected);
+            if expected == "aborted" {
+                assert_eq!(summary.end_reason.as_deref(), Some("operator_abort"));
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

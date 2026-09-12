@@ -85,6 +85,10 @@ export interface AdminBotInfo {
   ship_id: string;
   ready: boolean;
   alive: boolean;
+  connected?: boolean;
+  forfeited?: boolean;
+  disconnect_reason?: string | null;
+  readiness_blocker?: string | null;
 }
 
 /** Match tuning, including the nested powerup configuration. */
@@ -122,6 +126,13 @@ export interface RoomInfo {
   map?: { width: number; height: number };
   tick_hz?: number;
   replay_mode?: boolean;
+  capabilities?: { monte_carlo: boolean; manage_match: boolean; tournament: boolean };
+  match_id?: string;
+  config_hash?: string;
+  match_timeout_ticks?: number;
+  tick_deadline_ms?: number;
+  expected_teams?: string[];
+  roster_error?: string | null;
 }
 
 /** One tunable's metadata from `GET /api/config/schema`. */
@@ -147,6 +158,7 @@ export interface BotReport {
   kills: number;
   final_hp: number;
   survived: boolean;
+  forfeited?: boolean;
 }
 
 /** Response shape of `GET /api/room/report`. */
@@ -154,6 +166,7 @@ export interface MatchReport {
   room: string;
   replay_id: string | null;
   outcome: 'winner' | 'draw' | 'aborted';
+  end_reason?: string;
   winner: string | null;
   winner_name: string | null;
   duration_ticks: number;
@@ -219,6 +232,8 @@ export interface ReplaySummary {
   bots: string[];
   final_tick: number | null;
   winner_name: string | null;
+  outcome?: string;
+  end_reason?: string | null;
 }
 
 /** Response shape of `GET /api/replays/{id}` — the ground-truth timeline. */
@@ -226,7 +241,7 @@ export interface CapturedReplay {
   header: ReplayHeaderInfo;
   /** `frames[t]` is the world at tick `t`. */
   frames: WorldFrame[];
-  end: { tick: number; winner: string | null } | null;
+  end: { tick: number; winner: string | null; outcome?: string; end_reason?: string } | null;
 }
 
 /** One bot's sensor-filtered view at a single tick. */

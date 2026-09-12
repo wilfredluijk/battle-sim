@@ -2,7 +2,7 @@
      view-mode-driven canvas resize. All drawing delegates to `lib/renderer.ts`. -->
 <script lang="ts">
   import { onDestroy, onMount, tick as sveltetick } from 'svelte';
-  import { latestWorld, splashes, view } from '../stores';
+  import { latestWorld, splashes, view, selectedTeam, projector, displayOptions } from '../stores';
   import { draw, type Splash } from '../lib/renderer';
   import { fitCanvas } from '../lib/canvas';
   import { room } from '../stores/admin';
@@ -18,7 +18,14 @@
   let currentFrame: WorldFrame | null = null;
   let currentSplashes: Splash[] = [];
 
-  const unsubFrame = latestWorld.subscribe((v) => (currentFrame = v));
+  let trails = new Map<string, [number, number][]>();
+  const unsubFrame = latestWorld.subscribe((v) => {
+    if (!v || v.tick < (currentFrame?.tick ?? 0)) trails = new Map();
+    if (v && v.tick !== currentFrame?.tick) for (const ship of v.ships) {
+      trails.set(ship.id, [...(trails.get(ship.id) ?? []), ship.pos].slice(-80));
+    }
+    currentFrame = v;
+  });
   const unsubSplashes = splashes.subscribe((v) => (currentSplashes = v));
 
   // HP-bar scale follows the match's configured hull when known, so the canvas
@@ -58,7 +65,7 @@
 
     const loop = (): void => {
       rafId = requestAnimationFrame(loop);
-      draw(ctx, currentFrame, currentSplashes, performance.now(), mapWidth, mapHeight, currentMaxHp, radarRange);
+      draw(ctx, currentFrame, currentSplashes, performance.now(), mapWidth, mapHeight, currentMaxHp, radarRange, { ...$displayOptions, selected: $selectedTeam, projector: $projector, history: trails });
     };
     rafId = requestAnimationFrame(loop);
   });

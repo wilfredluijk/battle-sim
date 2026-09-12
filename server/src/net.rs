@@ -379,18 +379,51 @@ struct RoomResponse {
     map: protocol::MapInfo,
     tick_hz: u32,
     replay_mode: bool,
+    capabilities: serde_json::Value,
+    match_id: String,
+    config_hash: String,
+    match_timeout_ticks: u64,
+    tick_deadline_ms: u64,
+    expected_teams: Vec<String>,
+    roster_error: Option<String>,
 }
 
-/// Public: current room state plus the active balance parameters. Drives both the
+/// Authenticated: current room state plus the active balance parameters. Drives both the
 /// pre-match summary screen and the post-battle report.
 async fn get_room(State(state): State<AppState>) -> Result<Json<RoomResponse>, ApiError> {
     let snap: RoomSnapshot = ask_room(&state, |reply| RoomEvent::QueryState { reply }).await?;
+    let (expected_teams, roster_error) = if state.participants.path.is_some() {
+        match state.participants.read() {
+            Ok(roster) => (
+                roster
+                    .into_iter()
+                    .filter(|p| p.enabled)
+                    .map(|p| p.identity)
+                    .collect(),
+                None,
+            ),
+            Err(error) => (Vec::new(), Some(error)),
+        }
+    } else {
+        (Vec::new(), None)
+    };
     Ok(Json(RoomResponse {
         state: snap.state,
         config: snap.config,
         map: snap.map,
         tick_hz: snap.tick_hz,
         replay_mode: snap.replay_mode,
+        capabilities: serde_json::json!({
+            "monte_carlo": !snap.tournament && !snap.replay_mode,
+            "manage_match": !snap.replay_mode,
+            "tournament": snap.tournament,
+        }),
+        match_id: snap.match_id,
+        config_hash: snap.config_hash,
+        match_timeout_ticks: crate::room::MATCH_TIMEOUT_TICKS,
+        tick_deadline_ms: snap.tick_deadline_ms,
+        expected_teams,
+        roster_error,
     }))
 }
 
@@ -879,12 +912,14 @@ async fn handle_bot(
     let mut budget = RateLimit::new(40, 64 * 1024);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut last_seen = Instant::now();
+    let mut disconnect_reason = "connection closed";
     loop {
         tokio::select! {
             biased;
             _ = shutdown_rx.recv() => break,
             _ = heartbeat.tick() => {
-                if last_seen.elapsed() > Duration::from_secs(15) || !participants.valid(&session.identity, &token) { break; }
+                if !participants.valid(&session.identity, &token) { disconnect_reason = "credentials revoked"; break; }
+                if last_seen.elapsed() > Duration::from_secs(15) { disconnect_reason = "heartbeat timeout"; break; }
                 if !send_frame(&mut sink, Message::Ping(vec![])).await { break; }
             }
             msg = outbound.recv() => {
@@ -899,6 +934,7 @@ async fn handle_bot(
                 let Some(Ok(frame)) = frame else { break; };
                 let bytes = match &frame { Message::Text(t) => t.len(), Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(), _ => 0 };
                 if !budget.accept(bytes) {
+                    disconnect_reason = "message or byte limit exceeded";
                     send_error(&mut sink, "rate_limited", "message or byte budget exceeded").await;
                     break;
                 }
@@ -927,7 +963,7 @@ async fn handle_bot(
                             if code != "late_command" && code != "wrong_tick" { violations += 1; }
                             tracing::debug!(bot = %bot_id, code, "command rejected");
                             send_error(&mut sink, code, code).await;
-                            if violations >= MAX_VIOLATIONS { break; }
+                            if violations >= MAX_VIOLATIONS { disconnect_reason = "protocol violation limit exceeded"; break; }
                         }
                     }
                     Message::Ping(_) | Message::Pong(_) => {},
@@ -935,7 +971,7 @@ async fn handle_bot(
                     Message::Binary(_) => {
                         violations += 1;
                         send_error(&mut sink, error_code::BINARY_FRAMES_UNSUPPORTED, "text JSON required").await;
-                        if violations >= MAX_VIOLATIONS { break; }
+                        if violations >= MAX_VIOLATIONS { disconnect_reason = "protocol violation limit exceeded"; break; }
                     }
                 }
             }
@@ -944,7 +980,10 @@ async fn handle_bot(
     ingress.close();
     let _ = timeout(
         Duration::from_secs(2),
-        room_tx.send(RoomEvent::BotDisconnect { bot_id }),
+        room_tx.send(RoomEvent::BotDisconnectReason {
+            bot_id,
+            reason: disconnect_reason,
+        }),
     )
     .await;
     let _ = send_frame(&mut sink, Message::Close(None)).await;

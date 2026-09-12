@@ -73,3 +73,18 @@ The deployment validation observed command deadline misses. A pre-training conne
 **Third:** session persistence, expected roster, per-team timing diagnostics, standings and guided debriefs. These need explicit backend/API work and should not be presented as cosmetic changes.
 
 Validate the first two phases with eight teams, long names, unready/missing teams, a revoked connection, an expired admin session, a timeout draw with survivors, an aborted match and a replay perspective failure. Check the map and essential status at common laptop/projector sizes. No change to game physics is required for the core redesign.
+
+## Implementation status — 12 September 2026
+
+The first two implementation phases are implemented in the trainer console:
+
+- Bounded split/full battlefield and replay canvases, independent roster/event scrolling, responsive header and replay controls, compact stable team rows, selected-team telemetry and ship highlight, distinct session colours with ship identifiers, display toggles and projector typography.
+- Focused, labelled sign-in; authentication-gated polling; expired-session, connecting, disconnected and stale-data states; stale HTTP/WebSocket responses cannot restore a previous session. Navigation describes the viewed surface independently of the server's live state.
+- Explicit match/team confirmations for abort and live forfeit, pending/error feedback, and retained views on failure. The lobby offers a cancellable five-second countdown.
+- Capability-aware Analysis navigation; active rules, draft counts/change summaries, apply/discard gating, presets and rules import/export. Expected roster names and readiness blockers are sanitized administrator data.
+- Server timing and match identifiers, named/filterable events, explicit forfeit/disconnect reasons, and recent-interval trainer metrics. The counters are not presented as team latency or late-command rates.
+- Truthful hits-per-shot and draw wording; end reasons and forfeits in reports; damage bars, replay links and CSV/JSON exports. New replay end records distinguish outcomes while older ambiguous records remain unknown. Replay search/filtering, frame steps, previous/next event, in-view bookmarks and visible perspective errors support debriefs.
+
+The third phase remains separate product work: durable named training sessions, per-team round-trip/response timing instrumentation, formal session standings with an agreed scoring rule, persistent replay bookmarks and comparison views. The public audience permission model, sound cues and advanced version/heatmap analysis are also future features. Match IDs are identifiers, not trainer-supplied round names; the roster is sourced from the existing credential file, not a new session editor. No game physics or bot-facing protocol change was made.
+
+Validation uses isolated local servers and synthetic/example teams. These checks are not measurements of the Amersfoort venue network. See `docs/ADMIN-FRONTEND-VALIDATION.md` for the completed checks and limitations.

@@ -341,6 +341,8 @@ fn huge_replay_ticks_are_rejected_before_simulation() {
     let records = vec![
         ReplayRecord::Header(Box::new(header())),
         ReplayRecord::End(ReplayEnd {
+            outcome: None,
+            end_reason: None,
             tick: u64::MAX,
             winner: None,
         }),
@@ -365,6 +367,8 @@ async fn replay_with_silent_ticks_is_paced_one_simulation_step_at_a_time() {
         .unwrap();
     writer
         .write(&ReplayRecord::End(ReplayEnd {
+            outcome: None,
+            end_reason: None,
             tick: 10,
             winner: None,
         }))

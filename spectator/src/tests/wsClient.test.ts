@@ -40,6 +40,22 @@ describe('WsClient', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  it('ignores frames and close callbacks from an earlier login session', () => {
+    const { factory, sockets } = makeFactory();
+    const client = new WsClient('ws://test/spectate', { factory });
+    const received = vi.fn();
+    client.onWorld(received);
+    client.start(); client.close(); client.start();
+    sockets[0]!._message({ type: 'world', tick: 1, ships: [], shells: [], events: [] });
+    sockets[0]!._close();
+    vi.advanceTimersByTime(5000);
+    expect(received).not.toHaveBeenCalled();
+    expect(sockets).toHaveLength(2);
+    sockets[1]!._message({ type: 'world', tick: 2, ships: [], shells: [], events: [] });
+    expect(received).toHaveBeenCalledTimes(1);
+    client.close();
+  });
+
   it('prompts for authentication on open', () => {
     const { factory, sockets } = makeFactory();
     const client = new WsClient('ws://test/spectate', { factory });

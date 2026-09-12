@@ -1,12 +1,7 @@
 import { COLOR_PALETTE } from './constants';
 
-/**
- * Name → palette colour, derived by hashing the name into `COLOR_PALETTE`. The mapping is
- * deterministic, so a given bot renders in the same colour on every surface (sidebar,
- * report, canvas) regardless of the order names are first seen — unlike a first-seen counter,
- * which could assign different colours to the same bot on different screens. The `cache` just
- * memoises the hash; an optional argument is exposed so tests can isolate state.
- */
+/** Allocate distinct session colours until the palette is exhausted, then reuse colours.
+ * The shared cache keeps every surface consistent; ship identifiers also distinguish teams. */
 export function colorFor(name: string, cache: Map<string, string> = defaultCache): string {
   const cached = cache.get(name);
   if (cached) return cached;
@@ -15,7 +10,11 @@ export function colorFor(name: string, cache: Map<string, string> = defaultCache
   for (let i = 0; i < name.length; i++) {
     hash = (hash * 31 + name.charCodeAt(i)) | 0;
   }
-  const color = COLOR_PALETTE[Math.abs(hash) % COLOR_PALETTE.length];
+  const used = new Set(cache.values());
+  const preferred = Math.abs(hash) % COLOR_PALETTE.length;
+  const color = Array.from({ length: COLOR_PALETTE.length }, (_, i) =>
+    COLOR_PALETTE[(preferred + i) % COLOR_PALETTE.length]).find(c => !used.has(c))
+    ?? COLOR_PALETTE[preferred];
   cache.set(name, color);
   return color;
 }
