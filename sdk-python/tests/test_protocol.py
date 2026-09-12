@@ -212,3 +212,8 @@ def test_command_without_activation_omits_field():
     cmd = Command(throttle=0.5)
     out = cmd.to_dict(tick=10)
     assert "activate_powerup" not in out
+
+
+def test_command_includes_match_identifier():
+    from naval_sdk.protocol import Command
+    assert Command().to_dict(12, "round-unique")["match_id"] == "round-unique"

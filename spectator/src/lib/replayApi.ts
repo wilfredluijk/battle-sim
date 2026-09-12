@@ -1,3 +1,4 @@
+import { storedAuthHeaders } from './authToken';
 // REST client for the read-only `/api/replays/*` routes that back the replay viewer.
 // See `docs/PROTOCOL.md §2.6`.
 
@@ -10,7 +11,7 @@ import type {
 
 /** GET `url` as JSON, turning a non-2xx response into an `ApiError`. */
 async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: storedAuthHeaders() });
   if (!res.ok) {
     let code = 'error';
     let message = `request failed (HTTP ${res.status})`;

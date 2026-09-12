@@ -1,16 +1,13 @@
+# Local development, bound to loopback. Production uses compose.prod.yml.
 services:
   battle-sim:
     build: .
     image: battle-sim:local
-    container_name: battle-sim
-    ports:
-      - "7878:7878"
-    # The room is driven over the REST control plane (`/api/*`). Pin a fixed admin
-    # password here so it survives restarts instead of rotating each boot.
+    ports: ["127.0.0.1:7878:7878"]
     environment:
-      - BATTLE_ADMIN_PASSWORD=change-me
+      BATTLE_ADMIN_PASSWORD: ${BATTLE_ADMIN_PASSWORD:?set a random password of at least 16 characters}
+    command: ["--allow-unauthenticated-bots", "--replay-dir", "/app/replays"]
     volumes:
-      # Persist replay JSONL logs on the host. The server writes to /app/replays inside
-      # the container per `CMD` in the Dockerfile.
-      - ./replays:/app/replays
-    restart: unless-stopped
+      - local-replays:/app/replays
+volumes:
+  local-replays:

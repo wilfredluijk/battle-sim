@@ -1,0 +1,2 @@
+# Bundler output can contain intentional whitespace inside JavaScript template literals.
+spectator/dist/* linguist-generated=true -whitespace

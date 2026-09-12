@@ -31,7 +31,7 @@ async fn start_server_with(tick_hz: u32, tick_deadline_ms: u64) -> ServerHandle 
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
 
-    let mut config = Config::parse_from(["test"]);
+    let mut config = Config::parse_from(["test", "--allow-unauthenticated-bots"]);
     config.port = port;
     config.tick_hz = tick_hz;
     config.tick_deadline_ms = tick_deadline_ms;
@@ -117,11 +117,13 @@ async fn full_throttle_command_moves_the_ship_each_tick() {
     ))
     .await
     .expect("send hello");
-    let _welcome = recv_typed(&mut ws, "welcome").await;
+    let welcome = recv_typed(&mut ws, "welcome").await;
 
-    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
-        .await
-        .expect("send ready");
+    ws.send(Message::Text(
+        serde_json::json!({"type":"ready", "config_hash": welcome["config_hash"]}).to_string(),
+    ))
+    .await
+    .expect("send ready");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -135,6 +137,7 @@ async fn full_throttle_command_moves_the_ship_each_tick() {
     reply_rx.await.expect("oneshot").expect("start ok");
 
     let game_start = recv_typed(&mut ws, "game_start").await;
+    let match_id = game_start["match_id"].as_str().unwrap();
     let start_pos = (
         game_start["starting_position"][0].as_f64().unwrap() as f32,
         game_start["starting_position"][1].as_f64().unwrap() as f32,
@@ -156,7 +159,7 @@ async fn full_throttle_command_moves_the_ship_each_tick() {
         last_pos = pos;
 
         let cmd = format!(
-            r#"{{"type":"command","tick":{tick},"throttle":1.0,"rudder":0.0,"sensor_mode":"passive"}}"#
+            r#"{{"type":"command","match_id":"{match_id}","tick":{tick},"throttle":1.0,"rudder":0.0,"sensor_mode":"passive"}}"#
         );
         ws.send(Message::Text(cmd)).await.expect("send command");
     }
@@ -188,10 +191,12 @@ async fn late_command_yields_error_and_keeps_bot_alive() {
     ))
     .await
     .expect("send hello");
-    let _ = recv_typed(&mut ws, "welcome").await;
-    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
-        .await
-        .expect("send ready");
+    let welcome = recv_typed(&mut ws, "welcome").await;
+    ws.send(Message::Text(
+        serde_json::json!({"type":"ready", "config_hash": welcome["config_hash"]}).to_string(),
+    ))
+    .await
+    .expect("send ready");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -203,7 +208,8 @@ async fn late_command_yields_error_and_keeps_bot_alive() {
         .await
         .expect("send start");
     reply_rx.await.expect("oneshot").expect("start ok");
-    let _ = recv_typed(&mut ws, "game_start").await;
+    let game_start = recv_typed(&mut ws, "game_start").await;
+    let match_id = game_start["match_id"].as_str().unwrap();
 
     let first = recv_typed(&mut ws, "tick").await;
     let tick = first["tick"].as_u64().unwrap();
@@ -212,7 +218,7 @@ async fn late_command_yields_error_and_keeps_bot_alive() {
     tokio::time::sleep(Duration::from_millis(120)).await;
 
     let cmd = format!(
-        r#"{{"type":"command","tick":{tick},"throttle":1.0,"rudder":1.0,"sensor_mode":"active"}}"#
+        r#"{{"type":"command","match_id":"{match_id}","tick":{tick},"throttle":1.0,"rudder":1.0,"sensor_mode":"active"}}"#
     );
     ws.send(Message::Text(cmd))
         .await
@@ -263,11 +269,13 @@ async fn idle_bot_keeps_previous_controls() {
     ))
     .await
     .expect("send hello");
-    let _ = recv_typed(&mut ws, "welcome").await;
+    let welcome = recv_typed(&mut ws, "welcome").await;
 
-    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
-        .await
-        .expect("send ready");
+    ws.send(Message::Text(
+        serde_json::json!({"type":"ready", "config_hash": welcome["config_hash"]}).to_string(),
+    ))
+    .await
+    .expect("send ready");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -279,7 +287,8 @@ async fn idle_bot_keeps_previous_controls() {
         .await
         .expect("send start");
     reply_rx.await.expect("oneshot").expect("start ok");
-    let _ = recv_typed(&mut ws, "game_start").await;
+    let game_start = recv_typed(&mut ws, "game_start").await;
+    let match_id = game_start["match_id"].as_str().unwrap();
 
     // Send one command, then go silent and verify throttle/rudder persist in subsequent
     // tick frames. Because tick frames may already be in flight when the command lands,
@@ -288,7 +297,7 @@ async fn idle_bot_keeps_previous_controls() {
     let first = recv_typed(&mut ws, "tick").await;
     let tick = first["tick"].as_u64().unwrap();
     let cmd = format!(
-        r#"{{"type":"command","tick":{tick},"throttle":0.6,"rudder":-0.2,"sensor_mode":"passive"}}"#
+        r#"{{"type":"command","match_id":"{match_id}","tick":{tick},"throttle":0.6,"rudder":-0.2,"sensor_mode":"passive"}}"#
     );
     ws.send(Message::Text(cmd)).await.expect("send command");
 

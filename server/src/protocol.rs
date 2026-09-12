@@ -21,9 +21,16 @@ pub enum BotMsg {
     Hello {
         name: String,
         version: String,
+        #[serde(default)]
+        token: String,
     },
-    Ready,
+    Ready {
+        #[serde(default)]
+        config_hash: String,
+    },
     Command {
+        #[serde(default)]
+        match_id: String,
         tick: u64,
         throttle: f32,
         rudder: f32,
@@ -40,9 +47,7 @@ pub enum BotMsg {
     /// be sent while the room is in `lobby` and before `ready`. Sending it twice replaces
     /// the previous selection; an invalid loadout earns a typed `error` frame and leaves
     /// the previous selection (if any) intact.
-    SelectPowerups {
-        powerups: Vec<PowerupId>,
-    },
+    SelectPowerups { powerups: Vec<PowerupId> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -65,7 +70,13 @@ pub enum SensorMode {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    Configuration {
+        config_hash: String,
+        configuration: Box<serde_json::Value>,
+    },
     Welcome {
+        config_hash: String,
+        configuration: Box<serde_json::Value>,
         protocol_version: String,
         simulation_dt: f32,
         bot_id: String,
@@ -79,6 +90,7 @@ pub enum ServerMsg {
         available_powerups: Vec<PowerupId>,
     },
     GameStart {
+        match_id: String,
         ship_specs: ShipSpecs,
         simulation_dt: f32,
         tick: u64,
@@ -86,6 +98,7 @@ pub enum ServerMsg {
         starting_heading_deg: f32,
     },
     Tick {
+        match_id: String,
         tick: u64,
         deadline_ms: u64,
         #[serde(rename = "self")]
@@ -389,11 +402,15 @@ mod tests {
     #[test]
     fn bot_msg_roundtrips() {
         roundtrip(&BotMsg::Hello {
+            token: "test-token".into(),
             name: "captain_kirk".into(),
             version: "1.0".into(),
         });
-        roundtrip(&BotMsg::Ready);
+        roundtrip(&BotMsg::Ready {
+            config_hash: "test-config".into(),
+        });
         roundtrip(&BotMsg::Command {
+            match_id: "test-match".into(),
             tick: 142,
             throttle: 0.8,
             rudder: -0.3,
@@ -405,6 +422,7 @@ mod tests {
             activate_powerup: None,
         });
         roundtrip(&BotMsg::Command {
+            match_id: "test-match".into(),
             tick: 143,
             throttle: 0.0,
             rudder: 0.0,
@@ -420,6 +438,8 @@ mod tests {
     #[test]
     fn server_msg_roundtrips() {
         roundtrip(&ServerMsg::Welcome {
+            config_hash: "test-config".into(),
+            configuration: Box::new(serde_json::json!({})),
             protocol_version: "2.0".into(),
             simulation_dt: crate::sim::constants::DT,
             bot_id: "b_3".into(),
@@ -433,6 +453,7 @@ mod tests {
             available_powerups: PowerupId::all().to_vec(),
         });
         roundtrip(&ServerMsg::GameStart {
+            match_id: "test-match".into(),
             ship_specs: ShipSpecs::from_config(&crate::sim::SimConfig::default()),
             simulation_dt: crate::sim::constants::DT,
             tick: 0,
@@ -440,6 +461,7 @@ mod tests {
             starting_heading_deg: 90.0,
         });
         roundtrip(&ServerMsg::Tick {
+            match_id: "test-match".into(),
             tick: 142,
             deadline_ms: 80,
             self_state: SelfState {
@@ -578,6 +600,7 @@ mod tests {
                 fire,
                 sensor_mode,
                 activate_powerup,
+                ..
             } => {
                 assert_eq!(tick, 142);
                 assert!((throttle - 0.8).abs() < 1e-6);

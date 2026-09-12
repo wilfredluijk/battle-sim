@@ -1,4 +1,4 @@
-# Wire Protocol
+# Wire Protocol (v3)
 
 Public contract between the naval-battle server and bot / spectator clients. This doc and `server/src/protocol.rs` are mirrors — when one changes, the other changes in the same commit.
 
@@ -14,6 +14,10 @@ Public contract between the naval-battle server and bot / spectator clients. Thi
 
 ---
 
+Production entry point: `wss://93.190.187.250/bot`. Only the exact `/bot` path is public. Static UI, all `/api/*` routes and `/spectate` are reached through an SSH tunnel. Every sensitive read and write requires administrator authorization, including loopback clients.
+
+Protocol v3 requires a participant credential in `hello`, a configuration hash in `ready`, and a match ID in every command. Older bot clients must update. The Python SDK accepts `url=` / `token=` or `BATTLE_SERVER_URL` / `BATTLE_BOT_TOKEN`; `wss://` uses normal certificate and hostname verification.
+
 ## 1. Bot endpoint — `/bot`
 
 ### 1.1 Bot → Server
@@ -22,7 +26,7 @@ Public contract between the naval-battle server and bot / spectator clients. Thi
 First message after the WebSocket connects.
 
 ```json
-{ "type": "hello", "name": "captain_kirk", "version": "1.0" }
+{ "type": "hello", "name": "captain_kirk", "version": "naval-sdk/0.4.0", "token": "participant-credential" }
 ```
 
 | Field | Type | Notes |
@@ -34,7 +38,7 @@ First message after the WebSocket connects.
 Sent after `welcome` is received and the bot is willing to start.
 
 ```json
-{ "type": "ready" }
+{ "type": "ready", "config_hash": "sha256-from-welcome-or-configuration" }
 ```
 
 #### `select_powerups`
@@ -56,6 +60,7 @@ Sent once per tick in response to a `tick` message. Echo the tick number from th
 ```json
 {
   "type": "command",
+  "match_id": "id-from-the-tick",
   "tick": 142,
   "throttle": 0.8,
   "rudder": -0.3,
@@ -84,7 +89,9 @@ Acknowledges the `hello` and assigns identifiers and gameplay constants.
 ```json
 {
   "type": "welcome",
-  "protocol_version": "2.0",
+  "protocol_version": "3.0",
+  "config_hash": "sha256-of-configuration",
+  "configuration": { "revision": 1, "sim_config": {}, "...": "see below" },
   "simulation_dt": 0.1,
   "bot_id": "b_3",
   "ship_id": "s_3",
@@ -122,6 +129,7 @@ Sent whenever a match starts, including Monte Carlo matches. `ship_specs` and `s
 ```json
 {
   "type": "game_start",
+  "match_id": "unique-per-match",
   "tick": 0,
   "starting_position": [120.0, 340.0],
   "starting_heading_deg": 90.0,
@@ -149,6 +157,7 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
 ```json
 {
   "type": "tick",
+  "match_id": "unique-per-match",
   "tick": 142,
   "deadline_ms": 80,
   "self": {
@@ -227,9 +236,17 @@ Sent in response to a malformed or otherwise-rejected bot frame. See [§3 Error 
 
 The `message` field is human-readable and intended for logs / debugger output. It is *not* a stable contract — bots should branch on `code`, never on substring matches against `message`. Where useful, the server includes context (tick number, ms over deadline, ticks of cooldown remaining, expected schema); the exact wording may evolve.
 
-### 1.3 Late and missing commands
+### 1.3 Exact command admission and configuration agreement
 
-If a `command` arrives after the per-tick deadline, the server replies with `error` (`code: "late_command"`) and applies the previous tick's `throttle` / `rudder` / `sensor_mode`. No shot is fired that tick. The bot is **not** disconnected for missing or late commands — only for repeated protocol violations.
+`welcome.configuration` contains the complete `SimConfig` (including powerups), ship specs, protocol and configuration revision, fixed simulation timestep, tick rate, map, capacity, deadline, match timeout, available powerups, placement policy, forfeit rule, action phase order and tie rule. `config_hash` is SHA-256 of the server's serialized configuration. Echo this opaque hash in `ready`. The SDK exposes `Bot.accept_configuration(configuration, config_hash)` so a bot can refuse settings. A lobby configuration change clears every readiness flag and broadcasts `{ "type": "configuration", "config_hash": "...", "configuration": {...} }`; all bots must acknowledge again. The configuration is frozen while running.
+
+`game_start` and every `tick` include a fresh match identifier. A command must echo that identifier and the exact tick being answered. The first valid command received for that tick wins; later commands return `duplicate_command`. Old matches, earlier/future ticks, inactive/dead bots and messages received after the common cutoff are rejected before entering shared processing. Each connection has one command slot. The ingress timestamp is taken immediately when a complete WebSocket message is read, before JSON parsing. All bot windows open against the same monotonic deadline before views are built.
+
+Missing or late commands preserve throttle, rudder and sensor mode but do not repeat fire or powerup activations. `late_command` and `wrong_tick` errors do not disconnect a bot; repeated other violations do. At the deployed 10 Hz rate the budget is 80 ms total for travel in both directions and bot computation. Physics always uses `DT=0.1`; the binary rejects a deadline greater than or equal to the tick interval.
+
+Participant tokens are bound to roster identities; supplied display names cannot impersonate another participant. Only one active connection per identity is permitted. The roster file is rechecked every five seconds; disabling or rotating a token disconnects its existing session. Connections are limited globally to 32, each WebSocket frame/message to 16 KiB, bot traffic to 40 messages and 64 KiB per second, and HTTP bodies to 16 KiB. The proxy adds HTTP header timeouts, connection limits and connection-attempt throttling that accommodate eight players sharing a NAT. WebSocket writes time out after two seconds; heartbeats run every five seconds and peers idle for fifteen seconds are closed at the next heartbeat check (at most roughly twenty seconds).
+
+Eliminated bots receive no further sensor views and cannot submit gameplay commands. Disconnects and kicks during a match forfeit the ship: retain its hull and ownership with zero HP and `alive=false`, retain projectiles and scoring history, and remove the disconnected roster entry only when returning to the lobby. At timeout, highest HP then highest remaining ammo wins; equal best scores draw. Commands execute in phases: all controls, all powerup activations, all fire, movement, then shells. Tournament starts use fresh secret OS randomness and constrained random placement. Sensor and powerup streams are reproducibly derived per bot, tick and purpose using SHA-256; seeds remain private during play.
 
 ### 1.4 Match lifecycle
 
@@ -248,6 +265,8 @@ hello → welcome → [select_powerups] → ready → game_start → tick* → g
 ---
 
 ## 2. Spectator endpoint — `/spectate`
+
+The first frame must be `{ "type": "authenticate", "token": "admin-jwt" }`, received within five seconds. No subscription or world data is sent before verification. Tokens are checked periodically for expiry. Browsers select `wss://` on HTTPS pages and `ws://` for the local SSH tunnel.
 
 Read-only: the server pushes ground-truth state every tick, ignores anything the spectator sends.
 
@@ -328,7 +347,7 @@ Read-only: the server pushes ground-truth state every tick, ignores anything the
 
 Operator control is a plain HTTP/JSON REST API, not a WebSocket. The spectator web UI uses it to inspect and drive the room; there is no stdin command interface.
 
-**Authentication.** Mutating routes require a JSON Web Token. Obtain one with `POST /api/login`, then send it as `Authorization: Bearer <jwt>` on every mutating request. The admin password is set with `--admin-password` (or the `BATTLE_ADMIN_PASSWORD` env var); when neither is provided the server generates a random password and logs it once at `INFO` on startup. Tokens expire after `--token-ttl-hours` hours (default 12).
+**Authentication.** All sensitive reads and mutations require a JSON Web Token. Obtain one with `POST /api/login`, then send it as `Authorization: Bearer <jwt>` on every API request except login. Provide the admin password through `BATTLE_ADMIN_PASSWORD_FILE` or `BATTLE_ADMIN_PASSWORD`; it is required and never logged. Tokens expire after `--token-ttl-hours` hours (default 12) and are invalidated on restart.
 
 **Errors.** Any non-2xx response carries a JSON body `{ "code": "...", "message": "..." }`. Successful mutations return `204 No Content`.
 
@@ -337,9 +356,9 @@ Operator control is a plain HTTP/JSON REST API, not a WebSocket. The spectator w
 | Method & path | Auth | Success | Purpose |
 |---|---|---|---|
 | `POST /api/login` | — | `200` | Exchange the admin password for a JWT. |
-| `GET /api/room` | public | `200` | Current room state plus the active balance parameters. |
-| `GET /api/room/report` | public | `200` / `404` | Most recent match report (`404` until a match has finished). |
-| `GET /api/config/schema` | public | `200` | Metadata for the pre-match parameter form. |
+| `GET /api/room` | admin | `200` | Current room state plus the active balance parameters. |
+| `GET /api/room/report` | admin | `200` / `404` | Most recent match report (`404` until a match has finished). |
+| `GET /api/config/schema` | admin | `200` | Metadata for the pre-match parameter form. |
 | `PUT /api/room/config` | admin | `204` | Replace the match parameters. Only valid in the lobby. |
 | `POST /api/room/start` | admin | `204` | Lobby → Running. Refused if not in lobby, no bots, or not all ready. |
 | `POST /api/room/abort` | admin | `204` | Force-end the running match (`game_over` with `winner: null`). |
@@ -446,8 +465,7 @@ Returns `404` with code `unknown_bot` when no bot holds that id.
 
 Read-only routes that back the spectator's replay viewer. They re-run a recorded match
 server-side and return the reconstructed timeline as JSON. No JWT is required, but — like
-`/spectate` — they are restricted to loopback peers when the server runs in tournament
-mode (`403` `tournament_mode` otherwise), because replays expose ground-truth state.
+`/spectate` — they require an administrator bearer token on every request, including loopback (`401` otherwise), because replays expose ground-truth state.
 
 | Method & path | Success | Purpose |
 |---|---|---|
@@ -458,7 +476,7 @@ mode (`403` `tournament_mode` otherwise), because replays expose ground-truth st
 `{id}` is an opaque replay id (ordinary matches include the room, nanosecond timestamp, process ID, and a counter); it is validated against
 `[A-Za-z0-9_-]` and rejected with `400` `invalid_replay_id` otherwise. A missing file
 returns `404` `replay_not_found`; a log older than the current replay format returns `422`
-`unsupported_replay_version`. Current replay format is **v6**; older simulation versions cannot reproduce the corrected mechanics. Invalid or oversized logs return `422 invalid_replay`. Readers cap logs at 64 MiB, 3000 ticks, 256 bots, and 3258 records, validate ordering and finite values, and reject timelines extending past a simulated match end. Tick rates must be 1–1000. Each captured timeline is also capped at 64 MiB of frame JSON and aborts immediately when it reaches the budget. At most two replay captures run concurrently; excess requests return `503 replay_busy`. Replay files are created exclusively, so a collision cannot overwrite an existing match.
+`unsupported_replay_version`. Current replay format is **v7**; older simulation versions cannot reproduce the corrected mechanics. Invalid or oversized logs return `422 invalid_replay`. Readers cap logs at 64 MiB, 3000 ticks, 256 bots, and 3258 records, validate ordering and finite values, and reject timelines extending past a simulated match end. Tick rates must be 1–1000. Each captured timeline is also capped at 64 MiB of frame JSON and aborts immediately when it reaches the budget. At most two replay captures run concurrently; excess requests return `503 replay_busy`. Replay files are created exclusively, so a collision cannot overwrite an existing match.
 
 ### 2.6.1 `GET /api/replays`
 
@@ -486,7 +504,7 @@ every tick.
 
 ```json
 {
-  "header": { "version": 6, "replay_id": "...", "seed": 42, "map": { "...": "..." },
+  "header": { "version": 7, "replay_id": "...", "seed": 42, "map": { "...": "..." },
               "sim_config": { "...": "..." },
               "bots": [ { "bot_id": "b_1", "ship_id": "s_1", "name": "powerful",
                           "selected_powerups": ["overdrive", "rapid_fire"],
@@ -499,13 +517,11 @@ every tick.
 `frames` has `final_tick + 1` entries: index `0` is the starting layout, index `t` is the
 world after tick `t`. `end` is `null` for an incomplete log.
 
-**On-disk log format v6.** The JSONL log driving these endpoints carries `header`, `tick`,
+**On-disk log format v7.** The JSONL log driving these endpoints carries `header`, `tick`,
 `disconnect`, and `end` records. A `disconnect` record —
 `{ "type": "disconnect", "tick": T, "bot_id": "b_2" }` — is written whenever a bot
 disconnects or is kicked mid-match (while the room is `running`); `T` is the last tick the
-ship participated in. Re-simulation removes the ship at exactly that point so the shared RNG
-stream and the recorded outcome stay bit-identical (the ship simply vanishes from later
-`frames`). Only version 6 is accepted: earlier versions use different simulation semantics.
+ship participated in. Re-simulation applies the same deterministic forfeit at that point; the dead hull and ownership remain for scoring. Only version 7 is accepted: earlier versions use different simulation semantics.
 
 CLI `--replay` playback advances once per simulated tick at the recorded `tick_hz`, including gaps without commands. The room REST API remains available, the viewer stays on the battlefield, and playback freezes on the final frame until shutdown. CLI replay mode is read-only.
 
@@ -530,6 +546,8 @@ empty `contacts` and `events`. An unknown `bot_id` returns `404` `unknown_bot`.
 
 ## 2.7 Monte Carlo batch runner — `/api/montecarlo/*` (REST)
 
+Monte Carlo is an offline analysis mode and is refused by `--tournament`. This keeps the public training server on the exact, acknowledged fixed configuration. Use a separate local instance for batch experiments.
+
 Admin-only routes that drive a sequence of matches against the same connected bot roster,
 varying the starting positions per match and reporting which bot wins most often. The
 batch runs in **lockstep mode** — the server waits for every bot to send its command for
@@ -545,7 +563,7 @@ matches. Every match's replay is preserved in the replay directory.
 | `POST /api/montecarlo/stop` | `204` | Stop the active batch. Body: `{ "force_abort": bool }` (optional). |
 | `GET /api/montecarlo/status` | `200` | Snapshot of the active or most-recent run. |
 
-`start` and `stop` require `Authorization: Bearer <jwt>`. `status` is public so the
+`start`, `stop` and `status` require `Authorization: Bearer <jwt>`. The
 spectator UI can poll it without holding admin credentials.
 
 Preconditions for `start`: the room must be in `lobby`, at least two bots must be
@@ -664,25 +682,30 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `powerup_not_selected` | `command.activate_powerup` named a powerup the bot didn't pick for this match. |
 | `powerup_already_used` | `command.activate_powerup` named a powerup the bot already activated this match. |
 
-After 5 protocol violations on a single bot connection, the server sends `too_many_violations` and closes with WebSocket close code `Policy (1008)`. The violation-counted codes are `malformed_json`, `invalid_message`, `non_finite_value`, and `binary_frames_unsupported`. `handshake_timeout`, `invalid_name`, and `duplicate_name` close the connection on the first occurrence and bypass the counter. `late_command`, `stale_command`, `cooldown_active`, and `no_ammo` are gameplay rejections and do not count against the bot.
+After five protocol violations the bot connection closes. Invalid JSON/schema, non-finite values, binary frames, wrong-match commands, duplicate commands and commands while inactive count as violations. Late and wrong-tick commands are rejected without disconnecting a legitimate slow bot. Exceeding the message/byte budget closes the connection immediately with `rate_limited` when the socket is writable. Authentication failures never allocate a room slot.
 
-One further server-side limit is enforced without a dedicated error code:
+Per-IP and global WebSocket caps are checked before upgrade and return HTTP 503. HTTP header/TCP limits are enforced separately by the production proxy; the application hello timeout starts after upgrade.
 
-- **Per-IP connection cap** — when the peer IP is at `--max-connections-per-ip`, the TCP stream is dropped *before* the WebSocket handshake completes. The bot observes a connection close with no error frame.
-
-WebSocket messages are capped at 16 KiB. The `/spectate` endpoint can be restricted to the loopback interface with `--tournament` so competing bots cannot use it to bypass the sensor filter.
+WebSocket messages are capped at 16 KiB. The `/spectate` endpoint always requires administrator authentication before sending any ground truth.
 
 ---
 
 ## 4. Versioning
 
-`welcome.protocol_version` identifies the wire contract (currently `"2.0"`). Additive optional fields are backwards-compatible. Renamed or removed fields, type changes, and changed semantics require a protocol version bump. Replay simulation compatibility is tracked separately by the header's integer `version`.
+`welcome.protocol_version` identifies the wire contract (currently `"3.0"`). Additive optional fields are backwards-compatible. Renamed or removed fields, type changes, and changed semantics require a protocol version bump. Replay simulation compatibility is tracked separately by the header's integer `version`.
 
 ---
 
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-09-12 — protocol 3.0 and replay format 7
+
+- Participant credentials, protected admin reads/spectators, verified TLS clients, exact match/tick command slots and resource limits.
+- Complete configuration/hash acknowledgement and invalidation on lobby changes.
+- Deterministic forfeits, no eliminated-player scouting, tied scores draw, phased actions, independent reproducible random streams and secret tournament seeds.
+- Replay format 7 is required for these changed simulation semantics. Deployment image identity is recorded beside each replay.
 
 ## 2026-09-11 — protocol 2.0 and replay format 6
 

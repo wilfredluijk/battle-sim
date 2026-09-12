@@ -59,7 +59,7 @@ use crate::sim::{PowerupId, SimConfig};
 ///
 /// v6 changes sensor observations, effect windows, decoys and hull splash geometry.
 /// Older simulation inputs cannot be reproduced faithfully by this implementation.
-pub const REPLAY_FORMAT_VERSION: u32 = 6;
+pub const REPLAY_FORMAT_VERSION: u32 = 7;
 const MAX_REPLAY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REPLAY_BOTS: usize = 256;
 
@@ -227,6 +227,20 @@ impl ReplayWriter {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{replay_id}.jsonl"));
         let file = File::options().write(true).create_new(true).open(&path)?;
+        // Keep the immutable deployed image ID next to each replay without making it
+        // part of deterministic simulation inputs.
+        if let Ok(image_id) = std::env::var("BATTLE_IMAGE_ID") {
+            let meta = dir.join(format!("{replay_id}.build.json"));
+            let mut build = File::options().write(true).create_new(true).open(meta)?;
+            serde_json::to_writer(
+                &mut build,
+                &serde_json::json!({
+                    "image_id": image_id, "release": std::env::var("BATTLE_RELEASE").unwrap_or_default(),
+                    "replay_format": REPLAY_FORMAT_VERSION,
+                }),
+            )?;
+            build.flush()?;
+        }
         Ok(Self {
             sink: Box::new(BufWriter::new(file)),
             replay_id,
@@ -697,7 +711,7 @@ pub async fn run_replay_with_events(
         while next < records.len() {
             match &records[next] {
                 ReplayRecord::Disconnect(rec) if rec.tick == room.world.tick => {
-                    room.remove_bot_and_ship(&rec.bot_id);
+                    room.forfeit_bot(&rec.bot_id);
                     next += 1;
                 }
                 ReplayRecord::End(rec) if rec.tick == room.world.tick => {
@@ -805,7 +819,7 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
                 advance_to(&mut room, rec.tick, |_| {
                     drain_spectator_frames(&mut spec_rx, &mut frames, &mut capture_budget)
                 })?;
-                room.remove_bot_and_ship(&rec.bot_id);
+                room.forfeit_bot(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
@@ -895,7 +909,7 @@ pub fn capture_perspective(
                 advance_to(&mut room, rec.tick, |_| {
                     drain_perspective(&mut outbound, bot_id, &mut views, &mut capture_budget)
                 })?;
-                room.remove_bot_and_ship(&rec.bot_id);
+                room.forfeit_bot(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {

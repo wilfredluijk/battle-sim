@@ -11,3 +11,9 @@ __pycache__/
 /spectator/node_modules/
 /spectator/.svelte-kit/
 /spectator/vite.config.ts.timestamp-*.mjs
+
+# Deployment credentials and large release artifacts
+.deployment-secrets/
+release-artifacts/
+*.tar
+*.tar.sha256

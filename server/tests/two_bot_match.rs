@@ -38,11 +38,10 @@ async fn start_server() -> ServerHandle {
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
 
-    let mut config = Config::parse_from(["test"]);
+    let mut config = Config::parse_from(["test", "--allow-unauthenticated-bots"]);
     config.port = port;
-    // 100 Hz keeps the test under ~10s in the common case while leaving plenty of headroom
-    // for the tokio interval to keep up on a loaded CI runner.
-    config.tick_hz = 100;
+    // Exercise the production 10 Hz / 80 ms timing budget.
+    config.tick_hz = 10;
     config.tick_deadline_ms = 80;
 
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
@@ -140,9 +139,11 @@ async fn handshake(sink: &mut WsSink, stream: &mut WsStream, name: &str) -> Stri
         .expect("bot_id in welcome")
         .to_string();
 
-    sink.send(Message::Text(r#"{"type":"ready"}"#.into()))
-        .await
-        .expect("send ready");
+    sink.send(Message::Text(
+        serde_json::json!({"type":"ready", "config_hash": welcome["config_hash"]}).to_string(),
+    ))
+    .await
+    .expect("send ready");
     bot_id
 }
 
@@ -159,6 +160,7 @@ async fn drive_until_game_over(
             Some("game_start") => continue,
             Some("tick") => {
                 let tick = msg["tick"].as_u64().expect("tick number");
+                let match_id = msg["match_id"].as_str().unwrap();
                 let cmd = if shoot {
                     let contacts = msg["contacts"].as_array();
                     let fire = contacts
@@ -174,11 +176,11 @@ async fn drive_until_game_over(
                         })
                         .unwrap_or_default();
                     format!(
-                        r#"{{"type":"command","tick":{tick},"throttle":1.0,"rudder":0.0,"sensor_mode":"active"{fire}}}"#
+                        r#"{{"type":"command","match_id":"{match_id}","tick":{tick},"throttle":1.0,"rudder":0.0,"sensor_mode":"active"{fire}}}"#
                     )
                 } else {
                     format!(
-                        r#"{{"type":"command","tick":{tick},"throttle":0.0,"rudder":0.0,"sensor_mode":"passive"}}"#
+                        r#"{{"type":"command","match_id":"{match_id}","tick":{tick},"throttle":0.0,"rudder":0.0,"sensor_mode":"passive"}}"#
                     )
                 };
                 sink.send(Message::Text(cmd)).await.expect("send command");

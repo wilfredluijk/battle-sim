@@ -1,5 +1,17 @@
 # naval-sdk
 
+For the internet training server, use SDK 0.4 / protocol 3:
+
+```python
+from naval_sdk import run
+run(MyBot(), url="wss://93.190.187.250/bot", token=participant_credential)
+```
+
+Existing examples also accept `BATTLE_SERVER_URL` and `BATTLE_BOT_TOKEN` through the environment. `wss://` verifies the certificate and IP/hostname normally. Each participant receives one private credential; the server reserves the corresponding identity. See [VPS operation](../deploy/README.md) for participant files and private administrator access.
+
+The SDK echoes the exact match ID and tick for every command, acknowledges the complete configuration hash before readiness, and acknowledges again after a configuration change. Inspect `welcome.configuration` and `welcome.config_hash`, or override `Bot.accept_configuration(configuration, config_hash)` to refuse rules. Missing or late commands preserve controls but never repeat a shot/powerup. Eliminated bots stop receiving sensor updates and wait for `game_over`.
+
+
 Reference Python SDK for the **battle-sim** naval hackathon game. Subclass
 `Bot`, override `on_tick`, and the SDK handles the WebSocket transport,
 protocol framing, handshake, and message dispatch for you. You write
@@ -632,7 +644,7 @@ lead_target(shooter_pos, target_pos, target_vel,
             shell_speed) -> Optional[(x, y)]     # None if unreachable
 ```
 
-### `run(bot, *, host="localhost", port=7878, name="bot", version="naval-sdk/0.1.0", path="/bot") -> Optional[GameOver]`
+### `run(bot, *, host="localhost", port=7878, name="bot", version="naval-sdk/0.4.0", path="/bot", url=None, token=None) -> Optional[GameOver]`
 
 Synchronous entry point. Wraps `asyncio.run()`. Returns the `GameOver`
 payload if the match completed, else `None`.

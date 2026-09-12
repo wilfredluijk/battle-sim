@@ -1,5 +1,7 @@
 # Naval Battle Simulator
 
+Public VPS operation: see [deployment runbook](deploy/README.md). Players connect to `wss://93.190.187.250/bot` with an individual credential; the admin UI is private behind SSH.
+
 A hackathon programming game. Players write bots in any language, connect them
 to a central Rust server over WebSocket, and battle in a deterministic top-down
 naval simulation. A browser spectator renders matches live, and every match is
@@ -43,7 +45,7 @@ npm install        # one-time
 npm run build      # emits dist/{index.html,index.js,index.css}
 
 cd ../server
-cargo run -- --port 7878 --tick-hz 10 --seed 42
+BATTLE_ADMIN_PASSWORD="$(openssl rand -base64 32)" cargo run -- --port 7878 --tick-hz 10 --seed 42 --allow-unauthenticated-bots
 ```
 
 That boots a single room called `main` listening on `127.0.0.1:7878`. The room
@@ -51,9 +53,7 @@ is driven entirely over the REST control plane (`/api/*`); the spectator web UI
 at `http://localhost:7878/` is the easy way to log in, set match parameters, and
 start the match once every connected bot has signaled `ready`.
 
-The server prints a one-time admin password at startup (look for the
-`admin password` log line). Pin a fixed one with `--admin-password` or the
-`BATTLE_ADMIN_PASSWORD` env var. Hit Ctrl-C to shut down cleanly.
+Provide `BATTLE_ADMIN_PASSWORD_FILE` (preferred) or `BATTLE_ADMIN_PASSWORD` with a random password of at least 16 characters. Passwords are never logged. Bots require `BATTLE_BOT_CREDENTIALS_FILE`; use `--allow-unauthenticated-bots` only for a local development instance. SIGINT and SIGTERM shut down cleanly.
 
 ### Or use Docker
 
@@ -65,10 +65,7 @@ docker compose up --build
 ```
 
 The server listens on `127.0.0.1:7878` — open the spectator UI there to drive
-the room. Replays land in `./replays/` via a bind-mount. The admin password is
-printed in the container logs (`docker compose logs`); pin it by setting
-`BATTLE_ADMIN_PASSWORD` in the compose file's `environment`. Stop with
-`docker compose down`.
+the room. Set `BATTLE_ADMIN_PASSWORD` before starting Compose. Local replays use a Docker volume. The production Compose file runs a pinned release as a non-root user, publishes only to loopback and reads credentials from protected files. Stop with `docker compose down`.
 
 ### Spectator dev loop
 
@@ -100,8 +97,8 @@ Run `npm test` for the Vitest unit tests against `src/lib/`.
 | `--replay <FILE>` | — | Replay a saved match instead of accepting bot connections |
 | `--max-connections-per-ip` | `25` | Max simultaneous TCP connections per peer IP (`0` disables the cap) |
 | `--handshake-timeout-secs` | `5` | Seconds to wait for the HTTP head + WebSocket `hello` before dropping a half-open connection |
-| `--tournament` | `false` | Restrict `/spectate` to loopback so bots can't subscribe to ground-truth state |
-| `--admin-password` | random | Password for `POST /api/login` (logged once at startup if unset; also `BATTLE_ADMIN_PASSWORD`) |
+| `--tournament` | `false` | Fresh secret seeds, random hidden starts, fixed acknowledged configuration |
+| `--admin-password` | required | Password for `POST /api/login` (also `BATTLE_ADMIN_PASSWORD`; prefer `--admin-password-file`) |
 | `--token-ttl-hours` | `12` | Lifetime of issued admin JWTs |
 
 `cargo run -- --help` prints the same list.
@@ -129,7 +126,7 @@ quick smoke test with `wscat`:
 wscat -c ws://localhost:7878/bot
 > {"type":"hello","name":"manual_bot","version":"1.0"}
 < {"type":"welcome","bot_id":"b_1",...}
-> {"type":"ready"}
+> {"type":"ready","config_hash":"copy-from-welcome"}
 ```
 
 Then start the match from the spectator UI's pre-match lobby (log in with the

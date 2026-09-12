@@ -21,7 +21,7 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
 
-    let mut config = Config::parse_from(["test"]);
+    let mut config = Config::parse_from(["test", "--allow-unauthenticated-bots"]);
     config.port = port;
 
     let (shutdown_tx, _) = broadcast::channel::<()>(4);

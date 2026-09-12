@@ -81,6 +81,19 @@ fn game_start_publishes_current_specs_after_lobby_changes() {
     let (reply, mut rx) = oneshot::channel();
     room.handle_event(RoomEvent::OperatorConfigure { config, reply });
     rx.try_recv().unwrap().unwrap();
+    let ServerMsg::Configuration {
+        config_hash,
+        configuration,
+    } = bot.outbound.try_recv().unwrap()
+    else {
+        panic!("configuration must be published before readiness");
+    };
+    assert_eq!(configuration["sim_config"]["shell_speed"], 123.);
+    assert!(!room.all_ready());
+    room.handle_event(RoomEvent::BotReadyChecked {
+        bot_id: bot.bot_id.clone(),
+        config_hash,
+    });
     start(&mut room);
     match bot.outbound.try_recv().unwrap() {
         ServerMsg::GameStart {

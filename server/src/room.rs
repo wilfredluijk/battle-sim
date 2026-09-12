@@ -11,10 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::ingress::CommandSlot;
 use glam::Vec2;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_pcg::Pcg64;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -73,6 +75,8 @@ pub enum RoomState {
 #[derive(Debug)]
 #[allow(dead_code)] // `name`/`peer` are read by Phase 7 (spectator) / Phase 11 (kick).
 struct BotEntry {
+    ingress: CommandSlot,
+    disconnected: bool,
     bot_id: BotId,
     ship_id: ShipId,
     name: String,
@@ -115,6 +119,7 @@ pub struct PendingCommand {
 /// What the room hands back to a connection task after a successful `BotConnect`.
 #[derive(Debug)]
 pub struct BotRegistration {
+    pub ingress: CommandSlot,
     pub bot_id: BotId,
     pub ship_id: ShipId,
     /// Receiver for messages the room wants delivered to this bot.
@@ -264,6 +269,10 @@ impl ConfigureError {
 /// single-threaded with respect to its own state; this channel serializes all mutations.
 #[derive(Debug)]
 pub enum RoomEvent {
+    BotReadyChecked {
+        bot_id: BotId,
+        config_hash: String,
+    },
     BotConnect {
         peer: SocketAddr,
         name: String,
@@ -402,6 +411,10 @@ pub struct BotReport {
 
 #[derive(Debug)]
 pub struct Room {
+    pub tournament: bool,
+    match_id: String,
+    config_revision: u64,
+    ingress_notify: Arc<tokio::sync::Notify>,
     pub name: String,
     pub world: World,
     pub state: RoomState,
@@ -478,6 +491,10 @@ impl Room {
         max_bots: u32,
     ) -> Self {
         Self {
+            tournament: false,
+            match_id: String::new(),
+            config_revision: 1,
+            ingress_notify: Arc::default(),
             name,
             world: World::new(width, height, crate::sim::SimConfig::default()),
             state: RoomState::Lobby,
@@ -504,6 +521,37 @@ impl Room {
             mc_original_config: None,
             mc_stop_after_current: false,
         }
+    }
+
+    fn stream_rng(&self, domain: &str, bot_id: &str, tick: u64) -> Pcg64 {
+        let mut hash = Sha256::new();
+        hash.update(self.seed.to_le_bytes());
+        hash.update(domain.as_bytes());
+        hash.update(bot_id.as_bytes());
+        hash.update(tick.to_le_bytes());
+        let digest = hash.finalize();
+        Pcg64::from_seed(digest.into())
+    }
+
+    pub fn configuration(&self) -> serde_json::Value {
+        serde_json::json!({ "protocol_version": "3.0", "revision": self.config_revision,
+            "simulation_dt": crate::sim::constants::DT, "tick_hz": self.tick_hz,
+            "deadline_ms": self.tick_deadline_ms, "map": { "width": self.world.width, "height": self.world.height },
+            "max_bots": self.max_bots, "match_timeout_ticks": MATCH_TIMEOUT_TICKS,
+            "sim_config": self.world.config, "ship_specs": ShipSpecs::from_config(&self.world.config), "available_powerups": PowerupId::all(),
+            "command_policy": "exact_match_and_tick_first_valid_wins",
+            "disconnect_policy": "forfeit_hull_retained", "timeout_ties": "draw",
+            "action_phases": ["controls", "powerups", "fire", "physics", "shells"],
+            "starting_positions": if self.tournament { "constrained_random_hidden" } else { "public_ring" }
+        })
+    }
+    pub fn config_hash(&self) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&self.configuration()).expect("configuration serializes")
+            )
+        )
     }
 
     /// Wire a spectator broadcast channel. Subsequent `step_tick` calls will publish a
@@ -569,6 +617,7 @@ impl Room {
     ///    sensor-filtered combat events.
     /// 7. Snapshot the now-current `Active` pingers for use by next tick's passives.
     pub fn step_tick(&mut self) {
+        let _step_timer = crate::metrics::StepTimer::default();
         // Post-game pause: after a match ends the room stays in `Ended` for
         // `POST_GAME_LOBBY_TICKS` so the spectator UI can show the final frame and bots
         // can react to `game_over`. Once the gap elapses, transition back to `Lobby` and
@@ -589,6 +638,16 @@ impl Room {
             return;
         }
 
+        for entry in self.bots.values_mut() {
+            if let Some(command) = entry.ingress.close() {
+                entry.pending_command = Some(command);
+                record_command_tick(
+                    &mut entry.command_ticks,
+                    self.world.tick,
+                    self.tick_hz as u64,
+                );
+            }
+        }
         let bot_ids: Vec<BotId> = self.bots.keys().cloned().collect();
 
         // Snapshot of commands actually applied this tick, in BotId order. Written to the
@@ -599,60 +658,52 @@ impl Room {
         // via `TickEvent::PowerupActivated` / `SpectatorEvent::PowerupActivated`.
         let mut powerup_activations: Vec<(ShipId, PowerupId)> = Vec::new();
 
-        // 1. Drain pending commands and apply them in BotId order. Fire processed after
-        //    throttle/rudder so a successful shot is reflected in this tick's cooldown.
-        for bot_id in &bot_ids {
-            let cmd = match self.bots.get_mut(bot_id) {
-                Some(entry) => entry.pending_command.take(),
-                None => continue,
-            };
-            let Some(cmd) = cmd else { continue };
-
-            let ship_id = {
-                let entry = self.bots.get_mut(bot_id).expect("present");
+        let commands: Vec<_> = bot_ids
+            .iter()
+            .filter_map(|id| {
+                let entry = self.bots.get_mut(id)?;
+                let cmd = entry.pending_command.take()?;
+                if !self
+                    .world
+                    .ships
+                    .get(&entry.ship_id)
+                    .is_some_and(|s| s.alive)
+                {
+                    return None;
+                }
                 entry.sensor_mode = cmd.sensor_mode;
-                entry.ship_id.clone()
-            };
-            if let Some(ship) = self.world.ships.get_mut(&ship_id) {
+                Some((id.clone(), entry.ship_id.clone(), cmd))
+            })
+            .collect();
+        for (_, ship_id, cmd) in &commands {
+            if let Some(ship) = self.world.ships.get_mut(ship_id) {
                 ship.throttle = cmd.throttle.clamp(-1.0, 1.0);
                 ship.rudder = cmd.rudder.clamp(-1.0, 1.0);
             }
-            if let Some(fire_cmd) = cmd.fire {
-                match combat::fire(
-                    &mut self.world,
-                    &ship_id,
-                    fire_cmd.bearing_deg,
-                    fire_cmd.range,
-                ) {
-                    Ok(()) => {
-                        if let Some(stats) = self.match_stats.get_mut(bot_id) {
-                            stats.shots_fired += 1;
-                        }
-                    }
-                    Err(err) => self.send_fire_error(bot_id, err),
-                }
-            }
+        }
+        for (bot_id, ship_id, cmd) in &commands {
             if let Some(powerup) = cmd.activate_powerup {
-                match powerups::activate(&mut self.world, &ship_id, powerup, &mut self.rng) {
-                    Ok(()) => {
-                        powerup_activations.push((ship_id.clone(), powerup));
-                        info!(
-                            room = %self.name,
-                            bot = %bot_id,
-                            powerup = powerup.as_str(),
-                            tick = self.world.tick,
-                            "powerup activated",
-                        );
-                    }
+                let mut rng = self.stream_rng("powerup", bot_id, self.world.tick);
+                match powerups::activate(&mut self.world, ship_id, powerup, &mut rng) {
+                    Ok(()) => powerup_activations.push((ship_id.clone(), powerup)),
                     Err(err) => self.send_activation_error(bot_id, powerup, err),
                 }
             }
-            // Record the raw command (un-clamped) so a replay re-applies the exact same
-            // input the live run saw. Clamping happens deterministically inside step_tick,
-            // so the post-clamp ship state will match.
+        }
+        for (bot_id, ship_id, cmd) in commands {
+            if let Some(fire) = cmd.fire {
+                match combat::fire(&mut self.world, &ship_id, fire.bearing_deg, fire.range) {
+                    Ok(()) => {
+                        if let Some(stats) = self.match_stats.get_mut(&bot_id) {
+                            stats.shots_fired += 1;
+                        }
+                    }
+                    Err(err) => self.send_fire_error(&bot_id, err),
+                }
+            }
             if self.replay_writer.is_some() {
                 applied_commands.push(ReplayCommand {
-                    bot_id: bot_id.clone(),
+                    bot_id,
                     throttle: cmd.throttle,
                     rudder: cmd.rudder,
                     sensor_mode: cmd.sensor_mode,
@@ -709,6 +760,20 @@ impl Room {
             return;
         }
 
+        let sent_at = Instant::now();
+        self.tick_send_time = Some(sent_at);
+        let cutoff = sent_at + Duration::from_millis(self.command_deadline_ms());
+        for entry in self.bots.values() {
+            if !entry.disconnected
+                && self
+                    .world
+                    .ships
+                    .get(&entry.ship_id)
+                    .is_some_and(|s| s.alive)
+            {
+                entry.ingress.open(&self.match_id, self.world.tick, cutoff);
+            }
+        }
         // 6. Per-bot sensor view + filtered combat events.
         for bot_id in &bot_ids {
             // Look up the bot + ship without holding any borrow on self past the call
@@ -720,15 +785,19 @@ impl Room {
                 let Some(ship) = self.world.ships.get(&entry.ship_id) else {
                     continue;
                 };
+                if !ship.alive || entry.disconnected {
+                    continue;
+                }
                 (entry.ship_id.clone(), entry.sensor_mode, ship.pos)
             };
 
+            let mut sensor_rng = self.stream_rng("sensors", bot_id, self.world.tick);
             let sim_contacts = match sensor_mode {
                 SensorMode::Active => sensors::active_contacts_at(
                     &ship_id,
                     viewer_pos,
                     &self.world,
-                    &mut self.rng,
+                    &mut sensor_rng,
                     self.world.tick.saturating_sub(1),
                 ),
                 SensorMode::Passive => sensors::passive_contacts_at(
@@ -736,7 +805,7 @@ impl Room {
                     viewer_pos,
                     &self.world,
                     &self.previous_active_pingers,
-                    &mut self.rng,
+                    &mut sensor_rng,
                     self.world.tick.saturating_sub(1),
                 ),
             };
@@ -793,6 +862,7 @@ impl Room {
                 })
                 .collect();
             let tick_msg = ServerMsg::Tick {
+                match_id: self.match_id.clone(),
                 tick: world_tick,
                 deadline_ms: self.command_deadline_ms(),
                 self_state: SelfState {
@@ -823,13 +893,15 @@ impl Room {
         self.previous_active_pingers = self
             .bots
             .values()
-            .filter(|b| b.sensor_mode == SensorMode::Active)
+            .filter(|b| {
+                b.sensor_mode == SensorMode::Active
+                    && self.world.ships.get(&b.ship_id).is_some_and(|s| s.alive)
+            })
             .map(|b| b.ship_id.clone())
             .collect();
 
         // Record the deadline reference *after* the broadcast so the bot's allotted
         // window starts when it could actually have received the frame.
-        self.tick_send_time = Some(Instant::now());
     }
 
     /// Returns `Some(winner)` if the match should end this tick, where `winner` is the
@@ -850,10 +922,16 @@ impl Room {
         if self.world.tick >= MATCH_TIMEOUT_TICKS {
             // BTreeMap iteration is BotId-stable, so `max_by_key` deterministically
             // resolves further ties by BotId order (later wins).
-            let winner = alive
+            let best = alive.iter().map(|s| (s.hp, s.ammo)).max();
+            let leaders: Vec<_> = alive
                 .iter()
-                .max_by_key(|s| (s.hp, s.ammo))
-                .map(|s| s.bot_id.clone());
+                .filter(|s| Some((s.hp, s.ammo)) == best)
+                .collect();
+            let winner = if leaders.len() == 1 {
+                Some(leaders[0].bot_id.clone())
+            } else {
+                None
+            };
             return Some(winner);
         }
         None
@@ -1169,6 +1247,18 @@ impl Room {
     /// deterministic from the same `seed`, and broadcasts `ServerMsg::Lobby` to every
     /// bot so SDKs can rearm.
     fn transition_to_lobby(&mut self) {
+        let disconnected: Vec<_> = self
+            .bots
+            .values()
+            .filter(|b| b.disconnected)
+            .map(|b| b.bot_id.clone())
+            .collect();
+        for id in disconnected {
+            self.remove_bot_and_ship(&id);
+        }
+        for b in self.bots.values() {
+            b.ingress.close();
+        }
         info!(room = %self.name, "returning to lobby for next match");
         // A Monte Carlo run must never survive the return to lobby: a leftover `mc_run`
         // would capture the next *normal* match's result and chain leftover MC matches with
@@ -1230,6 +1320,10 @@ impl Room {
     /// Remove a bot from the room and delete its ship. Called both from the natural
     /// disconnect path (the connection task observed a close) and from operator kick.
     fn handle_bot_disconnect(&mut self, bot_id: BotId, reason: &'static str) {
+        // A kick closes the socket; its later transport cleanup must not record a second forfeit.
+        if self.bots.get(&bot_id).is_none_or(|b| b.disconnected) {
+            return;
+        }
         // A mid-match removal shifts the world (one fewer ship → fewer sensor RNG draws →
         // the shared Pcg64 stream diverges → the match may end early). It's therefore a
         // replay input: record it *before* mutating the world so replay re-applies the exact
@@ -1238,9 +1332,12 @@ impl Room {
         if self.state == RoomState::Running && self.bots.contains_key(&bot_id) {
             self.write_replay_disconnect(&bot_id);
         }
-        if self.remove_bot_and_ship(&bot_id) {
-            info!(room = %self.name, bot = %bot_id, reason, "bot removed");
+        if self.state == RoomState::Running {
+            self.forfeit_bot(&bot_id);
+        } else {
+            self.remove_bot_and_ship(&bot_id);
         }
+        info!(room = %self.name, bot = %bot_id, reason, "bot disconnected");
         // A Monte Carlo run requires a stable roster; any disconnect aborts the run.
         // We finalize the controller state but do not force-abort the current match —
         // it will end naturally (or by the timeout) and the chain logic will see the
@@ -1255,6 +1352,24 @@ impl Room {
     /// table) with no network side effects, so both the live handler and the replay driver
     /// (via `ReplayRecord::Disconnect`) call it and stay byte-identical. Returns `true` if a
     /// bot was actually present and removed.
+    /// Deterministic forfeit: retain hull and ownership so projectiles and scoring remain valid.
+    pub fn forfeit_bot(&mut self, bot_id: &BotId) {
+        if let Some(entry) = self.bots.get_mut(bot_id) {
+            entry.disconnected = true;
+            entry.ready = false;
+            entry.pending_command = None;
+            entry.ingress.close();
+            // Drop the live sender so an operator kick closes the socket.
+            let (tx, _) = mpsc::channel(1);
+            entry.outbound = tx;
+            if let Some(ship) = self.world.ships.get_mut(&entry.ship_id) {
+                ship.alive = false;
+                ship.hp = 0;
+                ship.throttle = 0.0;
+                ship.rudder = 0.0;
+            }
+        }
+    }
     pub fn remove_bot_and_ship(&mut self, bot_id: &BotId) -> bool {
         if let Some(entry) = self.bots.remove(bot_id) {
             self.world.ships.remove(&entry.ship_id);
@@ -1314,6 +1429,9 @@ impl Room {
     /// terminal `end` record to the replay log and drops the writer (which flushes the
     /// underlying file).
     fn broadcast_game_over(&mut self, winner: Option<BotId>) {
+        for b in self.bots.values() {
+            b.ingress.close();
+        }
         let final_tick = self.world.tick;
         let replay_id = self
             .replay_id
@@ -1516,6 +1634,22 @@ impl Room {
     /// events are fire-and-forget.
     pub fn handle_event(&mut self, event: RoomEvent) {
         match event {
+            RoomEvent::BotReadyChecked {
+                bot_id,
+                config_hash,
+            } => {
+                if self.state == RoomState::Lobby && config_hash == self.config_hash() {
+                    if let Some(b) = self.bots.get_mut(&bot_id) {
+                        b.ready = true;
+                    }
+                } else if let Some(b) = self.bots.get(&bot_id) {
+                    let _ = b.outbound.try_send(protocol::error_msg(
+                        "config_mismatch",
+                        "accept the current configuration before ready",
+                    ));
+                }
+            }
+
             RoomEvent::BotConnect {
                 peer,
                 name,
@@ -1523,7 +1657,9 @@ impl Room {
                 reply,
             } => {
                 let result = self.register_bot(peer, name, &version);
-                let _ = reply.send(result);
+                if let Err(Ok(reg)) = reply.send(result) {
+                    self.remove_bot_and_ship(&reg.bot_id);
+                }
             }
             RoomEvent::BotReady { bot_id } => {
                 if let Some(entry) = self.bots.get_mut(&bot_id) {
@@ -1638,6 +1774,15 @@ impl Room {
         }
         config.validate().map_err(ConfigureError::Invalid)?;
         self.world.config = config;
+        self.config_revision += 1;
+        let message = ServerMsg::Configuration {
+            config_hash: self.config_hash(),
+            configuration: Box::new(self.configuration()),
+        };
+        for b in self.bots.values_mut() {
+            b.ready = false;
+            let _ = b.outbound.try_send(message.clone());
+        }
         info!(room = %self.name, "match parameters updated");
         Ok(())
     }
@@ -1694,6 +1839,17 @@ impl Room {
     /// throttle / rudder / sensor_mode persist. Out-of-running-state commands are dropped
     /// silently — the ship has nothing to drive yet.
     fn handle_bot_command(&mut self, bot_id: BotId, command: PendingCommand) {
+        if self.state != RoomState::Running {
+            return;
+        }
+        if !self
+            .bots
+            .get(&bot_id)
+            .and_then(|b| self.world.ships.get(&b.ship_id))
+            .is_some_and(|s| s.alive)
+        {
+            return;
+        }
         let now = Instant::now();
         let state = self.state;
         let deadline_ms = self.tick_deadline_ms;
@@ -1713,7 +1869,7 @@ impl Room {
             // The bot must echo the tick of the last frame it received. Accept the current
             // tick plus a one-tick window for racing frame boundaries; anything further
             // out is either a confused bot or a replay attempt.
-            let max_lag: u64 = 1;
+            let max_lag: u64 = 0;
             let min_acceptable = world_tick.saturating_sub(max_lag);
             let max_acceptable = world_tick.saturating_add(max_lag);
             if command.tick < min_acceptable || command.tick > max_acceptable {
@@ -1774,6 +1930,13 @@ impl Room {
             }
         }
 
+        if entry.pending_command.is_some() {
+            let _ = entry.outbound.try_send(protocol::error_msg(
+                "duplicate_command",
+                "first valid command wins",
+            ));
+            return;
+        }
         entry.pending_command = Some(command);
         record_command_tick(
             &mut entry.command_ticks,
@@ -1799,8 +1962,19 @@ impl Room {
             return Err(StartError::NotAllReady);
         }
 
-        let n_bots = self.bots.len();
-        let layout = default_ring_layout(self.world.width, self.world.height, n_bots);
+        let layout = if self.tournament {
+            self.seed = rand::rngs::OsRng.gen();
+            self.rng = Pcg64::seed_from_u64(self.seed);
+            monte_carlo::place_ships_for_variance(
+                monte_carlo::VarianceMode::Random,
+                self.seed,
+                self.bots.len(),
+                self.world.width,
+                self.world.height,
+            )
+        } else {
+            default_ring_layout(self.world.width, self.world.height, self.bots.len())
+        };
         self.apply_match_layout(&layout);
         Ok(())
     }
@@ -1809,6 +1983,10 @@ impl Room {
     /// `BotId` order), broadcast `game_start`, reset state and open the replay log.
     /// Shared by [`Room::start_match`] and the Monte Carlo per-match path.
     fn apply_match_layout(&mut self, layout: &[(Vec2, f32)]) {
+        self.match_id = replay::unique_suffix();
+        for b in self.bots.values() {
+            b.ingress.close();
+        }
         // Freeze the balance parameters for the whole match: ship hull / ammo and every
         // physics tunable are read from this snapshot from here on.
         let config = self.world.config;
@@ -1840,6 +2018,7 @@ impl Room {
 
             let entry = self.bots.get(bot_id).expect("snapshot still in map");
             let game_start = ServerMsg::GameStart {
+                match_id: self.match_id.clone(),
                 ship_specs: ShipSpecs::from_config(&config),
                 simulation_dt: crate::sim::constants::DT,
                 tick: 0,
@@ -2028,6 +2207,9 @@ impl Room {
     /// ready bots; the first match is started synchronously here, subsequent matches
     /// are chained from inside `step_tick`. Returns the run id on success.
     fn start_monte_carlo(&mut self, config: McConfig) -> Result<String, McStartError> {
+        if self.tournament {
+            return Err(McStartError::Invalid("Monte Carlo is an offline analysis mode; tournament matches require the acknowledged fixed configuration".into()));
+        }
         if self.state != RoomState::Lobby {
             return Err(McStartError::NotInLobby);
         }
@@ -2269,7 +2451,12 @@ impl Room {
     /// `true` if every registered bot has a `pending_command` queued for the current
     /// tick. The lockstep tick loop steps immediately once this returns `true`.
     pub fn all_pending_commands_ready(&self) -> bool {
-        !self.bots.is_empty() && self.bots.values().all(|b| b.pending_command.is_some())
+        !self.bots.is_empty()
+            && self.bots.values().all(|b| {
+                !self.world.ships.get(&b.ship_id).is_some_and(|s| s.alive)
+                    || b.pending_command.is_some()
+                    || b.ingress.window.lock().expect("window").command.is_some()
+            })
     }
 
     /// Advertise the same command budget that the tick loop enforces.
@@ -2383,8 +2570,14 @@ impl Room {
 
         let (out_tx, out_rx) = mpsc::channel::<ServerMsg>(BOT_OUTBOUND_BUFFER);
 
+        let ingress = CommandSlot {
+            notify: self.ingress_notify.clone(),
+            ..Default::default()
+        };
         let welcome = ServerMsg::Welcome {
-            protocol_version: "2.0".into(),
+            config_hash: self.config_hash(),
+            configuration: Box::new(self.configuration()),
+            protocol_version: "3.0".into(),
             simulation_dt: crate::sim::constants::DT,
             bot_id: bot_id.clone(),
             ship_id: ship_id.clone(),
@@ -2404,6 +2597,8 @@ impl Room {
         self.bots.insert(
             bot_id.clone(),
             BotEntry {
+                ingress: ingress.clone(),
+                disconnected: false,
                 bot_id: bot_id.clone(),
                 ship_id: ship_id.clone(),
                 name: name.clone(),
@@ -2429,6 +2624,7 @@ impl Room {
         );
 
         BotRegistration {
+            ingress,
             bot_id,
             ship_id,
             outbound: out_rx,
@@ -2586,6 +2782,7 @@ pub async fn run_room(
     // commands queued; cleared every time we step. `None` outside lockstep mode.
     let mut lockstep_deadline: Option<tokio::time::Instant> = None;
 
+    let ingress_notify = room.ingress_notify.clone();
     loop {
         // Recompute lockstep status each iteration — entering/exiting an MC run can
         // change it under us.
@@ -2630,10 +2827,12 @@ pub async fn run_room(
                 room.step_tick();
                 lockstep_deadline = None;
             }
-            _ = ticker.tick(), if !lockstep => {
+            scheduled = ticker.tick(), if !lockstep => {
+                crate::metrics::MAX_DELAY_US.fetch_max(scheduled.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 room.step_tick();
                 debug!(room = %name, tick = room.world.tick, state = ?room.state, "tick");
             }
+            _ = ingress_notify.notified(), if lockstep => {}
             Some(event) = event_rx.recv() => {
                 room.handle_event(event);
                 // Most events touch room state in a way that may end the current
@@ -3021,6 +3220,7 @@ mod tests {
                 self_state,
                 contacts,
                 events,
+                ..
             } => {
                 assert_eq!(tick, 1, "first tick after game_start");
                 assert_eq!(deadline_ms, 80);
@@ -3277,7 +3477,8 @@ mod tests {
         assert_eq!(c.id, "c_0");
         assert_eq!(c.kind, ProtocolContactKind::Ship);
         let r = c.range.expect("active range");
-        assert!((r - 100.0).abs() < 1.0, "range was {r}");
+        // Position noise is bounded by 2 units per axis, hence sqrt(8) radially.
+        assert!((r - 100.0).abs() <= 2.83, "range was {r}");
 
         let passive_contacts = next_tick_contacts(&mut r2);
         assert_eq!(

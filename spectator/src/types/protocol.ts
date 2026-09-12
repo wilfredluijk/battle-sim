@@ -311,3 +311,31 @@ export interface BotGameStart {
   ship_specs: Record<string, number>;
   simulation_dt: number;
 }
+
+/** Bot protocol v3. Full settings are acknowledged before readiness. */
+export interface MatchConfiguration {
+  protocol_version: '3.0';
+  revision: number;
+  simulation_dt: number;
+  tick_hz: number;
+  deadline_ms: number;
+  map: { width: number; height: number };
+  max_bots: number;
+  match_timeout_ticks: number;
+  sim_config: SimConfig;
+  ship_specs: Record<string, number>;
+  available_powerups: string[];
+  command_policy: 'exact_match_and_tick_first_valid_wins';
+  disconnect_policy: 'forfeit_hull_retained';
+  timeout_ties: 'draw';
+  action_phases: string[];
+  starting_positions: 'constrained_random_hidden' | 'public_ring';
+}
+export interface ConfigurationMessage {
+  type: 'configuration';
+  config_hash: string;
+  configuration: MatchConfiguration;
+}
+export type BotHandshake =
+  | { type: 'hello'; name: string; version: string; token: string }
+  | { type: 'ready'; config_hash: string };

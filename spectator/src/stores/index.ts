@@ -1,3 +1,4 @@
+import { adminToken } from './admin';
 import { writable } from 'svelte/store';
 import { WsClient, defaultSpectatorUrl, type ConnectionStatus } from '../lib/wsClient';
 import { reconcile, type BotCardState } from '../lib/worldFrame';
@@ -60,9 +61,15 @@ export function startSpectator(url: string = defaultSpectatorUrl()): () => void 
     splashes.set(curSplashes);
   });
 
-  client.start();
+  const offAuth = adminToken.subscribe((token) => {
+    client.close();
+    latestWorld.set(null);
+    if (token) client.start();
+    else connection.set({ connected: false, message: 'log in as admin' });
+  });
 
   return () => {
+    offAuth();
     offStatus();
     offWorld();
     client.close();

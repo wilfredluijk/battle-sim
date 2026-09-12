@@ -1,0 +1,30 @@
+name: battle-sim
+services:
+  battle-sim:
+    image: ${BATTLE_IMAGE:?set an immutable release image tag}
+    container_name: battle-sim
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 128
+    ports:
+      - "127.0.0.1:7878:7878"
+    environment:
+      BATTLE_ADMIN_PASSWORD_FILE: /run/secrets/admin-password
+      BATTLE_BOT_CREDENTIALS_FILE: /run/secrets/participants.json
+      BATTLE_IMAGE_ID: ${BATTLE_IMAGE_ID:?set the loaded image ID}
+      RUST_LOG: info
+    volumes:
+      - /opt/battle-sim/secrets:/run/secrets:ro
+      - /opt/battle-sim/replays:/app/replays
+    command: ["--port", "7878", "--replay-dir", "/app/replays", "--max-bots", "8", "--tick-hz", "10", "--tick-deadline-ms", "80", "--map", "700x700", "--tournament"]
+    restart: unless-stopped
+    stop_grace_period: 12s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

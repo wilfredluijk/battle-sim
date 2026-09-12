@@ -72,6 +72,8 @@ class Welcome:
     available_powerups: List[str] = field(default_factory=list)
     simulation_dt: float = 0.1
     protocol_version: str = "1.0"
+    config_hash: str = ""
+    configuration: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Welcome":
@@ -79,6 +81,8 @@ class Welcome:
         if not math.isfinite(simulation_dt) or simulation_dt <= 0:
             raise ValueError("simulation_dt must be finite and positive")
         return cls(
+            config_hash=str(d.get("config_hash", "")),
+            configuration=dict(d.get("configuration", {})),
             bot_id=str(d["bot_id"]),
             ship_id=str(d["ship_id"]),
             map=MapInfo.from_dict(d["map"]),
@@ -260,12 +264,14 @@ class WorldView:
     self_state: SelfState
     contacts: List[Contact]
     events: List[TickEvent]
+    match_id: str = ""
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "WorldView":
         return cls(
             tick=int(d["tick"]),
             deadline_ms=int(d["deadline_ms"]),
+            match_id=str(d.get("match_id", "")),
             self_state=SelfState.from_dict(d["self"]),
             contacts=[Contact.from_dict(c) for c in d.get("contacts", [])],
             events=[_parse_event(e) for e in d.get("events", [])],
@@ -373,7 +379,7 @@ class Command:
         self.fire = FireCommand(bearing_deg=bearing, range=range_val)
         return self
 
-    def to_dict(self, tick: int) -> Dict[str, Any]:
+    def to_dict(self, tick: int, match_id: str = "") -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "type": "command",
             "tick": int(tick),
@@ -381,6 +387,8 @@ class Command:
             "rudder": float(self.rudder),
             "sensor_mode": self.sensor_mode,
         }
+        if match_id:
+            out["match_id"] = match_id
         if self.fire is not None:
             out["fire"] = self.fire.to_dict()
         if self.activate_powerup is not None:

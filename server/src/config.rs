@@ -4,6 +4,19 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "naval-server", about = "Naval battle game server", version)]
 pub struct Config {
+    /// Probe the local HTTP readiness endpoint and exit (container health check).
+    #[arg(long, default_value_t = false)]
+    pub healthcheck: bool,
+    /// Protected JSON participant roster. Required unless explicitly running local development.
+    #[arg(long, env = "BATTLE_BOT_CREDENTIALS_FILE")]
+    pub bot_credentials_file: Option<PathBuf>,
+    /// Development only: allow bots without participant credentials.
+    #[arg(long, default_value_t = false)]
+    pub allow_unauthenticated_bots: bool,
+    /// Read administrator password from a protected file (preferred in production).
+    #[arg(long, env = "BATTLE_ADMIN_PASSWORD_FILE")]
+    pub admin_password_file: Option<PathBuf>,
+
     /// TCP port to listen on for WebSocket connections
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
@@ -37,25 +50,21 @@ pub struct Config {
     #[arg(long, value_name = "FILE")]
     pub replay: Option<PathBuf>,
 
-    /// Maximum simultaneous TCP connections from a single peer IP. Above this, additional
-    /// connects from that IP are refused at accept time. Set to 0 to disable the cap.
+    /// Maximum WebSocket connections per peer IP. The production proxy also limits HTTP.
     #[arg(long, default_value_t = 25)]
     pub max_connections_per_ip: u32,
 
-    /// Seconds to wait for the HTTP head and the WebSocket `hello` message before forcibly
-    /// dropping a half-open connection. Closes the slow-loris vector on the handshake.
+    /// WebSocket hello timeout. HTTP header timeout is configured at the production proxy.
     #[arg(long, default_value_t = 5)]
     pub handshake_timeout_secs: u64,
 
-    /// Tournament mode: restrict the `/spectate` endpoint to loopback (127.0.0.1, ::1) so
-    /// competing bots cannot subscribe to ground-truth world state. Bots may still join
-    /// over the network.
+    /// Tournament mode: fresh secret seeds and constrained random starts per match.
+    /// Administrator authentication is always required, including on loopback.
     #[arg(long, default_value_t = false)]
     pub tournament: bool,
 
     /// Admin password for the REST control plane. `POST /api/login` checks this value and
-    /// issues a JWT. When omitted, the server generates a fresh random password at startup
-    /// and logs it once at INFO. Provide a fixed value for tests / scripted runs. Can also
+    /// issues a JWT. Required unless a password file is provided; never logged. Can also
     /// be supplied via the `BATTLE_ADMIN_PASSWORD` environment variable.
     #[arg(long, env = "BATTLE_ADMIN_PASSWORD", value_name = "PASSWORD")]
     pub admin_password: Option<String>,

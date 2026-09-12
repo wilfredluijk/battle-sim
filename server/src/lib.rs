@@ -4,8 +4,11 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod ingress;
+pub mod metrics;
 pub mod monte_carlo;
 pub mod net;
+pub mod participants;
 pub mod protocol;
 pub mod replay;
 pub mod room;

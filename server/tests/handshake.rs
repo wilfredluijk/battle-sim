@@ -30,7 +30,7 @@ async fn start_server() -> ServerHandle {
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
 
-    let mut config = Config::parse_from(["test"]);
+    let mut config = Config::parse_from(["test", "--allow-unauthenticated-bots"]);
     config.port = port;
     config.tick_hz = 50; // fast loop so shutdown observation is snappy
 
@@ -115,9 +115,11 @@ async fn hello_yields_welcome_and_ready_is_silent() {
     assert_eq!(parsed["tick_hz"], 50);
 
     // After ready, the server should stay silent until game_start (Phase 4.2).
-    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
-        .await
-        .expect("send ready");
+    ws.send(Message::Text(
+        serde_json::json!({"type":"ready", "config_hash": parsed["config_hash"]}).to_string(),
+    ))
+    .await
+    .expect("send ready");
 
     let res = tokio::time::timeout(Duration::from_millis(400), ws.next()).await;
     match res {
@@ -218,9 +220,11 @@ async fn operator_start_delivers_game_start_to_ready_bot() {
         serde_json::from_str(&recv_text(&mut ws).await).expect("welcome");
     assert_eq!(welcome["type"], "welcome");
 
-    ws.send(Message::Text(r#"{"type":"ready"}"#.into()))
-        .await
-        .expect("send ready");
+    ws.send(Message::Text(
+        serde_json::json!({"type":"ready", "config_hash": welcome["config_hash"]}).to_string(),
+    ))
+    .await
+    .expect("send ready");
 
     // Give the room a moment to record the ready flag.
     tokio::time::sleep(Duration::from_millis(80)).await;

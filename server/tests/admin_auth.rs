@@ -27,7 +27,7 @@ async fn start_server() -> ServerHandle {
     let port = probe.local_addr().expect("local_addr").port();
     drop(probe);
 
-    let mut config = Config::parse_from(["test"]);
+    let mut config = Config::parse_from(["test", "--allow-unauthenticated-bots"]);
     config.port = port;
     config.tick_hz = 50;
 
@@ -165,13 +165,38 @@ async fn mutating_route_accepts_valid_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn room_state_is_public() {
+async fn room_state_requires_admin_even_on_loopback() {
     let ServerHandle { port, shutdown } = start_server().await;
     let (status, body) = http_request(port, "GET", "/api/room", None, None).await;
-    assert_eq!(status, 200, "GET /api/room should be public, got: {body}");
+    assert_eq!(
+        status, 401,
+        "GET /api/room must require authorization, got: {body}"
+    );
+    let token = login(port).await;
+    let (status, body) = http_request(port, "GET", "/api/room", Some(&token), None).await;
+    assert_eq!(status, 200);
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("room json");
     assert_eq!(parsed["state"], "lobby");
     assert_eq!(parsed["room"], "main");
     assert!(parsed["config"].is_object(), "config block present");
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_sensitive_read_requires_admin() {
+    let ServerHandle { port, shutdown } = start_server().await;
+    for path in [
+        "/api/room",
+        "/api/room/report",
+        "/api/config/schema",
+        "/api/replays",
+        "/api/replays/any",
+        "/api/replays/any/perspective/b_1",
+        "/api/montecarlo/status",
+        "/api/metrics",
+    ] {
+        let (status, _) = http_request(port, "GET", path, None, None).await;
+        assert_eq!(status, 401, "{path} leaked privileged state");
+    }
     let _ = shutdown.send(());
 }

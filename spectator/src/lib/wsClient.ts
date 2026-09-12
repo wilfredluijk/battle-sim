@@ -1,3 +1,4 @@
+import { storedToken } from './authToken';
 import type { WorldFrame } from '../types/protocol';
 
 export interface ConnectionStatus {
@@ -88,7 +89,11 @@ export class WsClient {
     }
     this.socket = ws;
 
-    ws.onopen = () => this.emitStatus({ connected: true, message: 'live' });
+    ws.onopen = () => {
+      const token = storedToken();
+      if (token) ws.send(JSON.stringify({ type: 'authenticate', token }));
+      this.emitStatus({ connected: false, message: token ? 'authenticating…' : 'log in as admin' });
+    };
     ws.onerror = () => {
       // onclose fires next and handles the retry; do not double-schedule.
     };
@@ -106,6 +111,7 @@ export class WsClient {
         return;
       }
       if (isWorldFrame(msg)) {
+        this.emitStatus({ connected: true, message: 'live' });
         for (const cb of this.worldListeners) cb(msg);
       }
     };
@@ -127,7 +133,7 @@ export class WsClient {
 
 /** Build the default spectator WebSocket URL from `window.location.host`. */
 export function defaultSpectatorUrl(): string {
-  return `ws://${window.location.host}/spectate`;
+  return `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/spectate`;
 }
 
 function isWorldFrame(value: unknown): value is WorldFrame {

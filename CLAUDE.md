@@ -128,7 +128,7 @@ docker compose -f docker-compose.bots.yml up --build
                              #   Override with SERVER_HOST / SERVER_PORT env vars.
 ```
 
-The room is driven over a REST control plane (`/api/*`), not stdin — there is no operator command interface. Lifecycle actions (`start`, `abort`, `reset`, `kick`) and parameter changes (`PUT /api/room/config`) are HTTP routes gated by a JWT. Get a token from `POST /api/login` with the admin password (`--admin-password` / `BATTLE_ADMIN_PASSWORD`, random per start if unset and logged once at INFO). The spectator web UI uses these routes to manage matches from the browser. See `docs/PROTOCOL.md §2.5`.
+The room is driven over a REST control plane (`/api/*`), not stdin — there is no operator command interface. Lifecycle actions (`start`, `abort`, `reset`, `kick`) and parameter changes (`PUT /api/room/config`) are HTTP routes gated by a JWT. Get a token from `POST /api/login` with the admin password (`--admin-password` / `BATTLE_ADMIN_PASSWORD`, required, never logged; prefer `BATTLE_ADMIN_PASSWORD_FILE`). The spectator web UI uses these routes to manage matches from the browser. See `docs/PROTOCOL.md §2.5`.
 
 ---
 
@@ -210,11 +210,4 @@ These are choices that look like implementation details but have design implicat
 
 ## Hackathon mode reminder
 
-This is built for a hackathon, not production. Some deliberate omissions, listed so they're not "fixed" by accident:
-
-- The admin REST plane (`/api/*`) is gated by a JWT, but the `/bot` and `/spectate` WebSocket endpoints are intentionally unauthenticated. No TLS, no rate limiting. Local play only.
-- No persistence besides replay JSONL files. Rooms vanish when the server stops.
-- No matchmaking. The operator starts the match via the REST API / web UI.
-- One server process, one configurable room.
-
-If you're tempted to add a database, TLS, or auth to the `/bot` / `/spectate` endpoints, stop and check whether the scope has actually changed. For the hackathon target, simpler is the goal.
+The scope now includes an internet-facing training VPS (see `VPS-DEPLOYMENT-REVIEW.md` and `deploy/README.md`). Production requires participant credentials, administrator authentication on every sensitive endpoint, TLS termination, exact match/tick admission and bounded traffic. `--allow-unauthenticated-bots` is explicitly local development only. Preserve the replay determinism and sensor-isolation rules above when changing this boundary.

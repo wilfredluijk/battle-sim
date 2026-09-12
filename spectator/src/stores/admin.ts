@@ -151,6 +151,8 @@ async function withToken<T>(fn: (token: string) => Promise<T>): Promise<T> {
 export async function loginAdmin(password: string): Promise<void> {
   const { token } = await api.login(password);
   adminToken.set(token);
+  configSchema.set(await api.fetchConfigSchema());
+  await refreshRoom();
 }
 
 export function logoutAdmin(): void {

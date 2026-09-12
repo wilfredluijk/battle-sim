@@ -24,3 +24,8 @@ docs
 sdk-python
 examples
 spectator/legacy
+.deployment-secrets
+release-artifacts
+*.tar
+*.tar.sha256
+.env*

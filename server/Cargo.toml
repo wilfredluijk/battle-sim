@@ -16,7 +16,9 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.7", features = ["ws"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
+
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"

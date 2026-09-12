@@ -1,3 +1,4 @@
+import { storedAuthHeaders } from './authToken';
 // REST client for the `/api/*` control plane. Replaces the old admin WebSocket: room
 // lifecycle and parameter changes are plain request/response now, so a thin `fetch`
 // wrapper is all that's needed. The streaming surfaces (`/spectate`, `/bot`) stay on
@@ -51,14 +52,14 @@ function authHeaders(token: string): Record<string, string> {
 
 /** `GET /api/room` — current room lifecycle state plus the active balance parameters. */
 export async function fetchRoom(): Promise<RoomInfo> {
-  const res = await fetch('/api/room');
+  const res = await fetch('/api/room', { headers: storedAuthHeaders() });
   if (!res.ok) throw await toError(res);
   return (await res.json()) as RoomInfo;
 }
 
 /** `GET /api/room/report` — the most recent match report, or `null` if none exists yet. */
 export async function fetchReport(): Promise<MatchReport | null> {
-  const res = await fetch('/api/room/report');
+  const res = await fetch('/api/room/report', { headers: storedAuthHeaders() });
   if (res.status === 404) return null;
   if (!res.ok) throw await toError(res);
   return (await res.json()) as MatchReport;
@@ -66,7 +67,7 @@ export async function fetchReport(): Promise<MatchReport | null> {
 
 /** `GET /api/config/schema` — metadata for the pre-match parameter form. */
 export async function fetchConfigSchema(): Promise<ConfigField[]> {
-  const res = await fetch('/api/config/schema');
+  const res = await fetch('/api/config/schema', { headers: storedAuthHeaders() });
   if (!res.ok) throw await toError(res);
   const body = (await res.json()) as { fields?: ConfigField[] };
   return body.fields ?? [];
@@ -173,7 +174,7 @@ export async function stopMonteCarlo(
 
 /** `GET /api/montecarlo/status` — progress + results of the active or most-recent run. */
 export async function fetchMonteCarloStatus(): Promise<McStatus> {
-  const res = await fetch('/api/montecarlo/status');
+  const res = await fetch('/api/montecarlo/status', { headers: storedAuthHeaders() });
   if (!res.ok) throw await toError(res);
   return (await res.json()) as McStatus;
 }

@@ -45,22 +45,24 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Build spectator bundle
         working-directory: spectator
         run: |
           npm ci
+          npm run check
+          npm test -- --run
           npm run build
 
       - name: cargo fmt --check
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
   python:
     name: python sdk

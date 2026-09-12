@@ -4,7 +4,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use naval_server::{
-    auth::{self, AuthState},
+    auth::AuthState,
     config::Config,
     net, replay,
     room::{self, Room, SpectatorFrame, ROOM_EVENT_BUFFER},
@@ -33,12 +33,29 @@ async fn main() {
         .init();
 
     let config = Config::parse();
+    if config.healthcheck {
+        use std::io::{Read, Write};
+        let result = (|| -> std::io::Result<bool> {
+            let mut socket = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], config.port)),
+                std::time::Duration::from_secs(1),
+            )?;
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            socket.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+            socket.write_all(
+                b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut response = [0; 32];
+            socket.read_exact(&mut response)?;
+            Ok(response.starts_with(b"HTTP/1.1 200"))
+        })();
+        std::process::exit(if matches!(result, Ok(true)) { 0 } else { 1 });
+    }
     println!("{BANNER}");
     info!(
         port = config.port,
         tick_hz = config.tick_hz,
         tick_deadline_ms = config.tick_deadline_ms,
-        seed = config.seed,
         max_bots = config.max_bots,
         map_w = config.map.0,
         map_h = config.map.1,
@@ -46,15 +63,32 @@ async fn main() {
         "starting naval-server"
     );
 
-    // Resolve the admin password: explicit override wins, otherwise generate one. The
-    // value is logged once so a local operator can copy it into the web UI's login form.
-    let admin_password = config
-        .admin_password
-        .clone()
-        .unwrap_or_else(auth::generate_admin_password);
-    info!(
-        admin_password = %admin_password,
-        "admin password (POST /api/login — random each start unless --admin-password / BATTLE_ADMIN_PASSWORD is set)"
+    if config.tick_deadline_ms == 0 || config.tick_deadline_ms >= 1000 / u64::from(config.tick_hz) {
+        panic!("tick deadline must be positive and strictly less than the tick interval");
+    }
+    let participants = naval_server::participants::Participants::new(
+        config.bot_credentials_file.clone(),
+        config.allow_unauthenticated_bots,
+    );
+    if !config.allow_unauthenticated_bots && config.replay.is_none() {
+        participants
+            .read()
+            .expect("valid protected participant roster required");
+    }
+    let admin_password = if let Some(path) = &config.admin_password_file {
+        std::fs::read_to_string(path)
+            .expect("read admin password file")
+            .trim()
+            .to_owned()
+    } else {
+        config
+            .admin_password
+            .clone()
+            .expect("set BATTLE_ADMIN_PASSWORD_FILE or BATTLE_ADMIN_PASSWORD")
+    };
+    assert!(
+        admin_password.len() >= 16 && admin_password != "change-me",
+        "use an admin password with at least 16 characters"
     );
     let auth = AuthState::new(
         admin_password,
@@ -67,7 +101,7 @@ async fn main() {
 
     let replay_path = config.replay.clone();
 
-    let room_handle = if let Some(path) = replay_path.as_ref() {
+    let mut room_handle = if let Some(path) = replay_path.as_ref() {
         // Replay mode: drive a Room from a recorded JSONL log instead of accepting bot
         // connections. Keep the read-only control plane available for the spectator.
         info!(path = %path.display(), "starting in replay mode");
@@ -92,12 +126,13 @@ async fn main() {
             config.tick_deadline_ms,
             config.max_bots,
         );
+        main_room.tournament = config.tournament;
         main_room.set_spectator_broadcast(spec_tx.clone());
         main_room.set_replay_dir(config.replay_dir.clone());
         tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()))
     };
 
-    let net_handle = tokio::spawn(net::run(
+    let mut net_handle = tokio::spawn(net::run(
         config.clone(),
         ROOM_NAME.to_string(),
         auth,
@@ -106,20 +141,26 @@ async fn main() {
         shutdown_tx.clone(),
     ));
 
-    match tokio::signal::ctrl_c().await {
-        Ok(_) => info!("ctrl-c received, shutting down"),
-        Err(e) => tracing::error!(error = %e, "ctrl-c handler failed"),
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    let mut task_failed = false;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("SIGINT received"),
+        _ = sigterm.recv() => info!("SIGTERM received"),
+        result = &mut room_handle => { tracing::error!(?result, "room task exited unexpectedly"); task_failed = true; },
+        result = &mut net_handle => { tracing::error!(?result, "network task exited unexpectedly"); task_failed = true; },
     }
-
     let _ = shutdown_tx.send(());
     drop(room_tx);
-
-    if let Err(e) = net_handle.await {
-        tracing::error!(error = %e, "net task panicked");
+    if !task_failed {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let _ = net_handle.await;
+            let _ = room_handle.await;
+        })
+        .await;
     }
-    if let Err(e) = room_handle.await {
-        tracing::error!(error = %e, "room task panicked");
-    }
-
     info!("naval-server stopped");
+    if task_failed {
+        std::process::exit(1);
+    }
 }

@@ -8,11 +8,12 @@
 //! `sim/` is never imported here except for the wire-facing `SimConfig`; the room
 //! translates between protocol messages and simulation commands.
 
+use crate::participants::Participants;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Json, Path as AxumPath, State};
@@ -115,7 +116,9 @@ struct AppState {
     room_name: Arc<str>,
     ip_conns: IpConnTable,
     per_ip_cap: u32,
-    tournament: bool,
+    participants: Arc<Participants>,
+    connections: Arc<tokio::sync::Semaphore>,
+    requests: Arc<Mutex<RateLimit>>,
     hello_timeout: Duration,
     /// Directory replay JSONL logs are written to; the replay viewer reads them back.
     replay_dir: Arc<Path>,
@@ -155,7 +158,13 @@ pub async fn run(
         room_name: Arc::from(room_name),
         ip_conns: Arc::new(Mutex::new(HashMap::new())),
         per_ip_cap: config.max_connections_per_ip,
-        tournament: config.tournament,
+        participants: Arc::new(Participants {
+            path: config.bot_credentials_file.clone(),
+            allow_unauthenticated: config.allow_unauthenticated_bots,
+            ..Default::default()
+        }),
+        connections: Arc::new(tokio::sync::Semaphore::new(32)),
+        requests: Arc::new(Mutex::new(RateLimit::new(100, 1024 * 1024))),
         hello_timeout: Duration::from_secs(config.handshake_timeout_secs.max(1)),
         replay_dir: Arc::from(config.replay_dir.clone()),
         replay_mode: config.replay.is_some(),
@@ -168,6 +177,8 @@ pub async fn run(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    // Tick frames and heartbeat pings must not wait for delayed TCP acknowledgements.
+    .tcp_nodelay(true)
     .with_graceful_shutdown(async move {
         let _ = shutdown_rx.recv().await;
         info!("net: shutdown signal received");
@@ -179,10 +190,15 @@ pub async fn run(
 
 fn router(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(health))
         .route("/", get(serve_index))
         .route("/index.html", get(serve_index))
         .route("/index.js", get(serve_js))
         .route("/index.css", get(serve_css))
+        .route(
+            "/api/metrics",
+            get(|| async { Json(crate::metrics::snapshot()) }),
+        )
         .route("/api/login", post(login))
         .route("/api/room", get(get_room))
         .route("/api/room/report", get(get_report))
@@ -203,6 +219,11 @@ fn router(state: AppState) -> Router {
         .route("/api/montecarlo/status", get(get_mc_status))
         .route("/bot", get(bot_ws))
         .route("/spectate", get(spectate_ws))
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            protect_http,
+        ))
         .with_state(state)
 }
 
@@ -576,19 +597,6 @@ fn replay_id_is_valid(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Reject replay access from non-loopback peers in tournament mode. Replays expose
-/// ground-truth state, exactly like the live `/spectate` stream, so they get the same gate.
-fn require_replay_access(state: &AppState, peer: SocketAddr) -> Result<(), ApiError> {
-    if state.tournament && !peer.ip().is_loopback() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "tournament_mode",
-            "replay endpoints are restricted to loopback in tournament mode",
-        ));
-    }
-    Ok(())
-}
-
 /// Validate a replay id and resolve it to a path inside `replay_dir`.
 fn resolve_replay_path(state: &AppState, id: &str) -> Result<PathBuf, ApiError> {
     if !replay_id_is_valid(id) {
@@ -639,9 +647,7 @@ fn map_replay_error(e: replay::ReplayError) -> ApiError {
 /// Public (loopback-only under tournament mode): list the replays available on disk.
 async fn list_replays(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<Json<Vec<replay::ReplaySummary>>, ApiError> {
-    require_replay_access(&state, peer)?;
     let dir = state.replay_dir.clone();
     let summaries = tokio::task::spawn_blocking(move || replay::list_replays(&dir))
         .await
@@ -665,10 +671,8 @@ async fn list_replays(
 /// Public: re-run a replay and return the full ground-truth timeline.
 async fn get_replay(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<replay::CapturedReplay>, ApiError> {
-    require_replay_access(&state, peer)?;
     let path = resolve_replay_path(&state, &id)?;
     let permit = state
         .replay_captures
@@ -701,10 +705,8 @@ async fn get_replay(
 /// Public: re-run a replay from one bot's sensor perspective.
 async fn get_replay_perspective(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     AxumPath((id, bot_id)): AxumPath<(String, String)>,
 ) -> Result<Json<replay::CapturedPerspective>, ApiError> {
-    require_replay_access(&state, peer)?;
     let path = resolve_replay_path(&state, &id)?;
     let permit = state
         .replay_captures
@@ -757,16 +759,31 @@ async fn bot_ws(
                 .into_response();
         }
     };
+    let Ok(permit) = state.connections.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "connection limit").into_response();
+    };
+    let participants = state.participants.clone();
     let hello_timeout = state.hello_timeout;
     let shutdown_rx = state.shutdown_tx.subscribe();
     let room_tx = state.room_tx.clone();
     let ws = ws
+        .write_buffer_size(0)
+        .max_write_buffer_size(64 * 1024)
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
         let _guard = guard;
+        let _permit = permit;
         info!(%peer, "bot websocket connected");
-        handle_bot(peer, socket, room_tx, shutdown_rx, hello_timeout).await;
+        handle_bot(
+            peer,
+            socket,
+            room_tx,
+            shutdown_rx,
+            hello_timeout,
+            participants,
+        )
+        .await;
         info!(%peer, "bot connection ended");
     })
 }
@@ -776,15 +793,10 @@ async fn spectate_ws(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> Response {
-    // Tournament mode keeps ground-truth spectator state on loopback only.
-    if state.tournament && !peer.ip().is_loopback() {
-        warn!(%peer, "refusing /spectate: tournament mode allows loopback only");
-        return (
-            StatusCode::FORBIDDEN,
-            "spectator endpoint disabled in tournament mode",
-        )
-            .into_response();
-    }
+    let Ok(permit) = state.connections.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "connection limit").into_response();
+    };
+    let auth = state.auth.clone();
     let guard = match IpConnGuard::try_acquire(&state.ip_conns, peer.ip(), state.per_ip_cap) {
         Some(g) => g,
         None => {
@@ -799,12 +811,15 @@ async fn spectate_ws(
     let spec_tx = state.spec_tx.clone();
     let shutdown_rx = state.shutdown_tx.subscribe();
     let ws = ws
+        .write_buffer_size(0)
+        .max_write_buffer_size(64 * 1024)
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES);
     ws.on_upgrade(move |socket| async move {
         let _guard = guard;
+        let _permit = permit;
         info!(%peer, "spectator websocket connected");
-        handle_spectator(peer, socket, spec_tx, shutdown_rx).await;
+        handle_spectator(peer, socket, spec_tx, shutdown_rx, auth).await;
         info!(%peer, "spectator connection ended");
     })
 }
@@ -822,220 +837,117 @@ async fn handle_bot(
     room_tx: mpsc::Sender<RoomEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
     hello_timeout: Duration,
+    participants: Arc<Participants>,
 ) {
     let (mut sink, mut stream) = ws.split();
-    let mut violations: u32 = 0;
-
-    // Phase 1: wait for `hello`. A bot that never sends it is dropped after the timeout.
-    let hello_fut = wait_for_hello(
-        peer,
-        &mut sink,
-        &mut stream,
-        &mut shutdown_rx,
-        &mut violations,
-    );
-    let (name, version) = match timeout(hello_timeout, hello_fut).await {
-        Ok(Some(hello)) => hello,
-        Ok(None) => return,
-        Err(_) => {
-            warn!(%peer, "bot did not send `hello` within timeout; dropping");
-            send_error(
-                &mut sink,
-                error_code::HANDSHAKE_TIMEOUT,
-                format!(
-                    "hello not received within {}s; first frame must be \
-                     {{\"type\":\"hello\",\"name\":\"...\",\"version\":\"...\"}}",
-                    hello_timeout.as_secs()
-                ),
-            )
-            .await;
-            let _ = sink
-                .send(Message::Close(Some(CloseFrame {
-                    code: close_code::POLICY,
-                    reason: "handshake timeout".into(),
-                })))
-                .await;
+    let mut violations = 0;
+    let hello = timeout(
+        hello_timeout,
+        wait_for_hello(
+            peer,
+            &mut sink,
+            &mut stream,
+            &mut shutdown_rx,
+            &mut violations,
+        ),
+    )
+    .await;
+    let (name, version, token) = match hello {
+        Ok(Some(h)) => h,
+        _ => {
+            send_error(&mut sink, error_code::HANDSHAKE_TIMEOUT, "hello timeout").await;
             return;
         }
     };
-
-    if let Err(reason) = protocol::validate_bot_name(&name) {
-        warn!(%peer, name = %name, %reason, "rejecting invalid bot name");
-        send_error(&mut sink, error_code::INVALID_NAME, reason).await;
-        let _ = sink
-            .send(Message::Close(Some(CloseFrame {
-                code: close_code::POLICY,
-                reason: "invalid name".into(),
-            })))
-            .await;
+    let Some(session) = participants.acquire(&token, &name) else {
+        send_error(
+            &mut sink,
+            "unauthorized",
+            "invalid, revoked or already connected participant",
+        )
+        .await;
         return;
-    }
-
-    // Phase 2: register with the room.
-    let registration = match register(peer, &room_tx, name, version, &mut sink).await {
-        Some(r) => r,
-        None => return,
     };
-    let bot_id = registration.bot_id.clone();
-    let mut outbound_rx = registration.outbound;
-    info!(%peer, bot_id = %bot_id, ship_id = %registration.ship_id, "bot handshake complete");
-
-    // Phase 3: forward inbound bot messages to the room and outbound frames to the socket.
+    let registration =
+        match register(peer, &room_tx, session.identity.clone(), version, &mut sink).await {
+            Some(r) => r,
+            None => return,
+        };
+    let bot_id = registration.bot_id;
+    let ingress = registration.ingress;
+    let mut outbound = registration.outbound;
+    let mut budget = RateLimit::new(40, 64 * 1024);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    let mut last_seen = Instant::now();
     loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => {
-                info!(%peer, bot_id = %bot_id, "closing bot connection (shutdown)");
-                let _ = sink.send(Message::Close(None)).await;
-                break;
+            biased;
+            _ = shutdown_rx.recv() => break,
+            _ = heartbeat.tick() => {
+                if last_seen.elapsed() > Duration::from_secs(15) || !participants.valid(&session.identity, &token) { break; }
+                if !send_frame(&mut sink, Message::Ping(vec![])).await { break; }
             }
-            outbound = outbound_rx.recv() => {
-                let Some(msg) = outbound else {
-                    debug!(%peer, bot_id = %bot_id, "room dropped outbound channel");
-                    break;
-                };
-                if !send_server_msg(&mut sink, &msg).await {
-                    break;
+            msg = outbound.recv() => {
+                match msg {
+                    Some(m) => if !send_server_msg(&mut sink, &m).await { break; },
+                    None => break,
                 }
             }
             frame = stream.next() => {
+                // Timestamp the completed WebSocket message before parsing or queuing.
+                let received = Instant::now();
+                let Some(Ok(frame)) = frame else { break; };
+                let bytes = match &frame { Message::Text(t) => t.len(), Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(), _ => 0 };
+                if !budget.accept(bytes) {
+                    send_error(&mut sink, "rate_limited", "message or byte budget exceeded").await;
+                    break;
+                }
+                last_seen = received;
                 match frame {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<BotMsg>(&text) {
-                            Ok(BotMsg::Hello { .. }) => {
-                                violations += 1;
-                                warn!(%peer, bot_id = %bot_id, violations, "duplicate hello");
-                                send_error(
-                                    &mut sink,
-                                    error_code::INVALID_MESSAGE,
-                                    "hello already received for this connection",
-                                ).await;
-                                if violations >= MAX_VIOLATIONS {
-                                    disconnect_for_violations(&mut sink).await;
-                                    break;
-                                }
-                            }
-                            Ok(BotMsg::Ready) => {
-                                if room_tx
-                                    .send(RoomEvent::BotReady { bot_id: bot_id.clone() })
-                                    .await
-                                    .is_err()
-                                {
-                                    debug!(%peer, "room channel closed; ending bot loop");
-                                    break;
-                                }
-                            }
-                            Ok(BotMsg::Command {
-                                tick,
-                                throttle,
-                                rudder,
-                                fire,
-                                sensor_mode,
-                                activate_powerup,
-                            }) => {
-                                if let Err(reason) =
-                                    validate_command_floats(throttle, rudder, fire.as_ref())
-                                {
-                                    violations += 1;
-                                    warn!(
-                                        %peer,
-                                        bot_id = %bot_id,
-                                        violations,
-                                        %reason,
-                                        "rejecting command with non-finite float",
-                                    );
-                                    send_error(&mut sink, error_code::NON_FINITE_VALUE, reason)
-                                        .await;
-                                    if violations >= MAX_VIOLATIONS {
-                                        disconnect_for_violations(&mut sink).await;
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                let command = PendingCommand {
-                                    tick,
-                                    throttle,
-                                    rudder,
-                                    sensor_mode,
-                                    fire,
-                                    activate_powerup,
-                                };
-                                if room_tx
-                                    .send(RoomEvent::BotCommand {
-                                        bot_id: bot_id.clone(),
-                                        command,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    debug!(%peer, "room channel closed; ending bot loop");
-                                    break;
-                                }
+                    Message::Text(text) => {
+                        let result = match serde_json::from_str::<BotMsg>(&text) {
+                            Ok(BotMsg::Ready { config_hash }) => {
+                                room_tx.try_send(RoomEvent::BotReadyChecked { bot_id: bot_id.clone(), config_hash }).map_err(|_| "server_busy")
                             }
                             Ok(BotMsg::SelectPowerups { powerups }) => {
-                                if room_tx
-                                    .send(RoomEvent::BotSelectPowerups {
-                                        bot_id: bot_id.clone(),
-                                        powerups,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    debug!(%peer, "room channel closed; ending bot loop");
-                                    break;
+                                room_tx.try_send(RoomEvent::BotSelectPowerups { bot_id: bot_id.clone(), powerups }).map_err(|_| "server_busy")
+                            }
+                            Ok(BotMsg::Command { match_id, tick, throttle, rudder, fire, sensor_mode, activate_powerup }) => {
+                                match validate_command_floats(throttle, rudder, fire.as_ref()) {
+                                    Err(_) => Err(error_code::NON_FINITE_VALUE),
+                                    Ok(()) => ingress.submit(&match_id, PendingCommand { tick, throttle, rudder, fire, sensor_mode, activate_powerup }, received),
                                 }
                             }
-                            Err(e) => {
-                                violations += 1;
-                                let code = if matches!(
-                                    e.classify(),
-                                    serde_json::error::Category::Syntax
-                                ) {
-                                    error_code::MALFORMED_JSON
-                                } else {
-                                    error_code::INVALID_MESSAGE
-                                };
-                                warn!(%peer, code, error = %e, violations, "rejected bot frame");
-                                send_error(&mut sink, code, e.to_string()).await;
-                                if violations >= MAX_VIOLATIONS {
-                                    disconnect_for_violations(&mut sink).await;
-                                    break;
-                                }
-                            }
+                            Ok(_) => Err(error_code::INVALID_MESSAGE),
+                            Err(e) if e.is_syntax() => Err(error_code::MALFORMED_JSON),
+                            Err(_) => Err(error_code::INVALID_MESSAGE),
+                        };
+                        if let Err(code) = result {
+                            crate::metrics::REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if code != "late_command" && code != "wrong_tick" { violations += 1; }
+                            tracing::debug!(bot = %bot_id, code, "command rejected");
+                            send_error(&mut sink, code, code).await;
+                            if violations >= MAX_VIOLATIONS { break; }
                         }
                     }
-                    Some(Ok(Message::Binary(bytes))) => {
+                    Message::Ping(_) | Message::Pong(_) => {},
+                    Message::Close(_) => break,
+                    Message::Binary(_) => {
                         violations += 1;
-                        warn!(%peer, bytes = bytes.len(), violations, "binary frame on /bot");
-                        send_error(
-                            &mut sink,
-                            error_code::BINARY_FRAMES_UNSUPPORTED,
-                            "/bot only accepts text JSON frames (binary frames are rejected)",
-                        )
-                        .await;
-                        if violations >= MAX_VIOLATIONS {
-                            disconnect_for_violations(&mut sink).await;
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(frame))) => {
-                        info!(%peer, bot_id = %bot_id, ?frame, "bot closed");
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        warn!(%peer, error = %e, "ws read error");
-                        break;
-                    }
-                    None => {
-                        info!(%peer, bot_id = %bot_id, "bot stream ended");
-                        break;
+                        send_error(&mut sink, error_code::BINARY_FRAMES_UNSUPPORTED, "text JSON required").await;
+                        if violations >= MAX_VIOLATIONS { break; }
                     }
                 }
             }
         }
     }
-
-    let _ = room_tx.send(RoomEvent::BotDisconnect { bot_id }).await;
+    ingress.close();
+    let _ = timeout(
+        Duration::from_secs(2),
+        room_tx.send(RoomEvent::BotDisconnect { bot_id }),
+    )
+    .await;
+    let _ = send_frame(&mut sink, Message::Close(None)).await;
 }
 
 /// Read frames until a valid `hello` arrives or the connection ends.
@@ -1045,7 +957,8 @@ async fn wait_for_hello(
     stream: &mut WsStream,
     shutdown_rx: &mut broadcast::Receiver<()>,
     violations: &mut u32,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
+    let mut budget = RateLimit::new(20, 32 * 1024);
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -1053,11 +966,12 @@ async fn wait_for_hello(
                 return None;
             }
             frame = stream.next() => {
+                if !budget.accept(0) { return None; }
                 match frame {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<BotMsg>(&text) {
-                            Ok(BotMsg::Hello { name, version }) => {
-                                return Some((name, version));
+                            Ok(BotMsg::Hello { name, version, token }) => {
+                                return Some((name, version, token));
                             }
                             Ok(_) => {
                                 *violations += 1;
@@ -1147,9 +1061,9 @@ async fn register(
         send_error(sink, error_code::INVALID_MESSAGE, "server is shutting down").await;
         return None;
     }
-    match reply_rx.await {
-        Ok(Ok(reg)) => Some(reg),
-        Ok(Err(e)) => {
+    match timeout(Duration::from_secs(2), reply_rx).await {
+        Ok(Ok(Ok(reg))) => Some(reg),
+        Ok(Ok(Err(e))) => {
             warn!(%peer, reason = e.as_str(), "room rejected join");
             // Map each join failure to its most specific wire code so bot authors can
             // switch on it; fall back to the generic schema code for the rest.
@@ -1161,7 +1075,7 @@ async fn register(
             send_error(sink, code, e.as_str()).await;
             None
         }
-        Err(_) => {
+        _ => {
             warn!(%peer, "room dropped registration reply");
             None
         }
@@ -1177,13 +1091,37 @@ async fn handle_spectator(
     ws: WebSocket,
     spec_tx: broadcast::Sender<SpectatorFrame>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    auth: Arc<AuthState>,
 ) {
     let (mut sink, mut stream) = ws.split();
+    let token = match timeout(Duration::from_secs(5), stream.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(str::to_owned)),
+        _ => None,
+    };
+    let Some(token) = token.filter(|t| auth.verify_token(t)) else {
+        send_error(
+            &mut sink,
+            "unauthorized",
+            "administrator authentication required",
+        )
+        .await;
+        return;
+    };
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    let mut last_seen = Instant::now();
+    let mut budget = RateLimit::new(10, 16 * 1024);
     let mut spec_rx = spec_tx.subscribe();
     info!(%peer, subscribers = spec_tx.receiver_count(), "spectator subscribed");
 
     loop {
         tokio::select! {
+            biased;
+            _ = heartbeat.tick() => {
+                if !auth.verify_token(&token) || last_seen.elapsed() > Duration::from_secs(15) { break; }
+                if !send_frame(&mut sink, Message::Ping(vec![])).await { break; }
+            }
             _ = shutdown_rx.recv() => {
                 info!(%peer, "closing spectator connection (shutdown)");
                 let _ = sink.send(Message::Close(None)).await;
@@ -1192,7 +1130,7 @@ async fn handle_spectator(
             recv = spec_rx.recv() => {
                 match recv {
                     Ok(frame) => {
-                        if sink.send(Message::Text((*frame).clone())).await.is_err() {
+                        if !send_frame(&mut sink, Message::Text((*frame).clone())).await {
                             debug!(%peer, "spectator sink closed");
                             break;
                         }
@@ -1207,6 +1145,8 @@ async fn handle_spectator(
                 }
             }
             frame = stream.next() => {
+                if !budget.accept(0) { break; }
+                last_seen = Instant::now();
                 match frame {
                     Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
@@ -1264,13 +1204,7 @@ async fn send_error(sink: &mut WsSink, code: &str, message: impl Into<String>) {
 /// Returns `false` if the socket failed; the caller should treat that as terminal.
 async fn send_server_msg(sink: &mut WsSink, msg: &ServerMsg) -> bool {
     let payload = serde_json::to_string(msg).expect("ServerMsg always serializes");
-    match sink.send(Message::Text(payload)).await {
-        Ok(()) => true,
-        Err(e) => {
-            debug!(error = %e, "failed to send server frame");
-            false
-        }
-    }
+    send_frame(sink, Message::Text(payload)).await
 }
 
 async fn disconnect_for_violations(sink: &mut WsSink) {
@@ -1286,6 +1220,82 @@ async fn disconnect_for_violations(sink: &mut WsSink) {
             reason: "too many protocol violations".into(),
         })))
         .await;
+}
+
+/// Fixed one-second budget with small bursts suitable for eight bots behind one NAT.
+struct RateLimit {
+    started: Instant,
+    messages: u32,
+    bytes: usize,
+    max_messages: u32,
+    max_bytes: usize,
+}
+impl RateLimit {
+    fn new(max_messages: u32, max_bytes: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            messages: 0,
+            bytes: 0,
+            max_messages,
+            max_bytes,
+        }
+    }
+    fn accept(&mut self, bytes: usize) -> bool {
+        if self.started.elapsed() >= Duration::from_secs(1) {
+            self.started = Instant::now();
+            self.messages = 0;
+            self.bytes = 0;
+        }
+        self.messages = self.messages.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.messages <= self.max_messages && self.bytes <= self.max_bytes
+    }
+}
+async fn send_frame(sink: &mut WsSink, frame: Message) -> bool {
+    matches!(
+        timeout(Duration::from_secs(2), sink.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+async fn protect_http(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let allowed = state.requests.lock().expect("request budget").accept(0);
+    if !allowed {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let path = request.uri().path();
+    if path.starts_with("/api/")
+        && path != "/api/login"
+        && !bearer(request.headers()).is_some_and(|t| state.auth.verify_token(t))
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code":"unauthorized", "message":"administrator authentication required"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+async fn health(State(state): State<AppState>) -> StatusCode {
+    match timeout(
+        Duration::from_secs(1),
+        ask_room(&state, |reply| RoomEvent::QueryState { reply }),
+    )
+    .await
+    {
+        Ok(Ok(_)) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 #[cfg(test)]

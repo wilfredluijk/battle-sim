@@ -1,49 +1,29 @@
-# Multi-stage build: the Vite-built spectator dist must exist before the Rust crate is
-# compiled, because `server/src/net.rs` baked the spectator bundle into the binary at
-# compile time via `include_str!`. Order: node (build dist) → rust (build server, embedding
-# the freshly-produced dist) → debian-slim (runtime).
-
-# ---- stage 1: spectator build ----
-FROM node:20-alpine AS spectator-build
+# Pinned official build images; static musl binary avoids runtime OS packages.
+FROM node:24-bookworm-slim@sha256:2fe369e969550cde8e867afc3fe370b260140cab4a23d467074295b42163d553 AS spectator-build
 WORKDIR /spectator
-
-# Copy lockfile + manifest first so `npm ci` can be cached when only source changes.
 COPY spectator/package.json spectator/package-lock.json ./
 RUN npm ci
-
 COPY spectator/ ./
-RUN npm run build
-# Produces /spectator/dist/{index.html,index.js,index.css}
+RUN npm run check && npm test -- --run && npm run build
 
-# ---- stage 2: server build ----
-FROM rust:1.95-slim AS server-build
+FROM rust:1.95.0-slim-trixie@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0 AS server-build
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rustup target add x86_64-unknown-linux-musl
 WORKDIR /build
-
-# Dep-cache trick: copy just the manifests, build a stub binary so cargo fetches & compiles
-# all dependencies, then bring in the real sources. A code-only change re-uses this layer.
-COPY server/Cargo.toml server/Cargo.lock ./server/
-RUN mkdir -p server/src \
-    && echo 'fn main() {}' > server/src/main.rs \
-    && cd server && cargo build --release || true \
-    && rm -f server/src/main.rs
-
-# Real sources + the spectator dist that the include_str! macros need.
 COPY server/ ./server/
 COPY --from=spectator-build /spectator/dist /build/spectator/dist
-RUN cd server && cargo build --release
-# Produces /build/server/target/release/naval-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry cd server && cargo build --release --locked --target x86_64-unknown-linux-musl && mkdir -p /runtime/replays
 
-# ---- stage 3: runtime ----
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
+# No shell, package manager, curl, shared libraries, or writable root filesystem.
+FROM scratch AS runtime
+ARG RELEASE=development
+LABEL org.opencontainers.image.title="battle-sim" org.opencontainers.image.version=$RELEASE
+ENV BATTLE_RELEASE=$RELEASE
+COPY --from=server-build --chown=10001:10001 /build/server/target/x86_64-unknown-linux-musl/release/naval-server /usr/local/bin/naval-server
+COPY --from=server-build --chown=10001:10001 /runtime/ /app/
 WORKDIR /app
-RUN mkdir -p /app/replays
-
-COPY --from=server-build /build/server/target/release/naval-server /usr/local/bin/naval-server
-
+USER 10001:10001
 EXPOSE 7878
+HEALTHCHECK --interval=15s --timeout=4s --start-period=10s --retries=3 CMD ["/usr/local/bin/naval-server", "--healthcheck"]
 ENTRYPOINT ["/usr/local/bin/naval-server"]
 CMD ["--port", "7878", "--replay-dir", "/app/replays"]

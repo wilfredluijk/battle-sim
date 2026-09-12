@@ -40,7 +40,7 @@ describe('WsClient', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it('emits connecting → live on open', () => {
+  it('prompts for authentication on open', () => {
     const { factory, sockets } = makeFactory();
     const client = new WsClient('ws://test/spectate', { factory });
     const statuses: string[] = [];
@@ -48,7 +48,7 @@ describe('WsClient', () => {
     client.start();
     expect(statuses).toEqual(['connecting…']);
     sockets[0]!._open();
-    expect(statuses).toEqual(['connecting…', 'live']);
+    expect(statuses).toEqual(['connecting…', 'log in as admin']);
   });
 
   it('delivers parsed world frames to onWorld listeners', () => {

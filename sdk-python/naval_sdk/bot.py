@@ -11,6 +11,8 @@ import asyncio
 import json
 import logging
 import math
+import os
+from urllib.parse import urlsplit
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +37,10 @@ class Bot:
     The reference implementation defaults each callback to a no-op except
     `on_tick`, which must be implemented or the bot will simply hold station.
     """
+
+    def accept_configuration(self, configuration: Dict[str, Any], config_hash: str) -> bool:
+        """Return False to refuse these match rules. Called before each readiness acknowledgement."""
+        return True
 
     # ---- Public state populated by the runtime ----
     welcome: Optional[Welcome] = None
@@ -154,14 +160,20 @@ async def run_async(
     host: str = "localhost",
     port: int = 7878,
     name: str = "bot",
-    version: str = "naval-sdk/0.3.0",
+    version: str = "naval-sdk/0.4.0",
     path: str = "/bot",
+    url: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> Optional[GameOver]:
     """Connect `bot` to a running server and pump messages until `game_over`.
 
     Returns the `GameOver` payload, or `None` if the connection closed without one.
     """
-    uri = f"ws://{host}:{port}{path}"
+    uri = url or os.environ.get("BATTLE_SERVER_URL") or f"ws://{host}:{port}{path}"
+    token = token if token is not None else os.environ.get("BATTLE_BOT_TOKEN", "")
+    parsed = urlsplit(uri)
+    if parsed.scheme not in ("ws", "wss") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("server URL must be ws:// or wss:// with no credentials, query or fragment")
     log.info("connecting to %s as %r", uri, name)
 
     async with websockets.connect(uri) as ws:
@@ -176,6 +188,9 @@ async def run_async(
             `welcome`. `choose_powerups` needs the `Welcome`; reuse the stored one.
             """
             if bot.welcome is not None:
+                if not _safe_callback_returning(bot.accept_configuration, bot.welcome.configuration, bot.welcome.config_hash):
+                    log.warning("match configuration refused; remaining unready")
+                    return
                 picks = _safe_callback_returning(bot.choose_powerups, bot.welcome)
                 if picks and len(picks) != 2:
                     log.warning("choose_powerups must return exactly two distinct picks, or []")
@@ -188,11 +203,11 @@ async def run_async(
                             }
                         )
                     )
-            await ws.send(json.dumps({"type": "ready"}))
+            await ws.send(json.dumps({"type": "ready", "config_hash": bot.welcome.config_hash if bot.welcome else ""}))
 
         result: Optional[GameOver] = None
         try:
-            await ws.send(json.dumps({"type": "hello", "name": name, "version": version}))
+            await ws.send(json.dumps({"type": "hello", "name": name, "version": version, "token": token}))
 
             ready_sent = False
 
@@ -226,6 +241,16 @@ async def run_async(
                     bot.welcome = welcome
                     _safe_callback(bot.on_welcome, welcome)
                     if not ready_sent:
+                        await send_loadout_and_ready()
+                        ready_sent = True
+
+                elif msg_type == "configuration":
+                    if bot.welcome is not None:
+                        configuration = dict(msg["configuration"])
+                        bot.welcome = replace(bot.welcome, configuration=configuration,
+                            config_hash=str(msg["config_hash"]),
+                            ship_specs=ShipSpecs.from_dict(configuration["ship_specs"]) if "ship_specs" in configuration else bot.welcome.ship_specs)
+                        _safe_callback(bot.on_welcome, bot.welcome)
                         await send_loadout_and_ready()
                         ready_sent = True
 
@@ -275,7 +300,7 @@ async def run_async(
                         cmd = Command()
                     if cmd is None:
                         cmd = Command()
-                    await ws.send(json.dumps(cmd.to_dict(view.tick)))
+                    await ws.send(json.dumps(cmd.to_dict(view.tick, view.match_id)))
 
                 elif msg_type == "game_over":
                     try:
@@ -332,12 +357,14 @@ def run(
     host: str = "localhost",
     port: int = 7878,
     name: str = "bot",
-    version: str = "naval-sdk/0.3.0",
+    version: str = "naval-sdk/0.4.0",
     path: str = "/bot",
+    url: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> Optional[GameOver]:
     """Synchronous wrapper around `run_async` for the common `if __name__ == "__main__"` path."""
     return asyncio.run(
-        run_async(bot, host=host, port=port, name=name, version=version, path=path)
+        run_async(bot, host=host, port=port, name=name, version=version, path=path, url=url, token=token)
     )
 
 
