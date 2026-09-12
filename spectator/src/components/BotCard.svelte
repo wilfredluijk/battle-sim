@@ -38,6 +38,12 @@
       <span>Throttle {ship.throttle.toFixed(2)}</span><span>Sensor {ship.sensor_mode}</span>
       <span>Commands {ship.commands_per_sec.toFixed(0)}/sim s</span>
       {#each chipsForShip(ship) as chip (chip.id)}<span>{chip.label} · {chip.state === 'active' && $room?.tick_hz ? `${(chip.activeTicksLeft / $room.tick_hz).toFixed(1)}s left` : chip.state}</span>{/each}
+      {#if adminBot?.diagnostics}
+        <span>Response p95 {adminBot.diagnostics.response.p95_ms?.toFixed(1) ?? '—'} ms</span>
+        <span>RTT p95 {adminBot.diagnostics.rtt.p95_ms?.toFixed(1) ?? '—'} ms</span>
+        <span>Late rejects {adminBot.diagnostics.late} · Wrong tick {adminBot.diagnostics.wrong_tick}</span>
+        <span>Missed {adminBot.diagnostics.missed_windows}/{adminBot.diagnostics.completed_windows} command windows</span>
+      {/if}
       {#if adminBot?.disconnect_reason}<p class="config-err">{adminBot.disconnect_reason}</p>{/if}
     </div>
     {#if adminBot?.connected && $room?.state === 'running' && $room.capabilities?.manage_match && !$projector}

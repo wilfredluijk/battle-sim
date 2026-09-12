@@ -37,6 +37,8 @@ pub struct AdminState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AdminBotInfo {
+    #[serde(default)]
+    pub diagnostics: crate::diagnostics::TeamDiagnostics,
     pub bot_id: String,
     pub name: String,
     pub ship_id: String,
@@ -80,6 +82,7 @@ mod tests {
             tick: 0,
             last_winner: Some("b_1".into()),
             bots: vec![AdminBotInfo {
+                diagnostics: Default::default(),
                 connected: true,
                 forfeited: false,
                 disconnect_reason: None,

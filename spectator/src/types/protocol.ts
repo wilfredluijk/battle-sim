@@ -80,6 +80,7 @@ export interface WorldFrame {
 export type RoomState = 'lobby' | 'running' | 'ended';
 
 export interface AdminBotInfo {
+  diagnostics?: TeamDiagnostics;
   bot_id: string;
   name: string;
   ship_id: string;
@@ -133,6 +134,9 @@ export interface RoomInfo {
   tick_deadline_ms?: number;
   expected_teams?: string[];
   roster_error?: string | null;
+  round?: RoundTag | null;
+  training_revision?: number;
+  training_error?: string | null;
 }
 
 /** One tunable's metadata from `GET /api/config/schema`. */
@@ -148,6 +152,7 @@ export interface ConfigField {
 
 /** One bot's row in a `MatchReport`. */
 export interface BotReport {
+  diagnostics?: TeamDiagnostics;
   bot_id: string;
   name: string;
   shots_fired: number;
@@ -163,6 +168,8 @@ export interface BotReport {
 
 /** Response shape of `GET /api/room/report`. */
 export interface MatchReport {
+  match_id?: string;
+  round?: RoundTag | null;
   room: string;
   replay_id: string | null;
   outcome: 'winner' | 'draw' | 'aborted';
@@ -354,3 +361,30 @@ export interface ConfigurationMessage {
 export type BotHandshake =
   | { type: 'hello'; name: string; version: string; token: string }
   | { type: 'ready'; config_hash: string };
+
+export interface TimingSummary { samples: number; p50_ms: number | null; p95_ms: number | null; max_ms: number | null }
+export interface TeamDiagnostics {
+  accepted: number; late: number; wrong_tick: number; other_rejected: number;
+  completed_windows: number; missed_windows: number; late_windows: number;
+  response: TimingSummary; rtt: TimingSummary; rtt_age_seconds: number | null;
+}
+export interface Scoring { win: number; draw: number; loss: number }
+export interface RoundTag { session_id: string; session_name: string; number: number; name: string }
+export interface TrainingRound {
+  match_id: string; name: string; started_at: number; config_hash: string; teams: string[];
+  status: 'running' | 'finished' | 'interrupted'; report: MatchReport | null;
+}
+export interface TrainingSession {
+  id: string; name: string; created_at: number; expected_teams: string[];
+  scoring: Scoring; next_round: string; rounds: TrainingRound[];
+}
+export interface Debrief { notes: string; bookmarks: { tick: number; label: string }[] }
+export interface TrainingData {
+  version: number; revision: number; active_session: string | null;
+  sessions: TrainingSession[]; debriefs: Record<string, Debrief>; storage_error: string | null;
+}
+export type TrainingAction =
+  | { action: 'create'; name: string; expected_teams: string[]; scoring: Scoring }
+  | { action: 'configure'; name: string; expected_teams: string[]; scoring: Scoring; next_round: string }
+  | { action: 'activate'; session_id: string | null }
+  | { action: 'debrief'; replay_id: string; debrief: Debrief };

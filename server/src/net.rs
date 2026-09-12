@@ -200,6 +200,7 @@ fn router(state: AppState) -> Router {
             get(|| async { Json(crate::metrics::snapshot()) }),
         )
         .route("/api/login", post(login))
+        .route("/api/training", get(get_training).post(post_training))
         .route("/api/room", get(get_room))
         .route("/api/room/report", get(get_report))
         .route("/api/config/schema", get(get_config_schema))
@@ -386,6 +387,9 @@ struct RoomResponse {
     tick_deadline_ms: u64,
     expected_teams: Vec<String>,
     roster_error: Option<String>,
+    round: Option<crate::training::RoundTag>,
+    training_revision: u64,
+    training_error: Option<String>,
 }
 
 /// Authenticated: current room state plus the active balance parameters. Drives both the
@@ -422,9 +426,36 @@ async fn get_room(State(state): State<AppState>) -> Result<Json<RoomResponse>, A
         config_hash: snap.config_hash,
         match_timeout_ticks: crate::room::MATCH_TIMEOUT_TICKS,
         tick_deadline_ms: snap.tick_deadline_ms,
-        expected_teams,
+        expected_teams: snap.session_expected_teams.unwrap_or(expected_teams),
         roster_error,
+        round: snap.round,
+        training_revision: snap.training_revision,
+        training_error: snap.training_error,
     }))
+}
+
+async fn get_training(
+    State(state): State<AppState>,
+) -> Result<Json<crate::training::TrainingSnapshot>, ApiError> {
+    Ok(Json(
+        ask_room(&state, |reply| RoomEvent::QueryTraining { reply }).await?,
+    ))
+}
+async fn post_training(
+    State(state): State<AppState>,
+    Json(request): Json<crate::training::TrainingRequest>,
+) -> Result<Json<crate::training::TrainingSnapshot>, ApiError> {
+    if state.replay_mode {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "replay_mode",
+            "Session editing is unavailable in server replay mode.",
+        ));
+    }
+    let result = ask_room(&state, |reply| RoomEvent::UpdateTraining { request, reply }).await?;
+    result
+        .map(Json)
+        .map_err(|message| ApiError::new(StatusCode::CONFLICT, "training_refused", &message))
 }
 
 /// Public: the most recent match report. `404` until the first match has finished.
@@ -913,6 +944,8 @@ async fn handle_bot(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut last_seen = Instant::now();
     let mut disconnect_reason = "connection closed";
+    let mut ping_sequence = 0_u64;
+    let mut pending_ping: Option<(Vec<u8>, Instant)> = None;
     loop {
         tokio::select! {
             biased;
@@ -920,11 +953,17 @@ async fn handle_bot(
             _ = heartbeat.tick() => {
                 if !participants.valid(&session.identity, &token) { disconnect_reason = "credentials revoked"; break; }
                 if last_seen.elapsed() > Duration::from_secs(15) { disconnect_reason = "heartbeat timeout"; break; }
-                if !send_frame(&mut sink, Message::Ping(vec![])).await { break; }
+                ping_sequence = ping_sequence.wrapping_add(1);
+                let payload = ping_sequence.to_be_bytes().to_vec();
+                pending_ping = Some((payload.clone(), Instant::now()));
+                if !send_frame(&mut sink, Message::Ping(payload)).await { break; }
             }
             msg = outbound.recv() => {
                 match msg {
-                    Some(m) => if !send_server_msg(&mut sink, &m).await { break; },
+                    Some(m) => {
+                        if let ServerMsg::Tick { tick, .. } = &m { ingress.sent(*tick, Instant::now()); }
+                        if !send_server_msg(&mut sink, &m).await { break; }
+                    },
                     None => break,
                 }
             }
@@ -966,7 +1005,15 @@ async fn handle_bot(
                             if violations >= MAX_VIOLATIONS { disconnect_reason = "protocol violation limit exceeded"; break; }
                         }
                     }
-                    Message::Ping(_) | Message::Pong(_) => {},
+                    Message::Pong(payload) => {
+                        if let Some((expected, sent)) = &pending_ping {
+                            if *expected == payload {
+                                ingress.measurements.lock().expect("measurements poisoned").pong(*sent, received);
+                                pending_ping = None;
+                            }
+                        }
+                    },
+                    Message::Ping(_) => {},
                     Message::Close(_) => break,
                     Message::Binary(_) => {
                         violations += 1;

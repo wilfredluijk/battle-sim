@@ -11,7 +11,7 @@
 </script>
 <main class="battle" class:layout-full={$view === 'full'}>
   <header class="match-header">
-    <div><h1>{$room?.room ?? 'Match'}</h1><span class="pm-sub">Match {$room?.match_id || '—'} · tick {$tick}</span></div>
+    <div><h1>{$room?.round?.name ?? $room?.room ?? 'Match'}</h1><span class="pm-sub">Match {$room?.match_id || '—'} · tick {$tick}</span></div>
     <div class="match-clock">{hz ? clockText($tick / hz) : '—'} <small>elapsed</small></div>
     <div class="match-clock">{hz && $room?.match_timeout_ticks ? clockText(($room.match_timeout_ticks - $tick) / hz) : '—'} <small>remaining</small></div>
     <strong>{$latestWorld?.ships.filter(s => s.alive).length ?? 0} survivors</strong>

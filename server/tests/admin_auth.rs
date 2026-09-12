@@ -200,3 +200,36 @@ async fn every_sensitive_read_requires_admin() {
     }
     let _ = shutdown.send(());
 }
+
+#[tokio::test]
+async fn training_history_requires_authentication_and_rejects_stale_writes() {
+    let server = start_server().await;
+    let (status, _) = http_request(server.port, "GET", "/api/training", None, None).await;
+    assert_eq!(status, 401);
+    let token = login(server.port).await;
+    let request = r#"{"revision":0,"action":"create","name":"Workshop","expected_teams":["Atlas"],"scoring":{"win":3,"draw":1,"loss":0}}"#;
+    let (status, _) = http_request(server.port, "POST", "/api/training", None, Some(request)).await;
+    assert_eq!(status, 401);
+    let (status, body) = http_request(
+        server.port,
+        "POST",
+        "/api/training",
+        Some(&token),
+        Some(request),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["revision"], 1);
+    assert_eq!(value["sessions"][0]["expected_teams"][0], "Atlas");
+    let (status, _) = http_request(
+        server.port,
+        "POST",
+        "/api/training",
+        Some(&token),
+        Some(request),
+    )
+    .await;
+    assert_eq!(status, 409);
+    let _ = server.shutdown.send(());
+}

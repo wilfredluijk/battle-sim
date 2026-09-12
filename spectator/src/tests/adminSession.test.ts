@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import * as api from '../lib/adminApi';
-import { adminToken, configDraft, configSchema, room, sessionExpired, startControlPlane, startMonteCarloPolling, startMatch } from '../stores/admin';
+import { adminToken, configDraft, configSchema, room, sessionExpired, startControlPlane, startMonteCarloPolling, startMatch, training, saveTraining } from '../stores/admin';
 import { colorFor } from '../lib/palette';
 import { clockText, eventText } from '../lib/presentation';
 import type { RoomInfo } from '../types/protocol';
-vi.mock('../lib/adminApi', async importOriginal => ({ ...await importOriginal<typeof api>(), fetchRoom: vi.fn(), fetchConfigSchema: vi.fn(), fetchReport: vi.fn(), fetchMonteCarloStatus: vi.fn(), startMatch: vi.fn() }));
+vi.mock('../lib/adminApi', async importOriginal => ({ ...await importOriginal<typeof api>(), fetchRoom: vi.fn(), fetchConfigSchema: vi.fn(), fetchReport: vi.fn(), fetchMonteCarloStatus: vi.fn(), startMatch: vi.fn(), fetchTraining: vi.fn(), updateTraining: vi.fn() }));
 let teardown: (() => void)[] = [];
 const info = { room: 'main', state: 'lobby', tick: 0, bots: [], config: {}, capabilities: { monte_carlo: false, manage_match: true, tournament: true } } as RoomInfo;
 beforeEach(() => {
@@ -49,4 +49,22 @@ it('assigns eight distinct team colours even for colliding name hashes', () => {
 it('uses team names in events and handles a non-default clock rate', () => {
   expect(eventText({ type: 'death', ship_id: 's_3' }, new Map([['s_3', 'Atlas']]))).toBe('Atlas destroyed');
   expect(clockText(3000 / 20)).toBe('2:30'); expect(clockText(-1)).toBe('0:00');
+});
+
+it('does not restore protected session history after logout', async () => {
+  let resolve!: (history: import('../types/protocol').TrainingData) => void;
+  vi.mocked(api.fetchRoom).mockResolvedValue({ ...info, training_revision: 1 });
+  vi.mocked(api.fetchTraining).mockReturnValue(new Promise(yes => resolve = yes));
+  teardown.push(startControlPlane()); adminToken.set('test');
+  await vi.advanceTimersByTimeAsync(0); adminToken.set(null);
+  resolve({ version: 1, revision: 1, active_session: null, sessions: [], debriefs: {}, storage_error: null });
+  await vi.advanceTimersByTimeAsync(0); expect(get(training)).toBeNull();
+});
+it('keeps session history on a failed save and sends the draft revision for conflict detection', async () => {
+  const history = { version: 1, revision: 4, active_session: null, sessions: [], debriefs: {}, storage_error: null };
+  adminToken.set('test'); training.set(history);
+  vi.mocked(api.updateTraining).mockRejectedValue(new api.ApiError(409, 'training_refused', 'History changed'));
+  await expect(saveTraining({ action: 'activate', session_id: null }, 3)).rejects.toThrow('History changed');
+  expect(api.updateTraining).toHaveBeenCalledWith('test', 3, { action: 'activate', session_id: null });
+  expect(get(training)).toEqual(history);
 });

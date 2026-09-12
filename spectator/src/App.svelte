@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import SessionPanel from './components/SessionPanel.svelte';
   import Topbar from './components/Topbar.svelte';
   import Battle from './components/Battle.svelte';
   import MonteCarloPanel from './components/MonteCarloPanel.svelte';
@@ -44,6 +45,7 @@
     {:else if screen === 'replay-browser'}<ReplayBrowser />
     {:else if screen === 'replay-viewer'}<ReplayViewer />
     {:else if screen === 'monte-carlo' && $room.capabilities?.monte_carlo}<MonteCarloPanel />
+    {:else if screen === 'sessions'}<SessionPanel />
     {:else if screen === 'settings'}
       <main class="settings"><section class="pm-panel"><h1>Match settings</h1><ConfigForm /></section></main>
     {:else}<PreMatch />{/if}

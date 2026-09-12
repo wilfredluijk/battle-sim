@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod diagnostics;
 pub mod ingress;
 pub mod metrics;
 pub mod monte_carlo;
@@ -13,3 +14,4 @@ pub mod protocol;
 pub mod replay;
 pub mod room;
 pub mod sim;
+pub mod training;

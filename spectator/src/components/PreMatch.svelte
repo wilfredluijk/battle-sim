@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { room, roomError, configDraft, startMatch, kickBot, actionNotice } from '../stores/admin';
+  import { room, roomError, configDraft, startMatch, kickBot, actionNotice, training } from '../stores/admin';
   import { appMode } from '../stores';
   import { colorFor } from '../lib/palette';
   import { clockText } from '../lib/presentation';
+  import ConnectionCheck from './ConnectionCheck.svelte';
   import HealthPanel from './HealthPanel.svelte';
+  const activeSession = $derived($training?.sessions.find(s => s.id === $training.active_session));
   const bots = $derived(($room?.bots ?? []).filter(b => b.connected !== false));
   const expected = $derived($room?.expected_teams ?? []);
   const missing = $derived(expected.filter(name => !bots.some(b => b.name === name)));
@@ -43,6 +45,7 @@
 <main class="prematch">
   <section class="pm-panel">
     <header class="pm-head"><h1>Team lobby</h1><span class="admin-badge">{$room?.capabilities?.tournament ? 'Tournament' : 'Training'}</span></header>
+    <p class="pm-sub">{activeSession ? `${activeSession.name} · Next: ${activeSession.next_round}` : "No training session selected"} <button class="topbar-btn" onclick={() => appMode.set("sessions")}>Manage session</button></p>
     <div class="lobby-counts"><span><strong>{expected.length || '—'}</strong> expected</span><span><strong>{bots.length}</strong> connected</span><span><strong>{bots.filter(b => b.ready).length}</strong> ready</span></div>
     {#if $room?.roster_error}<p class="config-err" role="alert">Expected roster unavailable: {$room.roster_error}</p>{/if}
     <ul class="pm-bots">
@@ -64,6 +67,7 @@
   <div class="lobby-side">
     <section class="pm-panel"><h2>Active rules</h2><dl class="rules-summary"><dt>Map</dt><dd>{$room?.map?.width} × {$room?.map?.height} units</dd><dt>Time limit</dt><dd>{$room?.tick_hz && $room.match_timeout_ticks ? clockText($room.match_timeout_ticks / $room.tick_hz) : 'Unknown'}</dd><dt>Command deadline</dt><dd>{$room?.tick_deadline_ms ?? '—'} ms</dd><dt>Hull / ammo</dt><dd>{$room?.config.hull_hp} HP / {$room?.config.max_ammo}</dd></dl><button class="topbar-btn" onclick={() => appMode.set('settings')}>Review settings</button></section>
     <section class="pm-panel"><h2>Team connection check</h2><p class="pm-sub">Use protocol 3.0 and the current SDK. Each team connects with its privately supplied credential and acknowledges the active rules.</p><code class="server-address">{typeof location !== 'undefined' ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/bot` : ''}</code><button class="topbar-btn" onclick={copyAddress}>Copy connection address</button>{#if copied}<p role="status" class="pm-sub">{copied}</p>{/if}<p class="config-note">Ready confirms the handshake and rules acknowledgement. Run a short practice match to check command delivery at this venue.</p></section>
+    <ConnectionCheck />
     <HealthPanel />
   </div>
 </main>

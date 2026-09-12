@@ -239,3 +239,57 @@ fn kick_followed_by_socket_cleanup_records_one_replayable_forfeit() {
     );
     replay::capture_replay(records).unwrap();
 }
+
+#[test]
+fn training_history_preserves_named_rounds_reports_and_diagnostics_across_lobby_and_restart() {
+    use naval_server::training::{TrainingRequest, TrainingStore};
+    let dir = std::env::temp_dir().join(format!(
+        "naval-session-integration-{}",
+        naval_server::replay::unique_suffix()
+    ));
+    let mut room = room();
+    room.set_replay_dir(dir.clone());
+    let a = bot(&mut room, "Atlas");
+    let _b = bot(&mut room, "Echo");
+    let request: TrainingRequest = serde_json::from_value(serde_json::json!({"revision":0,"action":"create","name":"Workshop","expected_teams":["Atlas","Echo","Absent"],"scoring":{"win":3,"draw":1,"loss":0}})).unwrap();
+    let (reply, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::UpdateTraining { request, reply });
+    rx.try_recv().unwrap().unwrap();
+    start(&mut room);
+    room.step_tick();
+    let snapshot = room.snapshot();
+    assert_eq!(snapshot.round.as_ref().unwrap().name, "Round 1");
+    let sent = Instant::now();
+    a.ingress.sent(room.world.tick, sent);
+    assert!(a
+        .ingress
+        .submit(&snapshot.match_id, command(room.world.tick), sent)
+        .is_ok());
+    room.step_tick();
+    let (reply, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::OperatorAbort { reply });
+    rx.try_recv().unwrap().unwrap();
+    let (reply, mut rx) = oneshot::channel();
+    room.handle_event(RoomEvent::OperatorReset { reply });
+    rx.try_recv().unwrap().unwrap();
+    let restored = TrainingStore::load(dir.join("training-history.json"));
+    let saved = restored.active().unwrap();
+    assert_eq!(saved.next_round, "Round 2");
+    assert_eq!(saved.rounds.len(), 1);
+    let report = saved.rounds[0].report.as_ref().unwrap();
+    assert_eq!(report.outcome, "aborted");
+    assert_eq!(report.match_id, snapshot.match_id);
+    assert_eq!(
+        report
+            .bots
+            .iter()
+            .find(|b| b.name == "Atlas")
+            .unwrap()
+            .diagnostics
+            .accepted,
+        1
+    );
+    assert_eq!(room.snapshot().session_expected_teams.unwrap().len(), 3);
+    drop(room);
+    std::fs::remove_dir_all(dir).unwrap();
+}

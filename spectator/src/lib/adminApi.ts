@@ -178,3 +178,14 @@ export async function fetchMonteCarloStatus(): Promise<McStatus> {
   if (!res.ok) throw await toError(res);
   return (await res.json()) as McStatus;
 }
+
+export async function fetchTraining(): Promise<import('../types/protocol').TrainingData> {
+  const res = await fetch('/api/training', { headers: storedAuthHeaders() });
+  if (!res.ok) throw await toError(res);
+  return await res.json();
+}
+export async function updateTraining(token: string, revision: number, action: import('../types/protocol').TrainingAction): Promise<import('../types/protocol').TrainingData> {
+  const res = await fetch('/api/training', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(token) }, body: JSON.stringify({ revision, ...action }) });
+  if (!res.ok) throw await toError(res);
+  return await res.json();
+}

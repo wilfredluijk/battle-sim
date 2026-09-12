@@ -768,6 +768,7 @@ pub async fn run_replay_with_events(
                         snapshot.replay_mode = true;
                         let _ = reply.send(snapshot);
                     }
+                    Some(RoomEvent::QueryTraining { reply }) => room.handle_event(RoomEvent::QueryTraining { reply }),
                     Some(RoomEvent::QueryReport { reply }) => room.handle_event(RoomEvent::QueryReport { reply }),
                     Some(RoomEvent::QueryMonteCarloStatus { reply }) => room.handle_event(RoomEvent::QueryMonteCarloStatus { reply }),
                     Some(_) => {}, // HTTP mutations and /bot are refused before enqueueing.

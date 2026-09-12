@@ -2,6 +2,7 @@
      markers, a per-bot perspective selector, and an exit back to the live screen. -->
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import ReplayDebrief from './ReplayDebrief.svelte';
   import ReplayCanvas from './ReplayCanvas.svelte';
   import {
     advanceTick,
@@ -20,8 +21,9 @@
     togglePlay,
   } from '../stores/replay';
 
-  import { eventText, clockText } from '../lib/presentation';
-  let bookmarks = $state<number[]>([]);
+  import { eventText } from '../lib/presentation';
+  let compare = $state(false);
+  let guide = $state(false);
   const names = $derived(new Map($replayData?.header.bots.map(b => [b.ship_id, b.name]) ?? []));
   const currentEvents = $derived($replayData?.frames[$replayTick]?.events ?? []);
   function eventJump(direction: number) {
@@ -79,8 +81,12 @@
   </div>
 
   {#if $replayError}<p class="config-err" role="alert">{$replayError}. Showing overall ground truth. Choose a perspective to retry.</p>{/if}
-  <div class="rv-stage">
-    <ReplayCanvas />
+  <div class="rv-stage" class:with-guide={guide}>
+    <div class="replay-comparison" class:comparing={compare && $replayPerspective !== 'overall'}>
+      {#if compare && $replayPerspective !== 'overall'}<div class="comparison-pane"><span>Overall · ground truth</span><ReplayCanvas overall /></div>{/if}
+      <div class="comparison-pane"><span>{$replayPerspective === 'overall' ? 'Overall · ground truth' : 'Team sensor view'}</span><ReplayCanvas /></div>
+    </div>
+    <div class="guide-container" hidden={!guide}><ReplayDebrief close={() => guide = false} /></div>
   </div>
 
   <div class="rv-bar rv-controls">
@@ -129,8 +135,8 @@
 
   <div class="rv-debrief">
     <button class="topbar-btn" onclick={() => eventJump(-1)}>Previous event</button><button class="topbar-btn" onclick={() => step(-1)} aria-label="Previous frame">−1 frame</button><button class="topbar-btn" onclick={() => step(1)} aria-label="Next frame">+1 frame</button><button class="topbar-btn" onclick={() => eventJump(1)}>Next event</button>
-    <button class="topbar-btn" onclick={() => { if (!bookmarks.includes($replayTick)) bookmarks = [...bookmarks, $replayTick].sort((a,b) => a-b); }}>Bookmark</button>
-    {#each bookmarks as mark (mark)}<button class="topbar-btn" onclick={() => { replayPlaying.set(false); seekTo(mark); }}>{clockText(mark / ($replayData?.header.tick_hz ?? 1))}</button>{/each}
+    <button class="topbar-btn" aria-pressed={guide} onclick={() => guide = !guide}>Guide & bookmarks</button>
+    <label><input type="checkbox" bind:checked={compare} disabled={$replayPerspective === 'overall'} /> Compare ground truth</label>
     {#each currentEvents as event, i (i)}<span>{eventText(event, names)}</span>{/each}
   </div>
   <div class="rv-legend" aria-hidden="true">

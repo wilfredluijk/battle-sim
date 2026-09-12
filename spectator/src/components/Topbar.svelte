@@ -1,6 +1,6 @@
 <script lang="ts">
   import { appMode, projector } from '../stores';
-  import { room, roomError, roomUpdatedAt, abortMatch, actionNotice, configDraft } from '../stores/admin';
+  import { room, roomError, roomUpdatedAt, selectedReport, abortMatch, actionNotice, configDraft } from '../stores/admin';
   import { replayPlaying } from '../stores/replay';
   import LoginBox from './LoginBox.svelte';
   let { screen }: { screen: string } = $props();
@@ -12,7 +12,7 @@
   const stale = $derived($roomUpdatedAt > 0 && now - $roomUpdatedAt > 5000);
   const viewed = $derived(screen === 'replay-viewer' ? `Replay · ${$replayPlaying ? 'playing' : 'paused'}` :
     screen === 'replay-browser' ? 'Replay library' : screen === 'monte-carlo' ? 'Offline analysis' :
-    screen === 'battle' ? ($room?.replay_mode ? 'Server replay' : 'Live match') : screen === 'results' ? 'Results' : screen === 'settings' ? 'Settings' : 'Lobby');
+    screen === 'battle' ? ($room?.replay_mode ? 'Server replay' : 'Live match') : screen === 'results' ? 'Results' : screen === 'sessions' ? 'Training sessions' : screen === 'settings' ? 'Settings' : 'Lobby');
   const freshness = $derived($roomError ? 'Disconnected · retrying' : stale ? 'Stale server data' : !$room ? 'Connecting…' : 'Server connected');
   async function handleAbort() {
     if (abortBusy || confirmAbort !== $room?.match_id) return;
@@ -26,9 +26,10 @@
   <span class="topbar-title">Naval Battle</span>
   <nav class="primary-nav" aria-label="Main navigation">
     <button class="topbar-btn" aria-current={screen === 'lobby' ? 'page' : undefined} onclick={() => appMode.set('lobby')}>Lobby</button>
-    <button class="topbar-btn" aria-current={screen === 'battle' ? 'page' : undefined} onclick={() => appMode.set('live')}>Live match</button>
-    <button class="topbar-btn" aria-current={$appMode === 'results' ? 'page' : undefined} onclick={() => appMode.set('results')}>Results</button>
+    <button class="topbar-btn" aria-current={screen === 'battle' ? 'page' : undefined} onclick={() => { selectedReport.set(null); appMode.set('live'); }}>Live match</button>
+    <button class="topbar-btn" aria-current={$appMode === 'results' ? 'page' : undefined} onclick={() => { selectedReport.set(null); appMode.set('results'); }}>Results</button>
     <button class="topbar-btn" aria-current={$appMode.startsWith('replay') ? 'page' : undefined} onclick={() => appMode.set('replay-browser')}>Replays</button>
+    <button class="topbar-btn" aria-current={screen === "sessions" ? "page" : undefined} onclick={() => appMode.set("sessions")}>Sessions</button>
   </nav>
   <span class="topbar-spacer"></span>
   <div class="topbar-controls">
@@ -47,6 +48,7 @@
   {/if}
   {#if $actionNotice}<span role="status">{$actionNotice}</span><button class="topbar-btn quiet" aria-label="Dismiss notification" onclick={() => actionNotice.set(null)}>×</button>{/if}
 </div>
+{#if $room?.training_error}<div class="confirmation" role="alert"><strong>Session history: {$room.training_error}</strong><button class="topbar-btn" onclick={() => appMode.set("sessions")}>Review session history</button></div>{/if}
 {#if confirmAbort !== null}
   <div class="confirmation" role="alertdialog" aria-label="Confirm match abort">
     <strong>Abort match {confirmAbort} in {$room?.room}?</strong>

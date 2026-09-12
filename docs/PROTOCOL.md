@@ -833,3 +833,38 @@ All additions are forward-compatible for bots that don't use powerups: omit `sel
 - A per-IP cap on simultaneous TCP connections is enforced at accept time (`--max-connections-per-ip`, default 25; set to 0 to disable). Connections beyond the cap are dropped before the WebSocket handshake — no error frame is sent.
 - `--tournament` restricts the `/spectate` endpoint to the loopback interface, preventing competing bots from subscribing to ground-truth world state.
 - Duplicate `cooldown_active` / `no_ammo` errors are coalesced to one per tick to protect the bot's 32-slot outbound buffer from spam.
+
+### Administrator training sessions and diagnostics
+
+`GET /api/training` and `POST /api/training` require the same administrator bearer token as the other control-plane routes. They expose no participant credentials and do not change the bot protocol. Server replay mode permits reads of its empty session state and refuses writes; use the live trainer console for saved session history.
+
+The read response contains `version: 1`, a monotonically increasing `revision`, `active_session` (ID or null), `sessions`, `debriefs` keyed by replay ID, and `storage_error` (string or null). Each session stores `id`, `name`, `created_at` (Unix seconds), `expected_teams`, `scoring: {win, draw, loss}`, `next_round`, and `rounds`. A round stores `match_id`, `name`, `started_at` (Unix seconds), `config_hash`, participating `teams`, `status` (`running`, `finished`, or `interrupted`), and a complete `report` or null. Reports add `match_id`, optional `round: {session_id, session_name, number, name}`, and each bot's recorded `diagnostics`.
+
+Every write includes the revision of the data being edited. A stale revision or refused operation returns HTTP 409 with `code: "training_refused"` and an explanation. The response on success is the updated complete snapshot. Supported requests:
+
+```json
+{"revision":0,"action":"create","name":"Workshop","expected_teams":["Atlas","Echo"],"scoring":{"win":3,"draw":1,"loss":0}}
+{"revision":1,"action":"configure","name":"Workshop","expected_teams":["Atlas","Echo"],"scoring":{"win":3,"draw":1,"loss":0},"next_round":"Sensor warm-up"}
+{"revision":2,"action":"activate","session_id":null}
+{"revision":3,"action":"debrief","replay_id":"match_main_example","debrief":{"notes":"Discuss the blind spot","bookmarks":[{"tick":42,"label":"First contact"}]}}
+```
+
+`create` selects the new session. `activate` selects an existing ID or pauses session recording with null; it never deletes history. `configure` edits the active session in the lobby. Session identity/roster/scoring changes are refused during matches and Monte Carlo runs. Scoring locks after the first recorded round. Debriefs can be saved while a match runs. They are administrator notes, not replay inputs. Monte Carlo matches never enter training sessions.
+
+Limits: 100 sessions, 500 rounds per session, 32 expected team identities per session, 120 UTF-8 bytes per session/round/bookmark label, 64 bytes per expected identity, 1000 integer points per scoring field, 1000 replay debriefs, 100 bookmarks and 8000 bytes of notes per debrief. Bookmark ticks must be at most 1,000,000. The existing 16 KiB HTTP body limit also applies. Blank/duplicate expected identities are rejected; expected identities need not all be connected to start. The session roster describes attendance; authorization continues to use the protected credential file.
+
+Training standings group exact team identities across reconnects. A non-forfeiting winner receives `win`; every non-forfeiting participant in a draw receives `draw`; other non-forfeiting participants receive `loss`. Forfeits receive zero. Aborted and interrupted rounds are excluded from points and aggregate training statistics. Equal points share a place, with alphabetical display order within a tie; damage is not a tie-breaker. An absent expected team has zero appearances. CSV exports include the scoring rule; JSON exports include all round reports. These are configurable training points, not a definition of official competition scoring.
+
+The live room owns `<replay-dir>/training-history.json`. It writes an atomic replacement with file and directory synchronization before acknowledging a change or starting a session round. The deployment's replay volume therefore also preserves sessions and debriefs. Keep one live server writer per replay directory. Reads are bounded at 32 MiB. Invalid or unsupported history is preserved and further writes are refused. An in-progress round loaded after restart becomes `interrupted`, without inventing a result or resuming the simulation. Completed reports remain available across resets/restarts. If saving a completed report fails, the server retains it in memory, exposes `storage_error`, and retries before the next session mutation/start. Export it or restore storage before stopping that server. Replays retain their existing independent durability behavior.
+
+`GET /api/room` adds `round`, `training_revision`, and `training_error`. Its `expected_teams` uses the active session roster when one is selected, otherwise enabled credential-file identities. The frontend fetches history when its revision changes. Historical report selection is separate from the latest-match poll.
+
+`GET /api/room` bot entries and completed report bot entries add `diagnostics`:
+
+- `rtt` and `response`: `{samples, p50_ms, p95_ms, max_ms}`. Empty samples have null percentiles. Percentiles use nearest rank over at most the latest 512 measurements.
+- `rtt_age_seconds`: age of the last matching heartbeat reply, or null. RTT measures the server's WebSocket ping send to its matching pong receipt on this bot connection. Samples span the connection and may predate the current match. They include client/transport scheduling and are not browser-to-server latency.
+- Response samples measure the start of the server's tick send to receipt of the first matching match/tick command. They include transport, server send buffering and bot processing. Accepted and late first responses are sampled; duplicate submissions are not extra samples. A response that cannot be associated with a sent frame produces no measurement. Response samples reset at match start.
+- `accepted`, `late`, `wrong_tick`, `other_rejected`: command-slot submission counts since match start. `late` requires a matching match and tick after the admission deadline; other malformed-message/rate-limit errors are not included in these command-slot counters.
+- `completed_windows`, `missed_windows`, `late_windows`: closed command windows; those with no accepted command; and those with a late matching command but no accepted command. The displayed late-window rate is `late_windows / completed_windows`, or unknown when no windows closed. Wrong-tick replies are separate, so late-window rate alone does not describe all missed deadlines. Repeated late rejects can exceed late windows. An operator abort closes the open partial window before recording the report.
+
+These measurements are observational, bounded and outside `sim/`. They never affect admission, scoring, sensor filtering, simulation randomness or replay reconstruction. The 15-second frontend preflight reports readiness and recent matching heartbeats on the current connections; it does not measure command handling under match load. Run a practice round at the venue for those measurements.

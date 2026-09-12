@@ -3,13 +3,15 @@
   import { onMount } from 'svelte';
   import { fetchReplays } from '../lib/replayApi';
   import { openReplay, replayError, replayLoading } from '../stores/replay';
+  import { training } from '../stores/admin';
   import { appMode } from '../stores';
   import type { ReplaySummary } from '../types/protocol';
 
   let replays = $state<ReplaySummary[]>([]);
   let search = $state('');
   let outcome = $state('all');
-  const filtered = $derived(replays.filter(r => `${r.replay_id} ${r.room} ${r.bots.join(' ')}`.toLowerCase().includes(search.toLowerCase()) && (outcome === 'all' || (r.outcome ?? (r.winner_name ? 'winner' : 'unknown')) === outcome)));
+  const roundLabels = $derived(new Map(($training?.sessions ?? []).flatMap(s => s.rounds.filter(r => r.report?.replay_id).map(r => [r.report!.replay_id!, `${s.name} · ${r.name} · ${new Date(r.started_at * 1000).toLocaleString()}`] as const))));
+  const filtered = $derived(replays.filter(r => `${roundLabels.get(r.replay_id) ?? ""} ${r.replay_id} ${r.room} ${r.bots.join(' ')}`.toLowerCase().includes(search.toLowerCase()) && (outcome === 'all' || (r.outcome ?? (r.winner_name ? 'winner' : 'unknown')) === outcome)));
   let loading = $state(true);
   let listError = $state<string | null>(null);
 
@@ -39,7 +41,7 @@
       </button>
     </header>
 
-    <div class="replay-filters"><label>Search teams or match<input class="config-input" type="search" bind:value={search} /></label><label>Outcome<select bind:value={outcome}><option value="all">All outcomes</option><option value="winner">Winner</option><option value="draw">Draw</option><option value="aborted">Aborted</option><option value="incomplete">Incomplete</option><option value="unknown">Unknown</option></select></label></div>
+    <div class="replay-filters"><label>Search team, round or session<input class="config-input" type="search" bind:value={search} /></label><label>Outcome<select bind:value={outcome}><option value="all">All outcomes</option><option value="winner">Winner</option><option value="draw">Draw</option><option value="aborted">Aborted</option><option value="incomplete">Incomplete</option><option value="unknown">Unknown</option></select></label></div>
     {#if loading}
       <p class="rb-note">Loading replays…</p>
     {:else if listError}
@@ -53,6 +55,7 @@
         {#each filtered as r (r.replay_id)}
           <li class="rb-item">
             <div class="rb-item-main">
+              {#if roundLabels.has(r.replay_id)}<p class="rb-meta">{roundLabels.get(r.replay_id)}</p>{/if}
               <div class="rb-bots">{r.bots.join('  vs  ') || '(no bots)'}</div>
               <div class="rb-meta">
                 {#if r.winner_name}

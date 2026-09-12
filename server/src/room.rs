@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ingress::CommandSlot;
+use crate::training::{RoundTag, TrainingRequest, TrainingSnapshot, TrainingStore};
 use glam::Vec2;
 use rand::{Rng, SeedableRng};
 use rand_pcg::Pcg64;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
@@ -154,11 +155,15 @@ pub enum StartError {
     NotInLobby,
     NoBots,
     NotAllReady,
+    HistoryUnavailable,
 }
 
 impl StartError {
     pub fn as_str(&self) -> &'static str {
         match self {
+            StartError::HistoryUnavailable => {
+                "Could not preserve the round. Check Session history for storage errors or limits."
+            }
             StartError::UnknownRoom => "no room with that name",
             StartError::NotInLobby => "room is not in lobby state",
             StartError::NoBots => "no bots connected",
@@ -270,6 +275,13 @@ impl ConfigureError {
 /// single-threaded with respect to its own state; this channel serializes all mutations.
 #[derive(Debug)]
 pub enum RoomEvent {
+    QueryTraining {
+        reply: oneshot::Sender<TrainingSnapshot>,
+    },
+    UpdateTraining {
+        request: TrainingRequest,
+        reply: oneshot::Sender<Result<TrainingSnapshot, String>>,
+    },
     BotReadyChecked {
         bot_id: BotId,
         config_hash: String,
@@ -372,6 +384,10 @@ pub struct RoomSnapshot {
     pub match_id: String,
     pub config_hash: String,
     pub tick_deadline_ms: u64,
+    pub round: Option<RoundTag>,
+    pub training_revision: u64,
+    pub training_error: Option<String>,
+    pub session_expected_teams: Option<Vec<String>>,
 }
 
 /// Per-bot statistics accumulated over a single match. Reset at `start_match`, frozen into
@@ -388,8 +404,12 @@ struct BotStats {
 
 /// Post-match summary surfaced to the spectator UI via `GET /api/room/report`. Built once
 /// when a match ends (naturally or by abort) and kept until the next match starts.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchReport {
+    #[serde(default)]
+    pub match_id: String,
+    #[serde(default)]
+    pub round: Option<RoundTag>,
     pub room: String,
     /// Identifier of the replay log for this match, if one was written.
     pub replay_id: Option<String>,
@@ -404,8 +424,10 @@ pub struct MatchReport {
 }
 
 /// One bot's row in a [`MatchReport`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotReport {
+    #[serde(default)]
+    pub diagnostics: crate::diagnostics::TeamDiagnostics,
     pub bot_id: BotId,
     pub name: String,
     pub shots_fired: u32,
@@ -422,6 +444,8 @@ pub struct BotReport {
 
 #[derive(Debug)]
 pub struct Room {
+    training: TrainingStore,
+    current_round: Option<RoundTag>,
     pub tournament: bool,
     match_id: String,
     config_revision: u64,
@@ -502,6 +526,8 @@ impl Room {
         max_bots: u32,
     ) -> Self {
         Self {
+            training: TrainingStore::default(),
+            current_round: None,
             tournament: false,
             match_id: String::new(),
             config_revision: 1,
@@ -574,6 +600,7 @@ impl Room {
     /// Configure the directory where replay logs are written. Call before `start_match` —
     /// the writer is opened on the lobby→running transition.
     pub fn set_replay_dir(&mut self, dir: PathBuf) {
+        self.training = TrainingStore::load(dir.join("training-history.json"));
         self.replay_dir = Some(dir);
     }
 
@@ -1025,6 +1052,7 @@ impl Room {
                     0.0
                 };
                 BotReport {
+                    diagnostics: entry.ingress.diagnostics(),
                     bot_id: entry.bot_id.clone(),
                     name: entry.name.clone(),
                     shots_fired: stats.shots_fired,
@@ -1040,6 +1068,8 @@ impl Room {
             })
             .collect();
         MatchReport {
+            match_id: self.match_id.clone(),
+            round: self.current_round.clone(),
             room: self.name.clone(),
             replay_id: self.replay_id.clone(),
             outcome: outcome.into(),
@@ -1252,6 +1282,9 @@ impl Room {
         self.state = RoomState::Ended;
         self.end_tick = Some(self.world.tick);
         self.last_winner = None;
+        for bot in self.bots.values() {
+            bot.ingress.close();
+        }
         self.last_report = Some(self.build_match_report(None, true));
         self.broadcast_game_over(None);
         Ok(())
@@ -1424,6 +1457,10 @@ impl Room {
             match_id: self.match_id.clone(),
             config_hash: self.config_hash(),
             tick_deadline_ms: self.tick_deadline_ms,
+            round: self.current_round.clone(),
+            training_revision: self.training.data.revision,
+            training_error: self.training.error.clone(),
+            session_expected_teams: self.training.active().map(|s| s.expected_teams.clone()),
         }
     }
 
@@ -1437,6 +1474,7 @@ impl Room {
             .bots
             .values()
             .map(|entry| AdminBotInfo {
+                diagnostics: entry.ingress.diagnostics(),
                 bot_id: entry.bot_id.clone(),
                 name: entry.name.clone(),
                 ship_id: entry.ship_id.clone(),
@@ -1473,6 +1511,9 @@ impl Room {
     /// terminal `end` record to the replay log and drops the writer (which flushes the
     /// underlying file).
     fn broadcast_game_over(&mut self, winner: Option<BotId>) {
+        if let Some(report) = &self.last_report {
+            self.training.finish(report);
+        }
         for b in self.bots.values() {
             b.ingress.close();
         }
@@ -1782,6 +1823,16 @@ impl Room {
                 }
                 let _ = reply.send(result);
             }
+            RoomEvent::QueryTraining { reply } => {
+                let _ = reply.send(self.training.snapshot());
+            }
+            RoomEvent::UpdateTraining { request, reply } => {
+                let result = self.training.update(
+                    request,
+                    self.state == RoomState::Lobby && self.mc_run.is_none(),
+                );
+                let _ = reply.send(result.map(|_| self.training.snapshot()));
+            }
             RoomEvent::QueryState { reply } => {
                 let _ = reply.send(self.snapshot());
             }
@@ -2024,17 +2075,36 @@ impl Room {
         } else {
             default_ring_layout(self.world.width, self.world.height, self.bots.len())
         };
-        self.apply_match_layout(&layout);
+        let match_id = replay::unique_suffix();
+        self.current_round = self
+            .training
+            .begin(
+                &match_id,
+                self.config_hash(),
+                self.bots.values().map(|b| b.name.clone()).collect(),
+            )
+            .map_err(|e| {
+                self.training.error = Some(e);
+                StartError::HistoryUnavailable
+            })?;
+        self.apply_match_layout(&layout, match_id);
         Ok(())
     }
 
     /// Internal helper: place ships using the precomputed `layout` (one entry per bot in
     /// `BotId` order), broadcast `game_start`, reset state and open the replay log.
     /// Shared by [`Room::start_match`] and the Monte Carlo per-match path.
-    fn apply_match_layout(&mut self, layout: &[(Vec2, f32)]) {
-        self.match_id = replay::unique_suffix();
+    fn apply_match_layout(&mut self, layout: &[(Vec2, f32)], match_id: String) {
+        self.match_id = match_id;
         for b in self.bots.values() {
             b.ingress.close();
+        }
+        for b in self.bots.values() {
+            b.ingress
+                .measurements
+                .lock()
+                .expect("measurements poisoned")
+                .reset_match();
         }
         // Freeze the balance parameters for the whole match: ship hull / ammo and every
         // physics tunable are read from this snapshot from here on.
@@ -2417,7 +2487,8 @@ impl Room {
         // `apply_match_layout` opens a fresh replay writer (which uses the MC naming
         // scheme because `self.mc_run` is set), writes the new header, and broadcasts
         // `game_start` to every bot.
-        self.apply_match_layout(&layout);
+        self.current_round = None;
+        self.apply_match_layout(&layout, replay::unique_suffix());
         Ok(())
     }
 

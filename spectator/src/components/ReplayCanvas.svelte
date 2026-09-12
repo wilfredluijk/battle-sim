@@ -16,6 +16,7 @@
   } from '../stores/replay';
   import type { CapturedPerspective, CapturedReplay } from '../types/protocol';
 
+  let { overall = false }: { overall?: boolean } = $props();
   let canvas: HTMLCanvasElement | null = $state(null);
   let rafId: number | null = null;
   let resizeObserver: ResizeObserver | null = null;
@@ -42,10 +43,10 @@
     const radarRange = data.header.sim_config?.active_radar_range ?? ACTIVE_RADAR_RANGE;
     const frame = data.frames[Math.max(0, Math.min(tick, data.frames.length - 1))] ?? null;
 
-    if (perspective === 'overall') {
+    if (overall || perspective === 'overall') {
       // Replay frames are drawn directly (no splash interpolation, which assumes
       // monotonic time and would misbehave on a slider seek).
-      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp, radarRange);
+      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp, radarRange, { selected: data.header.bots.find(b => b.bot_id === perspective)?.ship_id });
       return;
     }
 
@@ -91,5 +92,5 @@
   bind:this={canvas}
   width="800"
   height="800"
-  aria-label="replay battlefield"
+  aria-label={overall ? "Replay ground truth comparison" : "Replay battlefield"}
 ></canvas>

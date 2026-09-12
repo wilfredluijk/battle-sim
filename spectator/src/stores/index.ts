@@ -38,6 +38,7 @@ export type AppMode =
   | 'lobby'
   | 'results'
   | 'settings'
+  | 'sessions'
   | 'replay-browser'
   | 'replay-viewer'
   | 'monte-carlo';

@@ -2,16 +2,17 @@
      and a per-bot statistics table. -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { report, room, adminToken, showReport, resetMatch } from '../stores/admin';
+  import { report, selectedReport, room, adminToken, showReport, resetMatch } from '../stores/admin';
   import { appMode } from '../stores';
   import { openReplay, replayLoading, replayError } from '../stores/replay';
   import { download } from '../lib/presentation';
+  import TeamTiming from './TeamTiming.svelte';
   import { colorFor } from '../lib/palette';
 
   onMount(() => replayError.set(null));
-  const r = $derived($report);
+  const r = $derived($selectedReport ?? $report);
   const isAdmin = $derived($adminToken != null);
-  const stillEnded = $derived($room?.state === 'ended');
+  const stillEnded = $derived($room?.state === 'ended' && (!r?.match_id || r.match_id === $room.match_id));
 
   let resetting = $state(false);
   let error = $state<string | null>(null);
@@ -42,7 +43,8 @@
 <main class="report">
   {#if r}
     <section class="report-card">
-      <h1>Match report</h1>
+      <h1>{r.round?.name ?? "Match report"}</h1>
+      {#if r.round}<p class="report-meta">{r.round.session_name} · Round {r.round.number}</p>{/if}
 
       <div class="report-outcome outcome-{r.outcome}">
         {#if r.outcome === 'winner'}
@@ -99,9 +101,11 @@
         </tbody>
       </table></div>
 
+      <TeamTiming bots={r.bots} historical />
       {#if error}<p class="config-err" role="alert">{error}</p>{/if}
       {#if $replayError}<p class="config-err" role="alert">{$replayError}</p>{/if}
       <div class="report-actions">
+        <button class="topbar-btn" onclick={() => appMode.set("sessions")}>Session standings</button>
         <button class="topbar-btn" type="button" onclick={dismiss}>Back to lobby</button>
         {#if r?.replay_id}<button class="pm-start" disabled={$replayLoading} onclick={() => r?.replay_id && openReplay(r.replay_id)}>{$replayLoading ? 'Loading replay…' : 'Watch replay'}</button>{/if}
         {#if r}<button class="topbar-btn" onclick={exportCsv}>Export CSV</button><button class="topbar-btn" onclick={() => download('match-results.json', JSON.stringify(r, null, 2))}>Export JSON</button>{/if}
@@ -112,7 +116,7 @@
             disabled={resetting}
             onclick={handleReset}
             title="Skip the post-game pause and return to the lobby now">
-            Reset now
+            Prepare next round
           </button>
         {/if}
       </div>

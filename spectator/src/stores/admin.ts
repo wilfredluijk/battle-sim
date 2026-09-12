@@ -43,6 +43,8 @@ adminToken.subscribe((t) => writeStoredToken(t));
 
 /** Latest `GET /api/room` snapshot, or null before the first successful poll. */
 export const room = writable<RoomInfo | null>(null);
+export const training = writable<import('../types/protocol').TrainingData | null>(null);
+export const trainingError = writable<string | null>(null);
 
 /** Set when the room poll fails (server unreachable); cleared on the next success. */
 export const roomError = writable<string | null>(null);
@@ -52,6 +54,7 @@ export const configSchema = writable<ConfigField[]>([]);
 
 /** Most recent match report, or null when no match has finished. */
 export const report = writable<MatchReport | null>(null);
+export const selectedReport = writable<MatchReport | null>(null);
 
 /** Whether the post-battle report screen should be shown. Set true when a match ends,
  *  cleared when a new match starts or the user dismisses the report. */
@@ -84,11 +87,14 @@ export function startControlPlane(): () => void {
     const epoch = ++generation;
     clearTimeout(timer);
     room.set(null);
+    training.set(null);
+    trainingError.set(null);
     roomUpdatedAt.set(0);
     roomError.set(null);
     configSchema.set([]);
     configDraft.set(null);
     report.set(null);
+    selectedReport.set(null);
     showReport.set(false);
     actionNotice.set(null);
     mcStatus.set(null);
@@ -105,6 +111,18 @@ export function startControlPlane(): () => void {
         if (previous === 'running' && info.state !== 'running') showReport.set(true);
         if (info.state === 'running') showReport.set(false);
         previous = info.state;
+        if (info.training_revision !== undefined && get(training)?.revision !== info.training_revision) {
+          try {
+            const history = await api.fetchTraining();
+            if (!current()) return;
+            if (!get(training) || history.revision >= get(training)!.revision) training.set(history);
+            trainingError.set(null);
+          } catch (e) {
+            if (!current()) return;
+            if (e instanceof ApiError && e.status === 401) { expireSession(); return; }
+            trainingError.set(e instanceof Error ? e.message : 'Session history unavailable');
+          }
+        }
         if (!get(configSchema).length) {
           const fields = await api.fetchConfigSchema();
           if (!current()) return;
@@ -181,6 +199,7 @@ export async function applyConfig(config: SimConfig): Promise<void> {
 export async function startMatch(): Promise<void> {
   if (get(configDraft)) throw new Error('Apply or discard the draft rules before starting.');
   await withToken(api.startMatch);
+  selectedReport.set(null);
   await refreshRoom();
 }
 
@@ -271,4 +290,17 @@ export async function stopMonteCarlo(forceAbort = false): Promise<void> {
     mcError.set(msg);
     throw e;
   }
+}
+
+export async function reloadTraining(): Promise<void> {
+  const history = await withToken(() => api.fetchTraining());
+  if (!get(training) || history.revision >= get(training)!.revision) training.set(history);
+  trainingError.set(null);
+}
+export async function saveTraining(action: import('../types/protocol').TrainingAction, revision = get(training)?.revision): Promise<void> {
+  if (revision === undefined) throw new Error('Load session history before saving.');
+  const history = await withToken(t => api.updateTraining(t, revision, action));
+  if (!get(training) || history.revision >= get(training)!.revision) training.set(history);
+  trainingError.set(null);
+  await refreshRoom();
 }
