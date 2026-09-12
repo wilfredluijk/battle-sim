@@ -1,0 +1,27 @@
+# Overlay for the public training server. Each bot uses its own participant file.
+# docker compose -f docker-compose.bots.yml -f docker-compose.bots.remote.yml up --build
+# Override BATTLE_CREDENTIALS_DIR to use a different directory of playerNN.env files.
+services:
+  bot-circler:
+    env_file: ["${BATTLE_CREDENTIALS_DIR:-./.deployment-secrets}/player01.env"]
+    command: ["bots/circle_bot.py", "--name", "circler"]
+
+  bot-warlord:
+    env_file: ["${BATTLE_CREDENTIALS_DIR:-./.deployment-secrets}/player02.env"]
+    command: ["bots/powerful_bot.py", "--name", "warlord"]
+
+  bot-strategist:
+    env_file: ["${BATTLE_CREDENTIALS_DIR:-./.deployment-secrets}/player03.env"]
+    command: ["bots/strategist_bot.py", "--name", "strategist"]
+
+  bot-tactician:
+    env_file: ["${BATTLE_CREDENTIALS_DIR:-./.deployment-secrets}/player04.env"]
+    command: ["bots/tactician_bot.py", "--name", "tactician"]
+
+  bot-tracker:
+    env_file: ["${BATTLE_CREDENTIALS_DIR:-./.deployment-secrets}/player05.env"]
+    command: ["bots/tracking_bot.py", "--name", "tracker"]
+
+  bot-loadout:
+    env_file: ["${BATTLE_CREDENTIALS_DIR:-./.deployment-secrets}/player06.env"]
+    command: ["bots/loadout_bot.py", "--name", "burst"]

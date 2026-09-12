@@ -1012,6 +1012,16 @@ main.replay-viewer { overflow: hidden; }
 .rv-field { font-size: 12px; }
 .rv-debrief { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; max-height: 88px; overflow: auto; font-size: 13px; }
 .projector .match-clock { font-size: 40px; }
+.sound-dialog { width: min(500px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); margin: auto; padding: 20px; overflow: auto; border: 1px solid var(--panel-border); border-radius: 12px; background: var(--panel); color: var(--ink); }
+.sound-dialog::backdrop { background: rgb(0 0 0 / 65%); }
+.sound-dialog-head, .sound-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.sound-dialog-head { justify-content: space-between; }
+.sound-dialog h2 { margin: 0; font-size: 22px; text-transform: none; letter-spacing: normal; }
+.sound-dialog p { margin: 14px 0; }
+.sound-volume { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 16px 0; }
+.sound-volume input { grid-column: 1/-1; width: 100%; min-height: 36px; padding: 0; }
+.sound-option { display: flex; align-items: center; gap: 8px; min-height: 40px; }
+.sound-actions { margin-top: 16px; }
 .projector .bot-name, .projector .ammo, .projector .meter-value, .projector .event-link { font-size: 16px; }
 .projector .meter-track { height: 9px; }
 .projector .bot-status { font-size: 12px; }

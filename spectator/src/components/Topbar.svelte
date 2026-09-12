@@ -2,7 +2,9 @@
   import { appMode, projector } from '../stores';
   import { room, roomError, roomUpdatedAt, selectedReport, abortMatch, actionNotice, configDraft } from '../stores/admin';
   import { replayPlaying } from '../stores/replay';
+  import { soundStatus } from '../stores/presenter';
   import LoginBox from './LoginBox.svelte';
+  import SoundControls from './SoundControls.svelte';
   let { screen }: { screen: string } = $props();
   let abortBusy = $state(false);
   let confirmAbort = $state<string | null>(null);
@@ -36,12 +38,14 @@
     <button class="topbar-btn quiet" onclick={() => appMode.set('settings')}>Settings{$configDraft ? ' •' : ''}</button>
     {#if $room?.capabilities?.monte_carlo}<button class="topbar-btn quiet" onclick={() => appMode.set('monte-carlo')}>Analysis</button>{/if}
     <button class="topbar-btn" aria-pressed={$projector} onclick={() => projector.update(v => !v)}>Projector</button>
+    <SoundControls />
     <LoginBox />
   </div>
 </header>
 <div class="session-strip">
   <strong>{viewed}</strong>
   <span class:config-err={!!$roomError || stale} role="status">{freshness}</span>
+  {#if $soundStatus.error}<span class="config-err" role="alert">{$soundStatus.error}</span>{/if}
   {#if $room?.state === 'running' && $appMode !== 'live'}<span>Match running in background</span>{/if}
   {#if $room?.state === 'running' && $room.capabilities?.manage_match && !$projector}
     <button class="topbar-btn danger" onclick={() => { confirmAbort = $room?.match_id ?? ''; error = null; }}>Abort match</button>

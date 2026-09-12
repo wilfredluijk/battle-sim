@@ -25,9 +25,9 @@ The bot is deliberately *not* random — its behaviour is a pure function
 of the WorldView history, so two runs against an identical opponent
 produce the same outcome.
 
-Run against a local server:
+Run against the training server with your participant file:
 
-    python examples/powerful_bot.py --host localhost --port 7878 --name warlord
+    python examples/powerful_bot.py --env-file player01.env --name warlord
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from naval_sdk.cli import add_connection_arguments, connection_options
 from naval_sdk import (
     Bot,
     Command,
@@ -434,11 +435,11 @@ def _abs_bearing_delta(a: float, b: float) -> float:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--host", default="localhost")
-    p.add_argument("--port", type=int, default=7878)
+    add_connection_arguments(p, default_url="wss://93.190.187.250/bot")
     p.add_argument("--name", default="warlord")
     args = p.parse_args()
-    run(PowerfulBot(), host=args.host, port=args.port, name=args.name)
+    connection = connection_options(p, args)
+    run(PowerfulBot(), name=args.name, **connection)
 
 
 if __name__ == "__main__":

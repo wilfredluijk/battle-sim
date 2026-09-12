@@ -1,6 +1,6 @@
 # docker-compose.bots.yml — start every example bot with one command.
 #
-# Runs all 5 example bots, each in its own container. This file does NOT start
+# Runs all 6 example bots, each in its own container. This file does NOT start
 # the server — bring that up separately first:
 #
 #   docker compose up -d              # the battle-sim server (docker-compose.yml)
@@ -16,7 +16,10 @@
 #
 #   SERVER_HOST=192.168.1.50 docker compose -f docker-compose.bots.yml up --build
 #
-# Bots restart on exit, so they rejoin the lobby for each new match. Stop them
+# For the public training server with separate participant credentials, add
+# -f docker-compose.bots.remote.yml (see examples/README.md).
+#
+# Bots stay connected between matches and restart on process exit. Stop them
 # all with Ctrl-C, or `docker compose -f docker-compose.bots.yml down`.
 
 name: battle-sim-bots
@@ -54,3 +57,7 @@ services:
   bot-tracker:
     <<: *python-bot
     command: ["bots/tracking_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "tracker"]
+
+  bot-loadout:
+    <<: *python-bot
+    command: ["bots/loadout_bot.py", "--host", "${SERVER_HOST:-host.docker.internal}", "--port", "${SERVER_PORT:-7878}", "--name", "burst"]

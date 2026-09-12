@@ -10,13 +10,15 @@
   import ReplayViewer from './components/ReplayViewer.svelte';
   import LoginBox from './components/LoginBox.svelte';
   import { exitReplay } from './stores/replay';
+  import { watchSoundVisibility } from './stores/presenter';
   import ConfigForm from './components/ConfigForm.svelte';
   import { appMode, projector, startSpectator } from './stores';
   import { startControlPlane, startMonteCarloPolling, room, report, showReport, adminToken, sessionExpired, roomError } from './stores/admin';
   const teardownSpectator = startSpectator();
   const teardownControl = startControlPlane();
   const teardownMc = startMonteCarloPolling();
-  onDestroy(() => { teardownSpectator(); teardownControl(); teardownMc(); });
+  const teardownSound = watchSoundVisibility();
+  onDestroy(() => { teardownSpectator(); teardownControl(); teardownMc(); teardownSound(); });
   $effect(() => { if (!$adminToken) { exitReplay(); projector.set(false); } });
   const screen = $derived.by(() => {
     if ($appMode !== 'live') return $appMode;

@@ -9,9 +9,9 @@ and a stealth-biased ``PingWhenStale`` sensor policy.
 Doctrine in one sentence: passive by default, active only when the tracker
 has lost the picture, fire only when a vetted shot is available.
 
-Run against a local server:
+Run against the training server with your participant file:
 
-    python examples/tactician_bot.py --host localhost --port 7878 --name tactician
+    python examples/tactician_bot.py --env-file player01.env --name tactician
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from naval_sdk.cli import add_connection_arguments, connection_options
 from naval_sdk import Bot, Command, WorldView, bearing_to, distance, run
 from naval_sdk.protocol import Welcome
 from naval_sdk.tactical import (
@@ -137,14 +138,14 @@ class TacticianBot(Bot):
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--host", default="localhost")
-    p.add_argument("--port", type=int, default=7878)
+    add_connection_arguments(p, default_url="wss://93.190.187.250/bot")
     p.add_argument("--name", default="tactician")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
+    connection = connection_options(p, args)
     if args.verbose:
         logging.getLogger("tactician_bot").setLevel(logging.DEBUG)
-    run(TacticianBot(), host=args.host, port=args.port, name=args.name)
+    run(TacticianBot(), name=args.name, **connection)
 
 
 if __name__ == "__main__":

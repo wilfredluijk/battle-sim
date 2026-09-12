@@ -8,14 +8,11 @@ Update/install the Python SDK from this checkout. Each participant receives only
 
 ```bash
 python -m pip install ./sdk-python
-# Load only your own participant file into the environment:
-set -a
-source player01.env
-set +a
-python examples/circle_bot.py
+# Use your own participant file (no need to source it into your shell):
+python examples/circle_bot.py --env-file player01.env
 ```
 
-Existing examples inherit `BATTLE_SERVER_URL` and `BATTLE_BOT_TOKEN`. Custom programs may call `run(bot, url="wss://93.190.187.250/bot", token=credential)`. TLS verification is enabled. Do not share the administrator password or the complete roster with participants.
+All six examples accept `--env-file`, inherit `BATTLE_SERVER_URL` and `BATTLE_BOT_TOKEN` when no file is selected, and default to the public training URL. An explicit `--url` or `--host`/`--port` overrides the selected URL. Custom programs may call `run(bot, url="wss://93.190.187.250/bot", token=credential)`. TLS verification is enabled. Do not share the administrator password or the complete roster with participants. See [example connection options and the six-bot Docker setup](../examples/README.md).
 
 Protocol v3 requires `hello.token`, `ready.config_hash` and `command.match_id`. Update older SDKs/raw clients. The full match configuration arrives before readiness, and any configuration change invalidates readiness. `Bot.accept_configuration(configuration, config_hash)` can refuse settings.
 

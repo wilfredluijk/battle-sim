@@ -12,7 +12,8 @@ WORKDIR /app
 COPY sdk-python/ ./sdk-python/
 RUN pip install --no-cache-dir ./sdk-python
 
-# The example bots. Run as: python bots/<name>.py --host ... --port ... --name ...
+# The examples accept --env-file for a mounted participant file, or inherit
+# BATTLE_SERVER_URL / BATTLE_BOT_TOKEN from the container environment.
 COPY examples/ ./bots/
 
 ENTRYPOINT ["python"]

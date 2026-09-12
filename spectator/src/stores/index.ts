@@ -1,4 +1,5 @@
-import { adminToken, room } from './admin';
+import { adminToken, room, roomError, roomUpdatedAt } from './admin';
+import { muteSounds, observeLiveSound, resetLiveCues } from './presenter';
 import { get } from 'svelte/store';
 import { writable } from 'svelte/store';
 import { WsClient, defaultSpectatorUrl, type ConnectionStatus } from '../lib/wsClient';
@@ -57,9 +58,18 @@ export function startSpectator(url: string = defaultSpectatorUrl()): () => void 
 
   const client = new WsClient(url);
 
-  const offStatus = client.onStatus((s) => connection.set(s));
+  const offStatus = client.onStatus((s) => {
+    connection.set(s);
+    if (!s.connected) resetLiveCues();
+  });
+  const offView = appMode.subscribe(() => resetLiveCues());
 
   const offWorld = client.onWorld((frame) => {
+    const info = get(room);
+    const now = Date.now();
+    observeLiveSound(frame, info?.match_id,
+      get(appMode) === 'live' && info?.state === 'running' && !info.replay_mode &&
+      !!info.capabilities?.manage_match && !get(roomError) && now - get(roomUpdatedAt) < 5000 && !document.hidden, now);
     if (frame.tick < (get(latestWorld)?.tick ?? 0)) {
       curBots = new Map(); curEvents = []; curSplashes = [];
       structuredEvents.set([]);
@@ -90,6 +100,7 @@ export function startSpectator(url: string = defaultSpectatorUrl()): () => void 
   });
 
   const offAuth = adminToken.subscribe((token) => {
+    muteSounds();
     client.close();
     latestWorld.set(null);
     curBots = new Map(); curEvents = []; curSplashes = [];
@@ -101,9 +112,11 @@ export function startSpectator(url: string = defaultSpectatorUrl()): () => void 
 
   return () => {
     offAuth();
+    offView();
     offRoom();
     offStatus();
     offWorld();
     client.close();
+    muteSounds();
   };
 }

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onDestroy, untrack } from 'svelte';
+  import { countdownSound, resetLiveCues } from '../stores/presenter';
   import { room, roomError, configDraft, startMatch, kickBot, actionNotice, training } from '../stores/admin';
   import { appMode } from '../stores';
   import { colorFor } from '../lib/palette';
@@ -19,9 +21,16 @@
     if (countdown === null) return;
     if (!canStart) { countdown = null; return; }
     if (countdown === 0) { countdown = null; void begin(); return; }
+    untrack(countdownSound);
     const timer = setTimeout(() => countdown = countdown === null ? null : countdown - 1, 1000);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); resetLiveCues(); };
   });
+  $effect(() => {
+    const hide = () => { if (document.hidden) countdown = null; };
+    document.addEventListener('visibilitychange', hide);
+    return () => document.removeEventListener('visibilitychange', hide);
+  });
+  onDestroy(resetLiveCues);
   async function begin() {
     if (!canStart || starting) return;
     starting = true; error = null;

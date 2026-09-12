@@ -5,9 +5,9 @@ This bot is the showcase for the toolkit's high-level layer. It subclasses
 up tracking, fire control, steering, sensor scheduling, and evasion. The
 bot author writes *intent*, not plumbing.
 
-Run against a local server:
+Run against the training server with your participant file:
 
-    python examples/strategist_bot.py --host localhost --port 7878 --name strategist
+    python examples/strategist_bot.py --env-file player01.env --name strategist
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from naval_sdk.cli import add_connection_arguments, connection_options
 from naval_sdk import run
 from naval_sdk.tactical import Intent, PingWhenStale, TacticalBot, TacticalContext
 
@@ -65,11 +66,11 @@ class StrategistBot(TacticalBot):
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--host", default="localhost")
-    p.add_argument("--port", type=int, default=7878)
+    add_connection_arguments(p, default_url="wss://93.190.187.250/bot")
     p.add_argument("--name", default="strategist")
     args = p.parse_args()
-    run(StrategistBot(), host=args.host, port=args.port, name=args.name)
+    connection = connection_options(p, args)
+    run(StrategistBot(), name=args.name, **connection)
 
 
 if __name__ == "__main__":

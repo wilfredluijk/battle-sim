@@ -89,6 +89,8 @@ The third phase is now implemented: durable named training sessions and rounds, 
 
 History and debriefs live beside the replays in `training-history.json`. A server restart preserves completed reports and marks unfinished rounds interrupted. Storage failures are visible and cannot silently acknowledge a session change. See the administrator session contract in `docs/PROTOCOL.md`.
 
-The public audience permission model, optional sound cues and advanced version/heatmap analysis remain later features outside the review’s three implementation phases. No game physics or bot-facing protocol change was made.
+The next extension, **presenter sound controls**, is implemented. The trainer can enable or immediately mute synthesized countdown and ship-elimination tones, set volume, choose cues and test each sound. Volume and cue choices persist locally; audio starts muted on reload and mutes on tab hiding or sign-out. Live cues exclude replay/background views, old events after reconnects and duplicate deaths; simultaneous deaths produce one cue. The countdown also cancels when the tab is hidden. All existing visual countdown, event and status information remains available with audio muted.
+
+The public audience permission model and advanced version/heatmap analysis remain later features outside the review’s three implementation phases. No game physics or bot-facing protocol change was made.
 
 Validation uses isolated local servers and synthetic/example teams. These checks are not measurements of the Amersfoort venue network. See `docs/ADMIN-FRONTEND-VALIDATION.md` for the completed checks and limitations.

@@ -119,7 +119,18 @@ Active-radar pings show as faint translucent rings.
 
 ## Connect a bot
 
-The server speaks JSON over WebSocket at `ws://localhost:7878/bot`. For a
+For the deployed training server, run an example with your participant file:
+
+```bash
+python -m pip install -e ./sdk-python
+python examples/circle_bot.py --env-file .deployment-secrets/player01.env
+```
+
+All examples default to `wss://93.190.187.250/bot` and support `--env-file`,
+`--url`, and explicit local `--host`/`--port` overrides. See
+[the examples guide](examples/README.md) for credentials and Docker usage.
+
+For local development, the server speaks JSON over WebSocket at `ws://localhost:7878/bot`. For a
 quick smoke test with `wscat`:
 
 ```bash

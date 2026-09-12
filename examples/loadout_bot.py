@@ -11,9 +11,9 @@ Demonstrates the full powerup workflow:
 
 See ``docs/POWERUPS.md`` for the full powerup catalog and other synergy recipes.
 
-Run against a local server (start one with ``cargo run -- --port 7878`` first)::
+Run against the training server with your participant file::
 
-    python examples/loadout_bot.py --host localhost --port 7878 --name burst
+    python examples/loadout_bot.py --env-file player01.env --name burst
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import argparse
 import logging
 from typing import List
 
+from naval_sdk.cli import add_connection_arguments, connection_options
 from naval_sdk import Bot, Command, FireCommand, WorldView, run
 from naval_sdk.protocol import Welcome
 
@@ -94,11 +95,11 @@ class LoadoutBot(Bot):
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--host", default="localhost")
-    p.add_argument("--port", type=int, default=7878)
+    add_connection_arguments(p, default_url="wss://93.190.187.250/bot")
     p.add_argument("--name", default="burst")
     args = p.parse_args()
-    run(LoadoutBot(), host=args.host, port=args.port, name=args.name)
+    connection = connection_options(p, args)
+    run(LoadoutBot(), name=args.name, **connection)
 
 
 if __name__ == "__main__":
