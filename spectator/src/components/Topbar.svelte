@@ -36,7 +36,7 @@
     <span class="admin-badge admin-badge-{roomState}">{roomState}</span>
   {/if}
   <span class="topbar-spacer"></span>
-  <LoginBox />
+  {#if !$room?.replay_mode}<LoginBox />{/if}
   <div class="topbar-controls">
     {#if $appMode === 'live'}
       <button
@@ -44,13 +44,15 @@
         type="button"
         title="Browse and watch recorded matches"
         onclick={() => appMode.set('replay-browser')}>Replays</button>
+      {#if !$room?.replay_mode}
       <button
         class="topbar-btn"
         type="button"
         title="Run a Monte Carlo batch of matches and rank bots by win rate"
         onclick={() => appMode.set('monte-carlo')}>Monte Carlo</button>
+      {/if}
     {/if}
-    {#if isRunning && $adminToken}
+    {#if isRunning && $adminToken && !$room?.replay_mode}
       <button
         class="topbar-btn admin-disconnect"
         type="button"
@@ -58,7 +60,7 @@
         onclick={handleAbort}
         title="Force-end the running match (no winner)">Abort match</button>
     {/if}
-    {#if isRunning}
+    {#if isRunning || $room?.replay_mode}
       <button
         id="view-toggle"
         class="topbar-btn"

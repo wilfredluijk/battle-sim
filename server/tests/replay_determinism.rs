@@ -407,11 +407,9 @@ fn disconnect_mid_match_replays_byte_identically() {
     );
 }
 
-/// F-02 backward compatibility: a v4 log (no `Disconnect` records) still loads and replays.
-/// Older logs simply predate the record type, so `version <= REPLAY_FORMAT_VERSION` accepts
-/// them and the driver never encounters a disconnect.
+/// Changed simulation behavior is versioned: old logs fail explicitly instead of diverging.
 #[test]
-fn v4_log_without_disconnect_still_loads() {
+fn old_simulation_log_is_rejected() {
     // Drive a short natural-end match, then relabel the header version to 4 — the exact shape
     // of a pre-F-02 log: a header, tick records, an end record, and no disconnect record.
     let mut room = Room::new("test".into(), 1000.0, 1000.0, 55, 10, 80, 4);
@@ -478,10 +476,11 @@ fn v4_log_without_disconnect_still_loads() {
         "a v4 log must not contain disconnect records"
     );
 
-    // A v4 log loads and re-simulates without error.
-    let captured = replay::capture_replay(records).expect("v4 log should still load");
-    assert_eq!(captured.header.version, 4);
-    assert!(captured.end.is_some(), "match ended with an end record");
+    // Version 6 changed simulation behavior; older inputs must not silently diverge.
+    assert!(matches!(
+        replay::capture_replay(records),
+        Err(replay::ReplayError::Version(4))
+    ));
 }
 
 /// Sanity check: the writer emits a header line followed by tick lines, and the final

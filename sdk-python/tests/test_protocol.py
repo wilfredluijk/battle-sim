@@ -191,12 +191,13 @@ def test_self_state_parses_powerup_status_and_convenience_methods_work():
 def test_powerup_activated_event_parses():
     frame = dict(TICK_FRAME)
     frame["events"] = [
-        {"type": "powerup_activated", "ship_id": "s_2", "powerup": "smoke_screen"}
+        {"type": "powerup_activated", "own": False, "contact_id": "c_2", "powerup": "smoke_screen"}
     ]
     view = WorldView.from_dict(frame)
     assert len(view.events) == 1
     assert isinstance(view.events[0], PowerupActivatedEvent)
-    assert view.events[0].ship_id == "s_2"
+    assert view.events[0].contact_id == "c_2"
+    assert not view.events[0].own
     assert view.events[0].powerup == "smoke_screen"
 
 

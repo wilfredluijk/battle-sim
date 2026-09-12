@@ -15,23 +15,24 @@
 //! the recorded commands back through `Room::step_tick`. State is reconstructed, never
 //! deserialized.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::protocol::{
     Contact, FireCommand, MapInfo, SensorMode, ServerMsg, SpectatorMsg, TickEvent,
 };
-use crate::room::{PendingCommand, Room, RoomEvent, SpectatorFrame};
+use crate::room::{PendingCommand, Room, RoomEvent, RoomState, SpectatorFrame};
 use crate::sim::{PowerupId, SimConfig};
 
 /// Bumped on any breaking change to the on-disk format. Readers reject mismatched versions
@@ -48,16 +49,19 @@ use crate::sim::{PowerupId, SimConfig};
 /// v4 added per-bot `spawn_pos` + `spawn_heading_deg` to the header so a replay reproduces
 /// the *actual* starting positions, regardless of the variance layout the live run used
 /// (Monte Carlo runs use non-Fixed layouts; rebuilding via the default ring diverged).
-/// Both fields are `serde(default)`, so v2/v3 logs (which lack them) still deserialize;
-/// the reader treats `version <= REPLAY_FORMAT_VERSION` as loadable and falls back to the
-/// rebuilt ring layout when the recorded spawns are absent/all-zero.
+/// Both fields are `serde(default)`, so older logs can still be listed/deserialized;
+/// playback requires the current simulation version.
 ///
 /// v5 added the `Disconnect` record: a mid-match disconnect or operator kick removes the
 /// bot's ship from the world immediately, which shifts the shared RNG stream (fewer ships =
 /// fewer sensor draws) and can end the match early. Without it, replay kept a ghost ship and
-/// diverged from the recorded `End`. v4 and older logs simply carry no `Disconnect` records
-/// (a match where nobody dropped), so they still load and replay identically.
-pub const REPLAY_FORMAT_VERSION: u32 = 5;
+/// diverged from the recorded `End`.
+///
+/// v6 changes sensor observations, effect windows, decoys and hull splash geometry.
+/// Older simulation inputs cannot be reproduced faithfully by this implementation.
+pub const REPLAY_FORMAT_VERSION: u32 = 6;
+const MAX_REPLAY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REPLAY_BOTS: usize = 256;
 
 /// One line of the JSONL log. Internally tagged so the discriminator field (`type`) sits
 /// alongside the variant payload — the on-disk shape is exactly what bot authors see when
@@ -222,7 +226,7 @@ impl ReplayWriter {
     pub fn create_file(dir: &Path, replay_id: String) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{replay_id}.jsonl"));
-        let file = File::create(&path)?;
+        let file = File::options().write(true).create_new(true).open(&path)?;
         Ok(Self {
             sink: Box::new(BufWriter::new(file)),
             replay_id,
@@ -287,56 +291,141 @@ impl Write for SharedBuf {
 /// partial replays are not supported. Empty lines are silently skipped to tolerate trailing
 /// newlines and cosmetic padding.
 pub fn read_records(path: &Path) -> io::Result<Vec<ReplayRecord>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let rec: ReplayRecord = serde_json::from_str(trimmed).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("malformed replay line {}: {e}", lineno + 1),
-            )
-        })?;
-        out.push(rec);
-    }
-    Ok(out)
+    read_records_from(BufReader::new(File::open(path)?))
 }
 
-/// Same as `read_records` but reads from any `BufRead`. Useful for tests that keep the
-/// log in memory.
+/// Bound input bytes before parsing, including a maliciously long individual line.
 pub fn read_records_from<R: BufRead>(reader: R) -> io::Result<Vec<ReplayRecord>> {
+    let mut bytes = Vec::new();
+    reader.take(MAX_REPLAY_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REPLAY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay exceeds 64 MiB",
+        ));
+    }
     let mut out = Vec::new();
-    for (lineno, line) in reader.lines().enumerate() {
+    for (lineno, line) in BufReader::new(bytes.as_slice()).lines().enumerate() {
         let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        let rec: ReplayRecord = serde_json::from_str(trimmed).map_err(|e| {
+        out.push(serde_json::from_str(line.trim()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("malformed replay line {}: {e}", lineno + 1),
             )
-        })?;
-        out.push(rec);
+        })?);
+        if out.len() > crate::room::MATCH_TIMEOUT_TICKS as usize + MAX_REPLAY_BOTS + 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many replay records",
+            ));
+        }
     }
     Ok(out)
 }
 
-/// Generate a replay identifier of the form `match_<room>_<unix_secs>`. The unix timestamp
+/// Reject corrupt timelines before performing any simulation or allocating frames.
+fn validate_records(records: &[ReplayRecord]) -> Result<(), ReplayError> {
+    let Some(ReplayRecord::Header(header)) = records.first() else {
+        return Err(ReplayError::Header(
+            "replay must begin with a header".into(),
+        ));
+    };
+    if header.version != REPLAY_FORMAT_VERSION {
+        return Err(ReplayError::Version(header.version));
+    }
+    header.sim_config.validate().map_err(ReplayError::Header)?;
+    if header.map.width == 0
+        || header.map.height == 0
+        || header.bots.is_empty()
+        || header.bots.len() > MAX_REPLAY_BOTS
+        || header.tick_hz == 0
+        || header.tick_hz > 1000
+    {
+        return Err(ReplayError::Header(
+            "invalid map, bot count, or tick rate".into(),
+        ));
+    }
+    let mut bots = BTreeSet::new();
+    let mut ships = BTreeSet::new();
+    for bot in &header.bots {
+        if !bots.insert(bot.bot_id.clone())
+            || !ships.insert(bot.ship_id.clone())
+            || !bot.spawn_heading_deg.is_finite()
+            || bot.spawn_pos.iter().any(|v| !v.is_finite())
+        {
+            return Err(ReplayError::Header("invalid or duplicate bot/spawn".into()));
+        }
+    }
+    let mut last_tick = 0;
+    let mut ended = false;
+    for record in &records[1..] {
+        if ended {
+            return Err(ReplayError::Header("records after end".into()));
+        }
+        let tick = match record {
+            ReplayRecord::Tick(rec) => {
+                if rec.tick == 0 || rec.tick <= last_tick || rec.commands.len() > bots.len() {
+                    return Err(ReplayError::Header("invalid command tick/count".into()));
+                }
+                let mut seen = BTreeSet::new();
+                for cmd in &rec.commands {
+                    if !bots.contains(&cmd.bot_id)
+                        || !seen.insert(&cmd.bot_id)
+                        || !cmd.throttle.is_finite()
+                        || !cmd.rudder.is_finite()
+                        || cmd
+                            .fire
+                            .is_some_and(|f| !f.bearing_deg.is_finite() || !f.range.is_finite())
+                    {
+                        return Err(ReplayError::Header("invalid replay command".into()));
+                    }
+                }
+                rec.tick
+            }
+            ReplayRecord::Disconnect(rec) => {
+                if !bots.remove(&rec.bot_id) {
+                    return Err(ReplayError::Header("unknown disconnect".into()));
+                }
+                rec.tick
+            }
+            ReplayRecord::End(rec) => {
+                ended = true;
+                rec.tick
+            }
+            ReplayRecord::Header(_) => return Err(ReplayError::Header("duplicate header".into())),
+        };
+        if tick < last_tick || tick > crate::room::MATCH_TIMEOUT_TICKS {
+            return Err(ReplayError::Header(
+                "replay ticks must be ordered and at most 3000".into(),
+            ));
+        }
+        last_tick = tick;
+    }
+    Ok(())
+}
+
+/// Generate a unique replay identifier with nanoseconds, process ID, and a counter. The timestamp
 /// is a wall-clock read, so this MUST NOT be called inside the simulation — it's strictly
 /// for naming the file we're about to write.
 pub fn make_replay_id(room: &str) -> String {
-    let secs = SystemTime::now()
+    format!("match_{room}_{}", unique_suffix())
+}
+
+/// Wall-clock naming only; never a simulation input. Exclusive creation is the final guard.
+pub fn unique_suffix() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("match_{room}_{secs}")
+    format!(
+        "{nanos}_{}_{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A bot's id paired with the receiver for the frames the room sends it.
@@ -513,13 +602,14 @@ fn advance_and_inject(
     room: &mut Room,
     target_tick: u64,
     commands: &[ReplayCommand],
-    mut after_step: impl FnMut(&mut Room),
-) {
+    mut after_step: impl FnMut(&mut Room) -> Result<(), ReplayError>,
+) -> Result<(), ReplayError> {
     // Step every empty tick that precedes the one the commands belong to. The `+ 1` form
     // avoids the underflow a bare `target_tick - 1` would hit on a corrupt `tick: 0` record.
     while room.world.tick + 1 < target_tick {
+        ensure_running(room)?;
         room.step_tick();
-        after_step(room);
+        after_step(room)?;
     }
     for cmd in commands {
         room.inject_replay_command(
@@ -538,19 +628,36 @@ fn advance_and_inject(
     // record whose tick we've already reached (duplicate or corrupt) never steps backwards
     // or re-consumes an already-applied command.
     if room.world.tick < target_tick {
+        ensure_running(room)?;
         room.step_tick();
-        after_step(room);
+        after_step(room)?;
     }
+    Ok(())
 }
 
 /// Step `room` forward until `world.tick == target_tick`, running `after_step` after each
 /// step. Shared by the `End` and `Disconnect` record handlers (which advance the world but
 /// inject no commands) across all three replay drivers, so their timing stays in lockstep.
-fn advance_to(room: &mut Room, target_tick: u64, mut after_step: impl FnMut(&mut Room)) {
+fn advance_to(
+    room: &mut Room,
+    target_tick: u64,
+    mut after_step: impl FnMut(&mut Room) -> Result<(), ReplayError>,
+) -> Result<(), ReplayError> {
     while room.world.tick < target_tick {
+        ensure_running(room)?;
         room.step_tick();
-        after_step(room);
+        after_step(room)?;
     }
+    Ok(())
+}
+
+fn ensure_running(room: &Room) -> Result<(), ReplayError> {
+    if room.state != RoomState::Running {
+        return Err(ReplayError::Header(
+            "recorded tick exceeds simulated match end".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Drive a replay end-to-end: read the file, rebuild the room, then tick at the recorded
@@ -559,73 +666,92 @@ fn advance_to(room: &mut Room, target_tick: u64, mut after_step: impl FnMut(&mut
 pub async fn run_replay(
     path: PathBuf,
     spec_tx: broadcast::Sender<SpectatorFrame>,
+    shutdown_rx: broadcast::Receiver<()>,
+) -> Result<(), ReplayError> {
+    run_replay_with_events(path, spec_tx, shutdown_rx, None).await
+}
+
+/// Replay playback shares the normal control-plane read routes, but cannot be mutated.
+pub async fn run_replay_with_events(
+    path: PathBuf,
+    spec_tx: broadcast::Sender<SpectatorFrame>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    mut events: Option<mpsc::Receiver<RoomEvent>>,
 ) -> Result<(), ReplayError> {
     let records = tokio::task::spawn_blocking(move || read_records(&path))
         .await
-        .map_err(|e| ReplayError::Io(io::Error::other(format!("blocking read panicked: {e}"))))??;
-
-    let mut iter = records.into_iter();
-    let header = match iter.next() {
-        Some(ReplayRecord::Header(h)) => *h,
-        Some(_) => {
-            return Err(ReplayError::Header(
-                "replay log does not begin with a header record".into(),
-            ))
-        }
-        None => return Err(ReplayError::Header("replay log is empty".into())),
+        .map_err(|e| ReplayError::Io(io::Error::other(e.to_string())))??;
+    validate_records(&records)?;
+    let ReplayRecord::Header(header) = &records[0] else {
+        unreachable!("validated header")
     };
-    // Accept any version up to and including the current one. Old logs (v2/v3) lack the
-    // v4 spawn fields, which deserialize to defaults and trigger the ring-layout fallback
-    // on rebuild. Newer-than-current logs are still rejected — we can't know their shape.
-    if header.version > REPLAY_FORMAT_VERSION {
-        return Err(ReplayError::Version(header.version));
-    }
-
-    let tick_hz = header.tick_hz.max(1);
-    let mut room = tokio::task::spawn_blocking(move || rebuild_room_from_header(&header))
-        .await
-        .map_err(|e| ReplayError::Header(format!("rebuild room blocking task panicked: {e}")))??;
-    room.set_spectator_broadcast(spec_tx);
-
-    let period = Duration::from_secs_f64(1.0 / f64::from(tick_hz));
+    let mut room = rebuild_room_from_header(header)?;
+    room.set_spectator_broadcast(spec_tx.clone());
+    let period = Duration::from_secs_f64(1.0 / f64::from(header.tick_hz));
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    info!(tick_hz, "replay running");
-
+    let mut next = 1;
+    let mut finished = false;
     loop {
-        tokio::select! {
-            biased;
-            _ = shutdown_rx.recv() => {
-                info!("replay: shutdown signal received");
+        // Apply removals after their tick's observation and before the next simulation step.
+        while next < records.len() {
+            match &records[next] {
+                ReplayRecord::Disconnect(rec) if rec.tick == room.world.tick => {
+                    room.remove_bot_and_ship(&rec.bot_id);
+                    next += 1;
+                }
+                ReplayRecord::End(rec) if rec.tick == room.world.tick => {
+                    finished = true;
+                    next += 1;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        finished |= next == records.len();
+        if finished {
+            room.state = RoomState::Ended;
+            // Library callers finish at EOF; the CLI retains a frozen final frame and
+            // answers read requests so a late spectator can still view the replay.
+            if events.is_none() {
                 break;
             }
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => break,
             _ = ticker.tick() => {
-                let next = iter.next();
-                match next {
-                    Some(ReplayRecord::Tick(rec)) => {
-                        advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {});
+                if finished {
+                    let frame = serde_json::to_string(&room.spectator_world_snapshot())
+                        .map_err(|e| ReplayError::Header(e.to_string()))?;
+                    let _ = spec_tx.send(Arc::new(frame));
+                    continue;
+                }
+                ensure_running(&room)?;
+                let target = room.world.tick + 1;
+                if let Some(ReplayRecord::Tick(rec)) = records.get(next) {
+                    if rec.tick == target {
+                        advance_and_inject(&mut room, target, &rec.commands, |_| Ok(()))?;
+                        next += 1;
+                    } else { room.step_tick(); }
+                } else { room.step_tick(); }
+            }
+            event = async {
+                match &mut events {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    Some(RoomEvent::QueryState { reply }) => {
+                        let mut snapshot = room.snapshot();
+                        snapshot.replay_mode = true;
+                        let _ = reply.send(snapshot);
                     }
-                    Some(ReplayRecord::Disconnect(rec)) => {
-                        advance_to(&mut room, rec.tick, |_| {});
-                        room.remove_bot_and_ship(&rec.bot_id);
-                    }
-                    Some(ReplayRecord::End(end)) => {
-                        // Run remaining ticks (if any) so the spectator sees the final
-                        // state at the same world.tick the live run reached.
-                        while room.world.tick < end.tick {
-                            room.step_tick();
-                        }
-                        info!(final_tick = end.tick, winner = ?end.winner, "replay finished");
-                        break;
-                    }
-                    Some(ReplayRecord::Header(_)) => {
-                        warn!("replay: stray header record mid-stream, ignored");
-                    }
-                    None => {
-                        info!("replay: log exhausted with no end record");
-                        break;
-                    }
+                    Some(RoomEvent::QueryReport { reply }) => room.handle_event(RoomEvent::QueryReport { reply }),
+                    Some(RoomEvent::QueryMonteCarloStatus { reply }) => room.handle_event(RoomEvent::QueryMonteCarloStatus { reply }),
+                    Some(_) => {}, // HTTP mutations and /bot are refused before enqueueing.
+                    None => break,
                 }
             }
         }
@@ -639,6 +765,7 @@ pub async fn run_replay(
 /// Determinism: this drives the exact `inject_replay_command` + `step_tick` path the
 /// determinism test covers, so the captured frames are bit-faithful to the live run.
 pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, ReplayError> {
+    validate_records(&records)?;
     let mut iter = records.into_iter();
     let header = match iter.next() {
         Some(ReplayRecord::Header(h)) => *h,
@@ -649,10 +776,8 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
         }
         None => return Err(ReplayError::Header("replay log is empty".into())),
     };
-    // Accept any version up to and including the current one. Old logs (v2/v3) lack the
-    // v4 spawn fields, which deserialize to defaults and trigger the ring-layout fallback
-    // on rebuild. Newer-than-current logs are still rejected — we can't know their shape.
-    if header.version > REPLAY_FORMAT_VERSION {
+    // Only the current simulation version can reproduce these frames faithfully.
+    if header.version != REPLAY_FORMAT_VERSION {
         return Err(ReplayError::Version(header.version));
     }
 
@@ -668,23 +793,24 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
     frames.push(room.spectator_world_snapshot());
 
     let mut end: Option<ReplayEnd> = None;
+    let mut capture_budget = MAX_REPLAY_BYTES as usize;
     for record in iter {
         match record {
             ReplayRecord::Tick(rec) => {
                 advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
-                    drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                    drain_spectator_frames(&mut spec_rx, &mut frames, &mut capture_budget)
+                })?;
             }
             ReplayRecord::Disconnect(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
-                    drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                    drain_spectator_frames(&mut spec_rx, &mut frames, &mut capture_budget)
+                })?;
                 room.remove_bot_and_ship(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
-                    drain_spectator_frames(&mut spec_rx, &mut frames);
-                });
+                    drain_spectator_frames(&mut spec_rx, &mut frames, &mut capture_budget)
+                })?;
                 end = Some(rec);
                 break;
             }
@@ -706,13 +832,23 @@ pub fn capture_replay(records: Vec<ReplayRecord>) -> Result<CapturedReplay, Repl
 fn drain_spectator_frames(
     rx: &mut broadcast::Receiver<SpectatorFrame>,
     frames: &mut Vec<SpectatorMsg>,
-) {
+    budget: &mut usize,
+) -> Result<(), ReplayError> {
     while let Ok(frame) = rx.try_recv() {
+        charge_capture(budget, frame.len())?;
         match serde_json::from_str::<SpectatorMsg>(frame.as_str()) {
             Ok(msg) => frames.push(msg),
             Err(e) => warn!(error = %e, "replay capture: failed to parse spectator frame"),
         }
     }
+    Ok(())
+}
+
+fn charge_capture(budget: &mut usize, bytes: usize) -> Result<(), ReplayError> {
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or_else(|| ReplayError::Header("captured replay exceeds 64 MiB".into()))?;
+    Ok(())
 }
 
 /// Re-run a replay capturing one bot's sensor-filtered view at every tick. `bot_id` must
@@ -721,6 +857,7 @@ pub fn capture_perspective(
     records: Vec<ReplayRecord>,
     bot_id: &str,
 ) -> Result<CapturedPerspective, ReplayError> {
+    validate_records(&records)?;
     let mut iter = records.into_iter();
     let header = match iter.next() {
         Some(ReplayRecord::Header(h)) => *h,
@@ -731,10 +868,8 @@ pub fn capture_perspective(
         }
         None => return Err(ReplayError::Header("replay log is empty".into())),
     };
-    // Accept any version up to and including the current one. Old logs (v2/v3) lack the
-    // v4 spawn fields, which deserialize to defaults and trigger the ring-layout fallback
-    // on rebuild. Newer-than-current logs are still rejected — we can't know their shape.
-    if header.version > REPLAY_FORMAT_VERSION {
+    // Only the current simulation version can reproduce these frames faithfully.
+    if header.version != REPLAY_FORMAT_VERSION {
         return Err(ReplayError::Version(header.version));
     }
     if !header.bots.iter().any(|b| b.bot_id == bot_id) {
@@ -746,25 +881,26 @@ pub fn capture_perspective(
     // Per-tick filtered views keyed by tick. The registration `welcome` / `game_start`
     // frames already queued on the channels are drained and discarded here.
     let mut views: BTreeMap<u64, PerspectiveFrame> = BTreeMap::new();
-    drain_perspective(&mut outbound, bot_id, &mut views);
+    let mut capture_budget = MAX_REPLAY_BYTES as usize;
+    drain_perspective(&mut outbound, bot_id, &mut views, &mut capture_budget)?;
 
     for record in iter {
         match record {
             ReplayRecord::Tick(rec) => {
                 advance_and_inject(&mut room, rec.tick, &rec.commands, |_| {
-                    drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                    drain_perspective(&mut outbound, bot_id, &mut views, &mut capture_budget)
+                })?;
             }
             ReplayRecord::Disconnect(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
-                    drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                    drain_perspective(&mut outbound, bot_id, &mut views, &mut capture_budget)
+                })?;
                 room.remove_bot_and_ship(&rec.bot_id);
             }
             ReplayRecord::End(rec) => {
                 advance_to(&mut room, rec.tick, |_| {
-                    drain_perspective(&mut outbound, bot_id, &mut views);
-                });
+                    drain_perspective(&mut outbound, bot_id, &mut views, &mut capture_budget)
+                })?;
                 break;
             }
             ReplayRecord::Header(_) => {
@@ -799,7 +935,8 @@ fn drain_perspective(
     outbound: &mut [BotOutbound],
     bot_id: &str,
     views: &mut BTreeMap<u64, PerspectiveFrame>,
-) {
+    budget: &mut usize,
+) -> Result<(), ReplayError> {
     for (id, rx) in outbound.iter_mut() {
         while let Ok(msg) = rx.try_recv() {
             if id != bot_id {
@@ -812,17 +949,20 @@ fn drain_perspective(
                 ..
             } = msg
             {
-                views.insert(
+                let frame = PerspectiveFrame {
                     tick,
-                    PerspectiveFrame {
-                        tick,
-                        contacts,
-                        events,
-                    },
-                );
+                    contacts,
+                    events,
+                };
+                let bytes = serde_json::to_vec(&frame)
+                    .map_err(|e| ReplayError::Header(e.to_string()))?
+                    .len();
+                charge_capture(budget, bytes)?;
+                views.insert(tick, frame);
             }
         }
     }
+    Ok(())
 }
 
 /// List every readable replay in `dir`, newest first. A missing directory yields an empty
@@ -960,6 +1100,22 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn capture_budget_stops_advancing_a_tick_gap_immediately() {
+        let mut room = rebuild_room_from_header(&sample_header()).unwrap();
+        let (tx, mut rx) = broadcast::channel(4);
+        room.set_spectator_broadcast(tx);
+        let mut frames = Vec::new();
+        let mut budget = 0;
+        let error = advance_to(&mut room, 100, |_| {
+            drain_spectator_frames(&mut rx, &mut frames, &mut budget)
+        })
+        .unwrap_err();
+        assert!(matches!(error, ReplayError::Header(_)));
+        assert_eq!(room.world.tick, 1);
+        assert!(frames.is_empty());
     }
 
     fn sample_tick() -> ReplayTick {

@@ -222,61 +222,7 @@ JSON is the right call for a hackathon: human-readable when debugging, every lan
 
 **Server → Bot**
 
-```jsonc
-// 1. Hello acknowledged + assignment
-{
-  "type": "welcome",
-  "bot_id": "b_3",
-  "ship_id": "s_3",
-  "map": { "width": 700, "height": 700 },
-  "tick_hz": 10,
-  "ship_specs": { /* see §5.2 */ }
-}
-
-// 2. Game start
-{ "type": "game_start", "tick": 0, "starting_position": [120.0, 340.0], "starting_heading_deg": 90.0 }
-
-// 3. Each tick: filtered sensor view
-{
-  "type": "tick",
-  "tick": 142,
-  "deadline_ms": 80,
-  "self": {
-    "pos": [203.4, 511.7],
-    "heading_deg": 92.3,
-    "speed": 4.1,
-    "hp": 78,
-    "ammo": 14,
-    "rudder": -0.3,
-    "throttle": 0.8
-  },
-  "contacts": [                 // only what this bot's sensors detect
-    {
-      "id": "c_a1",             // unstable per-tick contact ID, NOT the ship_id
-      "kind": "ship",           // "ship" | "shell" | "unknown"
-      "pos": [450.0, 510.0],    // possibly noisy
-      "bearing_deg": 88.0,      // always present
-      "range": 247.0,           // present if active radar
-      "confidence": 0.85
-    }
-  ],
-  "events": [                   // events since last tick that this bot can perceive
-    { "type": "hit", "amount": 12 },
-    { "type": "shell_splash", "pos": [220.0, 505.0] }
-  ]
-}
-
-// 4. Game end
-{
-  "type": "game_over",
-  "winner": "b_3",              // or null for draw
-  "final_tick": 1843,
-  "replay_id": "match_20260508_171203"
-}
-
-// 5. Errors (invalid command, late command, malformed JSON, etc.)
-{ "type": "error", "code": "late_command", "message": "command for tick 142 arrived after deadline" }
-```
+See [the current server-to-bot wire contract](docs/PROTOCOL.md#12-server--bot) for `welcome`, `game_start`, filtered ticks, and game results.
 
 **Late or missing commands**: the bot's previous throttle/rudder/sensor_mode persist; no shot is fired that tick. The bot is *not* disconnected for missing a tick — only for malformed messages or repeated protocol violations.
 
@@ -284,20 +230,7 @@ JSON is the right call for a hackathon: human-readable when debugging, every lan
 
 Spectators receive **full ground-truth state** every tick, plus all events. No commands accepted.
 
-```jsonc
-{
-  "type": "world",
-  "tick": 142,
-  "ships": [
-    { "id": "s_1", "bot_name": "captain_kirk", "pos": [203.4, 511.7], "heading_deg": 92.3, "hp": 78, "alive": true },
-    /* ... */
-  ],
-  "shells": [
-    { "id": "sh_22", "pos": [310.0, 500.0], "vel": [40.0, 5.0], "ttl_ticks": 18 }
-  ],
-  "events": [ /* hits, splashes, deaths */ ]
-}
-```
+See [the spectator wire contract](docs/PROTOCOL.md) for full ship, shell (`id_index`), and event fields.
 
 ---
 
@@ -356,7 +289,7 @@ One gun, ballistic shells.
 - **Shell speed**: 70 units/s, constant.
 - **Shell flight time** = `range / 70` seconds, capped at ~4.3 seconds (max range 300 units).
 - During flight, shells are visible to active radar.
-- On expiry: explode. Any ship within **15 units** of the splash takes damage based on proximity (linear falloff: 25 dmg at center, 0 at the edge).
+- On expiry: explode. Damage falls linearly from **25 HP at the hull surface** to zero **15 units beyond it**. The default hull hit radius is 8 units; see the current [damage contract](docs/PROTOCOL.md).
 - Gun cooldown enforced server-side; `fire` commands during cooldown are silently ignored (an `error` event is sent to the bot).
 - Friendly fire is on (you can hit yourself). This punishes sloppy bearing math and makes the game more honest.
 

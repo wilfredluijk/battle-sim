@@ -84,6 +84,8 @@ Acknowledges the `hello` and assigns identifiers and gameplay constants.
 ```json
 {
   "type": "welcome",
+  "protocol_version": "2.0",
+  "simulation_dt": 0.1,
   "bot_id": "b_3",
   "ship_id": "s_3",
   "map": { "width": 700, "height": 700 },
@@ -110,19 +112,34 @@ Acknowledges the `hello` and assigns identifiers and gameplay constants.
 }
 ```
 
-Field values shown above are the current defaults; the live `welcome` payload always reflects whatever the server is actually running. The runtime authority for these constants is `server/src/sim/constants.rs` — `ship_specs` is derived from there.
+Field values shown above are the current defaults; the live `welcome` payload always reflects whatever the server is actually running. The runtime authority is the current `SimConfig`; defaults live in `server/src/sim/constants.rs`. `simulation_dt` is the fixed physics step in seconds (0.1); `tick_hz` controls wall-clock pacing only.
 
 `available_powerups` is the catalog the server understands; pass any of these ids to `select_powerups`. See `docs/POWERUPS.md` for what each one does.
 
 #### `game_start`
-Sent when the operator transitions the room to `running`.
+Sent whenever a match starts, including Monte Carlo matches. `ship_specs` and `simulation_dt` describe this match and supersede the connection-time values. The Python SDK refreshes `bot.welcome` and calls `on_welcome` again if these values changed, before `on_game_start`.
 
 ```json
 {
   "type": "game_start",
   "tick": 0,
   "starting_position": [120.0, 340.0],
-  "starting_heading_deg": 90.0
+  "starting_heading_deg": 90.0,
+  "simulation_dt": 0.1,
+  "ship_specs": {
+    "max_forward_speed": 9.0,
+    "max_reverse_speed": 2.0,
+    "acceleration": 3.5,
+    "turn_rate_deg_per_s": 20.0,
+    "hull_hp": 100,
+    "max_ammo": 250,
+    "gun_cooldown_ticks": 15,
+    "hit_radius": 8.0,
+    "shell_speed": 70.0,
+    "max_shell_range": 300.0,
+    "splash_radius": 15.0,
+    "max_splash_damage": 25
+  }
 }
 ```
 
@@ -161,18 +178,20 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
   "events": [
     { "type": "hit", "amount": 12 },
     { "type": "shell_splash", "pos": [220.0, 505.0] },
-    { "type": "powerup_activated", "ship_id": "s_2", "powerup": "smoke_screen" }
+    { "type": "powerup_activated", "own": false, "contact_id": "c_0", "powerup": "smoke_screen" }
   ]
 }
 ```
 
 `contacts[].id` is a per-tick contact ID, **not** the underlying `ship_id`. Trackers must do their own data association across ticks.
 
-`contacts[].range` is omitted when not measured (passive mode).
+`contacts[].range` is omitted when not measured (passive mode). Active bearing and range are derived from the same noisy observed position as `pos`; they cannot reconstruct the true position. Decoys receive the same ordinary active-radar noise as ships.
 
 `contacts[].kind` is one of `"ship"`, `"shell"`, `"unknown"`.
 
-`events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range, plus `powerup_activated` events for the bot's own activations and any activation by a currently-visible ship.
+`events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range, plus `powerup_activated` events for the bot's own activations and any activation by a ship in this tick's actual sensor contacts. Own activations carry `own: true` and omit `contact_id`; other activations carry `own: false` and the matching per-tick `contact_id`. Bot events never expose persistent ship IDs. Spectator events retain `ship_id`.
+
+`active_ticks_left` reports future effect steps remaining after this tick. A duration of N includes the activation step and all N sensor sweeps; the final affected frame can therefore show zero remaining. Incoming EMP suppression does not mark the victim's own EMP as activated.
 
 `self.selected_powerups` and `self.powerup_status` are omitted (or sent as empty arrays) when the bot picked no powerups. `powerup_status[i].active_ticks_left` counts down each tick; check `used && active_ticks_left == 0` to know a pick is spent.
 
@@ -342,6 +361,9 @@ A wrong password returns `401` with code `invalid_credentials`.
 {
   "room": "main",
   "state": "lobby",
+  "map": { "width": 700, "height": 700 },
+  "tick_hz": 10,
+  "replay_mode": false,
   "tick": 0,
   "last_winner": null,
   "bots": [
@@ -356,7 +378,11 @@ A wrong password returns `401` with code `invalid_credentials`.
 | `state` | `"lobby"` \| `"running"` \| `"ended"` | Room state machine. `ended` is the post-game pause; the room returns to `lobby` automatically after ~2s. |
 | `tick` | u64 | Current `world.tick`. |
 | `last_winner` | string \| null | `bot_id` of the most recent winner, or `null` for a draw / abort / fresh match. |
-| `config` | object | The active `SimConfig` — a flat map of every balance tunable to its current value. |
+| `config` | object | The active `SimConfig`, including the nested `powerups` object. Preserve nested values when editing scalar fields. |
+
+| `map` | object | Actual arena `width` and `height`. |
+| `tick_hz` | integer | Wall-clock playback/tick rate. Physics always uses 0.1 seconds per step. |
+| `replay_mode` | boolean | CLI replay playback; mutations and bot connections return HTTP 409. |
 
 ### 2.5.4 `GET /api/config/schema`
 
@@ -373,7 +399,7 @@ Describes each tunable so a UI can render a form. `integer` fields must be sent 
 
 ### 2.5.5 `PUT /api/room/config`
 
-Body is a complete `SimConfig` object (every key from the schema). Parameters are frozen when the match starts and recorded in the replay header.
+Body is a complete `SimConfig` object, including nested `powerups` settings in addition to the scalar schema fields. Parameters are frozen when the match starts and recorded in the replay header.
 
 - `204` — applied.
 - `400` `invalid_parameter` — a value failed validation (non-finite, out of bounds).
@@ -429,10 +455,10 @@ mode (`403` `tournament_mode` otherwise), because replays expose ground-truth st
 | `GET /api/replays/{id}` | `200` | Re-run a replay; return the ground-truth timeline. |
 | `GET /api/replays/{id}/perspective/{bot_id}` | `200` | Re-run a replay from one bot's sensors. |
 
-`{id}` is a replay id (`match_<room>_<unix_secs>`); it is validated against
+`{id}` is an opaque replay id (ordinary matches include the room, nanosecond timestamp, process ID, and a counter); it is validated against
 `[A-Za-z0-9_-]` and rejected with `400` `invalid_replay_id` otherwise. A missing file
 returns `404` `replay_not_found`; a log older than the current replay format returns `422`
-`unsupported_replay_version`.
+`unsupported_replay_version`. Current replay format is **v6**; older simulation versions cannot reproduce the corrected mechanics. Invalid or oversized logs return `422 invalid_replay`. Readers cap logs at 64 MiB, 3000 ticks, 256 bots, and 3258 records, validate ordering and finite values, and reject timelines extending past a simulated match end. Tick rates must be 1–1000. Each captured timeline is also capped at 64 MiB of frame JSON and aborts immediately when it reaches the budget. At most two replay captures run concurrently; excess requests return `503 replay_busy`. Replay files are created exclusively, so a collision cannot overwrite an existing match.
 
 ### 2.6.1 `GET /api/replays`
 
@@ -460,9 +486,10 @@ every tick.
 
 ```json
 {
-  "header": { "version": 5, "replay_id": "...", "seed": 42, "map": { "...": "..." },
+  "header": { "version": 6, "replay_id": "...", "seed": 42, "map": { "...": "..." },
               "sim_config": { "...": "..." },
               "bots": [ { "bot_id": "b_1", "ship_id": "s_1", "name": "powerful",
+                          "selected_powerups": ["overdrive", "rapid_fire"],
                           "spawn_pos": [300.0, 500.0], "spawn_heading_deg": 90.0 } ] },
   "frames": [ /* one `world` payload (§2 `world`) per tick; frames[t] is the world at tick t */ ],
   "end": { "tick": 1071, "winner": "b_1" }
@@ -472,14 +499,15 @@ every tick.
 `frames` has `final_tick + 1` entries: index `0` is the starting layout, index `t` is the
 world after tick `t`. `end` is `null` for an incomplete log.
 
-**On-disk log format v5.** The JSONL log driving these endpoints carries `header`, `tick`,
+**On-disk log format v6.** The JSONL log driving these endpoints carries `header`, `tick`,
 `disconnect`, and `end` records. A `disconnect` record —
 `{ "type": "disconnect", "tick": T, "bot_id": "b_2" }` — is written whenever a bot
 disconnects or is kicked mid-match (while the room is `running`); `T` is the last tick the
 ship participated in. Re-simulation removes the ship at exactly that point so the shared RNG
 stream and the recorded outcome stay bit-identical (the ship simply vanishes from later
-`frames`). Logs written before v5 (`"version"` 2–4) carry no `disconnect` records and still
-load — a match where nobody dropped is indistinguishable from an older log.
+`frames`). Only version 6 is accepted: earlier versions use different simulation semantics.
+
+CLI `--replay` playback advances once per simulated tick at the recorded `tick_hz`, including gaps without commands. The room REST API remains available, the viewer stays on the battlefield, and playback freezes on the final frame until shutdown. CLI replay mode is read-only.
 
 ### 2.6.3 `GET /api/replays/{id}/perspective/{bot_id}`
 
@@ -541,11 +569,13 @@ connected, and every connected bot must be `ready`. Otherwise `409 Conflict` wit
 | Field | Meaning |
 |---|---|
 | `n_matches` | Number of matches to run. Capped at 10000. |
-| `mc_seed` | Root seed; the per-match seed is `splitmix64(mc_seed ^ match_index)`. |
+| `mc_seed` | Root seed; the per-match seed is `splitmix64_finalize(mc_seed ^ (match_index * 0x9E37_79B9_7F4A_7C15))`, with a zero-based index and wrapping u64 arithmetic; see `mix_match_seed` in `server/src/monte_carlo.rs`. |
 | `variance_mode` | One of `fixed`, `rotated`, `shuffled`, `random`. See below. |
-| `per_tick_timeout_ms` | Optional. Lockstep deadline (default 1000). |
+| `per_tick_timeout_ms` | Optional. Lockstep deadline (default 1000); this replaces the ordinary 80 ms command deadline and is advertised in each tick. |
 | `spectator_throttle` | Optional. Broadcast every Nth tick; `0` disables (default 5). |
 | `sim_config` | Optional. Replaces the active balance parameters at run start. |
+
+A soft stop (`force_abort: false`) finishes and records the current match before ending the batch. Completion, soft stop, forced stop, and abort restore the operator's original seed and balance configuration.
 
 Variance modes:
 
@@ -646,13 +676,26 @@ WebSocket messages are capped at 16 KiB. The `/spectate` endpoint can be restric
 
 ## 4. Versioning
 
-The server's release version is included in `welcome.version` (planned — currently absent in MVP). Additive changes (new optional fields, new event types) are backwards-compatible. Renamed or removed fields, type changes, and changed semantics are breaking and will bump the version sent in `welcome`.
+`welcome.protocol_version` identifies the wire contract (currently `"2.0"`). Additive optional fields are backwards-compatible. Renamed or removed fields, type changes, and changed semantics require a protocol version bump. Replay simulation compatibility is tracked separately by the header's integer `version`.
 
 ---
 
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-09-11 — protocol 2.0 and replay format 6
+
+- `welcome` publishes protocol version and fixed simulation dt; `game_start` refreshes match specs and dt.
+- Bot activation events use `own` and ephemeral `contact_id`, gated by actual sensor returns.
+- Radar polar values use the noisy position; decoys share radar noise and remain within arena bounds.
+- Sensor effects last all configured sweeps. EMP victims and their own activations have separate state.
+- Turning clamps at the effective maximum even while residual Overdrive speed decays. Headings stay in `[0, 360)`.
+- `hit_radius` is now functional: splash falloff starts at the hull surface. Damage is `max_damage * max(0, 1 - max(0, center_distance - hit_radius) / splash_radius)`, rounded as before. This changes balance; SDK gunners include hull radius in self-splash avoidance.
+- Earlier replay formats are rejected because these simulation changes alter outcomes. Version 6 recordings retain deterministic playback.
+- Replay reads and concurrency are bounded; IDs are unique and files never overwrite prior recordings.
+- CLI replay serves a read-only room and retains the final frame. Room state includes actual map dimensions and tick rate.
+- Lockstep commands use the batch deadline. Soft stop retains the current result; every exit restores the original seed/config.
 
 ## 2026-07-07 — replay records mid-match disconnects
 

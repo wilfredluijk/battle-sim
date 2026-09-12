@@ -6,7 +6,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fitCanvas } from '../lib/canvas';
   import { draw, drawPerspective } from '../lib/renderer';
-  import { MAX_HP } from '../lib/constants';
+  import { MAX_HP, ACTIVE_RADAR_RANGE } from '../lib/constants';
   import {
     replayData,
     replayPerspective,
@@ -39,12 +39,13 @@
     const mapW = data.header.map.width;
     const mapH = data.header.map.height;
     const maxHp = data.header.sim_config?.hull_hp ?? MAX_HP;
+    const radarRange = data.header.sim_config?.active_radar_range ?? ACTIVE_RADAR_RANGE;
     const frame = data.frames[Math.max(0, Math.min(tick, data.frames.length - 1))] ?? null;
 
-    if (perspective === 'overall' || !perspectiveData) {
+    if (perspective === 'overall') {
       // Replay frames are drawn directly (no splash interpolation, which assumes
       // monotonic time and would misbehave on a slider seek).
-      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp);
+      draw(ctx, frame, [], performance.now(), mapW, mapH, maxHp, radarRange);
       return;
     }
 
@@ -52,10 +53,10 @@
     const ownShip =
       bot && frame ? (frame.ships.find((s) => s.id === bot.ship_id) ?? null) : null;
     const pf =
-      perspectiveData.frames[
-        Math.max(0, Math.min(tick, perspectiveData.frames.length - 1))
+      perspectiveData?.frames[
+        Math.max(0, Math.min(tick, (perspectiveData?.frames.length ?? 1) - 1))
       ];
-    drawPerspective(ctx, ownShip, pf?.contacts ?? [], mapW, mapH, maxHp);
+    drawPerspective(ctx, ownShip, pf?.contacts ?? [], mapW, mapH, maxHp, radarRange);
   }
 
   onMount(() => {

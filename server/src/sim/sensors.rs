@@ -26,6 +26,8 @@ pub enum ContactKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Contact {
+    /// Internal association for event filtering. Never serialized to a bot.
+    pub ship_id: Option<ShipId>,
     pub kind: ContactKind,
     /// Reported position (with sensor noise applied where appropriate).
     pub pos: Vec2,
@@ -38,8 +40,7 @@ pub struct Contact {
 
 /// Active-radar sweep from the perspective of `viewer_id` standing at `viewer_pos`. Sees
 /// every other alive ship inside `ACTIVE_RADAR_RANGE`; reports position with seeded
-/// uniform ±`ACTIVE_RADAR_NOISE` noise, bearing from true relative position, range from
-/// true distance.
+/// uniform ±`ACTIVE_RADAR_NOISE` noise. Bearing and range derive from that same observation.
 ///
 /// Two RNG draws are made per detected ship (x noise, then y noise). Calling order is
 /// stable BotId-by-BotId because `World::ships` is a `BTreeMap`.
@@ -49,13 +50,23 @@ pub fn active_contacts(
     world: &World,
     rng: &mut Pcg64,
 ) -> Vec<Contact> {
-    let tick = world.tick;
+    active_contacts_at(viewer_id, viewer_pos, world, rng, world.tick)
+}
+
+/// Evaluate effect windows at the same simulation step as movement/combat.
+pub fn active_contacts_at(
+    viewer_id: &ShipId,
+    viewer_pos: Vec2,
+    world: &World,
+    rng: &mut Pcg64,
+    tick: u64,
+) -> Vec<Contact> {
     let powerup_cfg = world.config.powerups;
     let viewer_state = world.ships.get(viewer_id).map(|s| &s.powerups);
 
     // EMP forces the affected ship's active radar to return nothing this tick.
     if let Some(state) = viewer_state {
-        if state.is_active(PowerupId::EmpBurst, tick) {
+        if state.emp_debuff_until > tick {
             return Vec::new();
         }
     }
@@ -125,18 +136,20 @@ pub fn active_contacts(
         } else {
             0.0
         };
+        let observed_pos = ship.pos + Vec2::new(nx, ny);
+        let observed_to = observed_pos - viewer_pos;
         out.push(Contact {
+            ship_id: Some(id.clone()),
             kind: ContactKind::Ship,
-            pos: ship.pos + Vec2::new(nx, ny),
-            bearing_deg: compass_deg(to),
-            range: Some(dist),
+            pos: observed_pos,
+            bearing_deg: compass_deg(observed_to),
+            range: Some(observed_to.length()),
             confidence,
         });
     }
 
     // Decoys appear in the active radar of every viewer except the decoy's owner. They
-    // produce no noise (they're synthetic) and have full confidence — bots have to use
-    // judgement to tell them apart from real ships. Iteration is over `world.decoys` in
+    // use the same observation noise as real non-silent ships. Iteration is over `world.decoys` in
     // insertion order, so the output stays deterministic.
     for decoy in &world.decoys {
         if &decoy.owner == viewer_id {
@@ -150,11 +163,20 @@ pub fn active_contacts(
         if smoke_blocks(world, viewer_pos, decoy.pos, tick) {
             continue;
         }
+        let noise = if awacs_active { 0.0 } else { base_noise };
+        let offset = if noise > 0.0 {
+            Vec2::new(rng.gen_range(-noise..=noise), rng.gen_range(-noise..=noise))
+        } else {
+            Vec2::ZERO
+        };
+        let observed_pos = decoy.pos + offset;
+        let observed_to = observed_pos - viewer_pos;
         out.push(Contact {
+            ship_id: None,
             kind: ContactKind::Ship,
-            pos: decoy.pos,
-            bearing_deg: compass_deg(to),
-            range: Some(dist),
+            pos: observed_pos,
+            bearing_deg: compass_deg(observed_to),
+            range: Some(observed_to.length()),
             confidence: 1.0,
         });
     }
@@ -195,10 +217,27 @@ pub fn passive_contacts(
     active_pingers: &BTreeSet<ShipId>,
     rng: &mut Pcg64,
 ) -> Vec<Contact> {
+    passive_contacts_at(
+        viewer_id,
+        viewer_pos,
+        world,
+        active_pingers,
+        rng,
+        world.tick,
+    )
+}
+
+pub fn passive_contacts_at(
+    viewer_id: &ShipId,
+    viewer_pos: Vec2,
+    world: &World,
+    active_pingers: &BTreeSet<ShipId>,
+    rng: &mut Pcg64,
+    tick: u64,
+) -> Vec<Contact> {
     let nearby_range = world.config.passive_hear_nearby_range;
     let active_range = world.config.passive_hear_active_range;
     let bearing_noise = world.config.passive_bearing_noise_deg;
-    let tick = world.tick;
     let mut out = Vec::new();
     for (id, ship) in &world.ships {
         if id == viewer_id || !ship.alive {
@@ -222,6 +261,7 @@ pub fn passive_contacts(
         let placeholder = viewer_pos
             + Vec2::new(radians.sin(), -radians.cos()) * PASSIVE_CONTACT_PLACEHOLDER_DISTANCE;
         out.push(Contact {
+            ship_id: Some(id.clone()),
             kind: ContactKind::Ship,
             pos: placeholder,
             bearing_deg: bearing,
@@ -249,6 +289,7 @@ pub fn passive_contacts(
         let placeholder = viewer_pos
             + Vec2::new(radians.sin(), -radians.cos()) * PASSIVE_CONTACT_PLACEHOLDER_DISTANCE;
         out.push(Contact {
+            ship_id: None,
             kind: ContactKind::Ship,
             pos: placeholder,
             bearing_deg: bearing,
@@ -295,7 +336,10 @@ mod tests {
         assert_eq!(from1.len(), 1, "s_1 should see exactly one contact (s_2)");
         assert_eq!(from2.len(), 1, "s_2 should see exactly one contact (s_1)");
         let r = from1[0].range.expect("active range present");
-        assert!((r - 200.0).abs() < 1e-3, "range was {r}");
+        assert!(
+            (r - from1[0].pos.distance(Vec2::new(500.0, 500.0))).abs() < 1e-3,
+            "range was {r}"
+        );
         assert_eq!(from1[0].kind, ContactKind::Ship);
     }
 
@@ -370,6 +414,7 @@ mod tests {
     #[test]
     fn bearing_is_compass_from_viewer_to_target() {
         let mut world = World::new(1000.0, 1000.0, SimConfig::default());
+        world.config.active_radar_noise = 0.0; // Isolate bearing convention from noise.
         world.insert_ship(ship("s_1", 500.0, 500.0));
         // Place targets in each cardinal direction from the viewer.
         world.insert_ship(ship("s_e", 600.0, 500.0)); // east → 90°
@@ -621,7 +666,7 @@ mod tests {
     fn emp_burst_empties_active_radar_for_affected_ship() {
         let mut world = World::new(1000.0, 1000.0, SimConfig::default());
         let mut viewer = ship("s_1", 500.0, 500.0);
-        viewer.powerups.emp_expires_at = 100;
+        viewer.powerups.emp_debuff_until = 100;
         world.insert_ship(viewer);
         world.insert_ship(ship("s_2", 700.0, 500.0));
         let mut rng = Pcg64::seed_from_u64(7);
@@ -676,5 +721,34 @@ mod tests {
         let a = passive_contacts(&"s_1".into(), viewer, &world, &pingers, &mut rng_a);
         let b = passive_contacts(&"s_1".into(), viewer, &world, &pingers, &mut rng_b);
         assert_eq!(a, b);
+    }
+    #[test]
+    fn active_polar_fields_describe_the_noisy_observation_and_decoys_jitter() {
+        let mut world = World::new(700., 700., SimConfig::default());
+        world.insert_ship(ship("viewer", 100., 100.));
+        world.insert_ship(ship("target", 200., 200.));
+        world.decoys.push(crate::sim::Decoy {
+            fake_id: 0,
+            owner: "target".into(),
+            pos: Vec2::new(220., 220.),
+            heading_deg: 0.,
+            vel: Vec2::ZERO,
+            expires_at: 100,
+        });
+        let mut rng = Pcg64::seed_from_u64(42);
+        let viewer = Vec2::new(100., 100.);
+        let first = active_contacts(&"viewer".into(), viewer, &world, &mut rng);
+        let second = active_contacts(&"viewer".into(), viewer, &world, &mut rng);
+        assert_ne!(first[0].pos, Vec2::new(200., 200.));
+        assert_ne!(
+            first[1].pos, second[1].pos,
+            "decoys must have normal sensor jitter"
+        );
+        for c in first {
+            let bearing = c.bearing_deg.to_radians();
+            let reconstructed =
+                viewer + Vec2::new(bearing.sin(), -bearing.cos()) * c.range.unwrap();
+            assert!(reconstructed.distance(c.pos) < 0.001);
+        }
     }
 }

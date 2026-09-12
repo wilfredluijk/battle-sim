@@ -38,7 +38,7 @@ class Gunner:
         max_active_age_ticks: int = 5,
         require_recent_active: bool = True,
     ) -> None:
-        """``self_splash_margin`` is a multiple of the ship's splash radius.
+        """``self_splash_margin`` scales the splash radius beyond the hull surface.
 
         ``max_active_age_ticks`` is how recent the last *active* (range-fixed)
         observation must be for the gunner to trust the position estimate.
@@ -47,7 +47,7 @@ class Gunner:
         """
         self._specs = specs
         self._cooldown = int(specs.gun_cooldown_ticks)
-        self._self_splash = float(specs.splash_radius) * float(self_splash_margin)
+        self._self_splash = float(specs.hit_radius) + float(specs.splash_radius) * float(self_splash_margin)
         self._max_age = int(max_active_age_ticks)
         self._require_active = bool(require_recent_active)
         self._next_fire_tick = 0

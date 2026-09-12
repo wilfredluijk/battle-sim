@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use crate::admin::{AdminBotInfo, AdminServerMsg, AdminState};
+use crate::admin::{AdminBotInfo, AdminState};
 use crate::monte_carlo::{self, McConfig, McState, McStatus};
 use crate::protocol::{
     self, error_code, Contact as ProtocolContact, ContactKind as ProtocolContactKind, FireCommand,
@@ -53,7 +53,7 @@ const STARTING_RING_RADIUS: f32 = 400.0;
 
 /// Hard match timeout per §5.5. After this many ticks the room ends regardless of how
 /// many ships are alive; the highest-HP survivor (tie-break: highest remaining ammo) wins.
-const MATCH_TIMEOUT_TICKS: u64 = 3000;
+pub const MATCH_TIMEOUT_TICKS: u64 = 3000;
 
 /// Ticks the room stays in `Ended` before auto-returning to `Lobby` after a match. At the
 /// default `tick_hz = 10` this is ~2 seconds — long enough for the spectator UI to show
@@ -310,12 +310,6 @@ pub enum RoomEvent {
         bot_id: BotId,
         reply: oneshot::Sender<Result<(), KickError>>,
     },
-    /// Admin client subscribed to room-state pushes. The room replies with a fresh
-    /// `broadcast::Receiver` and immediately publishes the current snapshot so the new
-    /// receiver's first frame is the state.
-    AdminSubscribe {
-        reply: oneshot::Sender<broadcast::Receiver<AdminServerMsg>>,
-    },
     /// Admin REST request for a one-shot snapshot of the current room state. Used by
     /// `GET /api/room` — no subscription, just the current `AdminState`.
     QueryState {
@@ -357,6 +351,9 @@ pub enum RoomEvent {
 pub struct RoomSnapshot {
     pub state: AdminState,
     pub config: SimConfig,
+    pub map: MapInfo,
+    pub tick_hz: u32,
+    pub replay_mode: bool,
 }
 
 /// Per-bot statistics accumulated over a single match. Reset at `start_match`, frozen into
@@ -452,10 +449,6 @@ pub struct Room {
     /// admin clients via `AdminState.last_winner` so the UI can show the result during the
     /// post-game pause and on Lobby afterwards.
     last_winner: Option<BotId>,
-    /// Optional broadcast sender for admin state pushes. `None` in unit tests; the
-    /// runtime in `main.rs` wires a real channel. Receivers are added via
-    /// `RoomEvent::AdminSubscribe`.
-    admin_tx: Option<broadcast::Sender<AdminServerMsg>>,
     /// Per-bot statistics for the in-progress match, keyed by `BotId`. Reset to a fresh
     /// entry per bot at `start_match`; folded into `last_report` when the match ends.
     match_stats: BTreeMap<BotId, BotStats>,
@@ -470,6 +463,8 @@ pub struct Room {
     /// Status snapshot of the most recently finished Monte Carlo run, surfaced via
     /// `GET /api/montecarlo/status` after the run ends.
     mc_last_status: Option<McStatus>,
+    mc_original_config: Option<(u64, SimConfig)>,
+    mc_stop_after_current: bool,
 }
 
 impl Room {
@@ -502,19 +497,13 @@ impl Room {
             replay_id: None,
             end_tick: None,
             last_winner: None,
-            admin_tx: None,
             match_stats: BTreeMap::new(),
             last_report: None,
             mc_run: None,
             mc_last_status: None,
+            mc_original_config: None,
+            mc_stop_after_current: false,
         }
-    }
-
-    /// Wire an admin broadcast channel. `AdminSubscribe` events return clones of this
-    /// sender's receiver; lifecycle transitions publish through it. Call once at
-    /// construction time.
-    pub fn set_admin_broadcast(&mut self, tx: broadcast::Sender<AdminServerMsg>) {
-        self.admin_tx = Some(tx);
     }
 
     /// Wire a spectator broadcast channel. Subsequent `step_tick` calls will publish a
@@ -589,7 +578,6 @@ impl Room {
             if let Some(end_tick) = self.end_tick {
                 if self.world.tick.saturating_sub(end_tick) >= POST_GAME_LOBBY_TICKS {
                     self.transition_to_lobby();
-                    self.publish_admin_state();
                 }
             }
         }
@@ -718,7 +706,6 @@ impl Room {
                 self.mc_record_match_end(winner, duration_ticks, replay_id_for_match);
                 self.mc_advance_after_match();
             }
-            self.publish_admin_state();
             return;
         }
 
@@ -737,21 +724,33 @@ impl Room {
             };
 
             let sim_contacts = match sensor_mode {
-                SensorMode::Active => {
-                    sensors::active_contacts(&ship_id, viewer_pos, &self.world, &mut self.rng)
-                }
-                SensorMode::Passive => sensors::passive_contacts(
+                SensorMode::Active => sensors::active_contacts_at(
+                    &ship_id,
+                    viewer_pos,
+                    &self.world,
+                    &mut self.rng,
+                    self.world.tick.saturating_sub(1),
+                ),
+                SensorMode::Passive => sensors::passive_contacts_at(
                     &ship_id,
                     viewer_pos,
                     &self.world,
                     &self.previous_active_pingers,
                     &mut self.rng,
+                    self.world.tick.saturating_sub(1),
                 ),
             };
             // If this bot has a pending counter-battery trace, splice a synthetic precise
             // contact in *before* the natural ones so it's near the front of the list.
             // Done in-place rather than in `sensors::active_contacts` so the trace works
             // regardless of the bot's current sensor mode.
+            // Associate events with exactly the contacts from this sweep. The source
+            // ShipId is internal and discarded by translate_contact.
+            let visible_contacts: BTreeMap<ShipId, String> = sim_contacts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.ship_id.as_ref().map(|id| (id.clone(), format!("c_{i}"))))
+                .collect();
             let mut contacts: Vec<ProtocolContact> = sim_contacts
                 .into_iter()
                 .enumerate()
@@ -769,11 +768,12 @@ impl Room {
             // Activation events: always show your own; for others, only if the activating
             // ship would currently be a contact for the viewer.
             for (acting_ship_id, powerup) in &powerup_activations {
-                let visible = acting_ship_id == &ship_id
-                    || self.is_ship_visible_to(&ship_id, viewer_pos, sensor_mode, acting_ship_id);
-                if visible {
+                let own = acting_ship_id == &ship_id;
+                let contact_id = visible_contacts.get(acting_ship_id).cloned();
+                if own || contact_id.is_some() {
                     events.push(TickEvent::PowerupActivated {
-                        ship_id: acting_ship_id.clone(),
+                        own,
+                        contact_id,
                         powerup: *powerup,
                     });
                 }
@@ -794,7 +794,7 @@ impl Room {
                 .collect();
             let tick_msg = ServerMsg::Tick {
                 tick: world_tick,
-                deadline_ms: self.tick_deadline_ms,
+                deadline_ms: self.command_deadline_ms(),
                 self_state: SelfState {
                     pos: [ship.pos.x, ship.pos.y],
                     heading_deg: ship.heading_deg,
@@ -1184,6 +1184,7 @@ impl Room {
                 "mc_run still set on lobby transition; clearing defensively",
             );
         }
+        self.restore_after_monte_carlo();
         let center = Vec2::new(self.world.width * 0.5, self.world.height * 0.5);
         let config = self.world.config;
         self.world.tick = 0;
@@ -1263,19 +1264,20 @@ impl Room {
         }
     }
 
-    /// Publish the current room state to admin subscribers. No-op when no admin channel
-    /// is wired or no admin client is currently connected.
-    fn publish_admin_state(&self) {
-        let Some(tx) = self.admin_tx.as_ref() else {
-            return;
-        };
-        if tx.receiver_count() == 0 {
-            return;
+    /// Build a snapshot of room state suitable for the admin wire protocol.
+    pub fn snapshot(&self) -> RoomSnapshot {
+        RoomSnapshot {
+            state: self.admin_state_snapshot(),
+            config: self.world.config,
+            map: MapInfo {
+                width: self.world.width as u32,
+                height: self.world.height as u32,
+            },
+            tick_hz: self.tick_hz,
+            replay_mode: false,
         }
-        let _ = tx.send(AdminServerMsg::State(self.admin_state_snapshot()));
     }
 
-    /// Build a snapshot of room state suitable for the admin wire protocol.
     fn admin_state_snapshot(&self) -> AdminState {
         let state_str = match self.state {
             RoomState::Lobby => "lobby",
@@ -1375,7 +1377,7 @@ impl Room {
         viewer_pos: Vec2,
         contacts: &mut Vec<ProtocolContact>,
     ) {
-        let tick = self.world.tick;
+        let tick = self.world.tick.saturating_sub(1);
         let attacker_pos = {
             let ship = match self.world.ships.get(ship_id) {
                 Some(s) => s,
@@ -1425,80 +1427,6 @@ impl Room {
         // Non-consuming: the track is bounded by `trace_reveal_until` (checked above), so
         // there's no counter to decrement here. A missing attacker (e.g. disconnected) simply
         // produces no contact this tick while the track is live.
-    }
-
-    /// Coarse "would the viewer currently see this ship" check, used to gate
-    /// `PowerupActivated` events. Mirrors the sensor module's range rules without
-    /// re-running the RNG: any ship inside the relevant range counts as visible. Smoke
-    /// blocks for active; silent_running hides from passive.
-    fn is_ship_visible_to(
-        &self,
-        viewer_ship_id: &ShipId,
-        viewer_pos: Vec2,
-        sensor_mode: SensorMode,
-        target_ship_id: &ShipId,
-    ) -> bool {
-        let Some(target) = self.world.ships.get(target_ship_id) else {
-            return false;
-        };
-        if !target.alive {
-            return false;
-        }
-        let tick = self.world.tick;
-        let config = &self.world.config;
-        let dist = target.pos.distance(viewer_pos);
-        match sensor_mode {
-            SensorMode::Active => {
-                let viewer = self.world.ships.get(viewer_ship_id);
-                if let Some(v) = viewer {
-                    if v.powerups.is_active(PowerupId::EmpBurst, tick) {
-                        return false;
-                    }
-                }
-                let awacs = viewer
-                    .map(|v| v.powerups.is_active(PowerupId::AwacsScan, tick))
-                    .unwrap_or(false);
-                let base_range = config.active_radar_range;
-                let radar_range = if awacs {
-                    base_range * config.powerups.awacs_range_mult
-                } else {
-                    base_range
-                };
-                let effective_range =
-                    if target.powerups.is_active(PowerupId::SilentRunning, tick) && !awacs {
-                        radar_range * config.powerups.silent_running_active_range_mult
-                    } else {
-                        radar_range
-                    };
-                if dist > effective_range {
-                    return false;
-                }
-                // Smoke blocks active sight when target is in a cloud the viewer isn't in.
-                for cloud in &self.world.smoke_clouds {
-                    if cloud.expires_at <= tick {
-                        continue;
-                    }
-                    let target_in = target.pos.distance(cloud.pos) <= cloud.radius;
-                    if !target_in {
-                        continue;
-                    }
-                    let viewer_in = viewer_pos.distance(cloud.pos) <= cloud.radius;
-                    if !viewer_in {
-                        return false;
-                    }
-                }
-                true
-            }
-            SensorMode::Passive => {
-                if target.powerups.is_active(PowerupId::SilentRunning, tick) {
-                    return false;
-                }
-                let nearby = config.passive_hear_nearby_range;
-                let active_hear = config.passive_hear_active_range;
-                let pinging = self.previous_active_pingers.contains(target_ship_id);
-                dist <= nearby || (pinging && dist <= active_hear)
-            }
-        }
     }
 
     /// Translate an `ActivationError` into a typed protocol error frame.
@@ -1596,21 +1524,15 @@ impl Room {
             } => {
                 let result = self.register_bot(peer, name, &version);
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::BotReady { bot_id } => {
-                let mut changed = false;
                 if let Some(entry) = self.bots.get_mut(&bot_id) {
                     if !entry.ready {
                         entry.ready = true;
-                        changed = true;
                         info!(room = %self.name, bot = %bot_id, "bot ready");
                     }
                 } else {
                     warn!(room = %self.name, bot = %bot_id, "ready from unknown bot, ignored");
-                }
-                if changed {
-                    self.publish_admin_state();
                 }
             }
             RoomEvent::BotSelectPowerups { bot_id, powerups } => {
@@ -1622,7 +1544,6 @@ impl Room {
             RoomEvent::BotDisconnect { bot_id } => {
                 if self.bots.contains_key(&bot_id) {
                     self.handle_bot_disconnect(bot_id, "disconnected");
-                    self.publish_admin_state();
                 }
             }
             RoomEvent::OperatorStart { room, reply } => {
@@ -1631,7 +1552,6 @@ impl Room {
                     warn!(room = %self.name, requested = %room, reason = e.as_str(), "operator start refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::OperatorAbort { reply } => {
                 let result = if self.mc_run.is_some() {
@@ -1657,7 +1577,6 @@ impl Room {
                     warn!(room = %self.name, reason = e.as_str(), "operator abort refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::OperatorReset { reply } => {
                 let result = self.reset_to_lobby();
@@ -1665,7 +1584,6 @@ impl Room {
                     warn!(room = %self.name, reason = e.as_str(), "operator reset refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::OperatorKick { bot_id, reply } => {
                 let result = if self.bots.contains_key(&bot_id) {
@@ -1678,26 +1596,9 @@ impl Room {
                     warn!(room = %self.name, bot = %bot_id, reason = e.as_str(), "operator kick refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
-            }
-            RoomEvent::AdminSubscribe { reply } => {
-                if let Some(tx) = self.admin_tx.as_ref() {
-                    let rx = tx.subscribe();
-                    // Push the current snapshot through the broadcast so the new
-                    // receiver's first frame is the room state. The send may report no
-                    // active receivers (the reply hasn't been delivered yet), but the
-                    // tokio broadcast queues the message internally so the next `recv`
-                    // on `rx` will still pick it up.
-                    let _ = tx.send(AdminServerMsg::State(self.admin_state_snapshot()));
-                    let _ = reply.send(rx);
-                }
-                // No-op when no admin channel is wired (unit tests).
             }
             RoomEvent::QueryState { reply } => {
-                let _ = reply.send(RoomSnapshot {
-                    state: self.admin_state_snapshot(),
-                    config: self.world.config,
-                });
+                let _ = reply.send(self.snapshot());
             }
             RoomEvent::QueryReport { reply } => {
                 let _ = reply.send(self.last_report.clone());
@@ -1708,7 +1609,6 @@ impl Room {
                     warn!(room = %self.name, reason = e.as_str(), "operator configure refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::StartMonteCarlo { config, reply } => {
                 let result = self.start_monte_carlo(config);
@@ -1716,7 +1616,6 @@ impl Room {
                     warn!(room = %self.name, reason = e.as_str(), "monte carlo start refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::StopMonteCarlo { force_abort, reply } => {
                 let result = self.stop_monte_carlo(force_abort);
@@ -1724,7 +1623,6 @@ impl Room {
                     warn!(room = %self.name, reason = e.as_str(), "monte carlo stop refused");
                 }
                 let _ = reply.send(result);
-                self.publish_admin_state();
             }
             RoomEvent::QueryMonteCarloStatus { reply } => {
                 let _ = reply.send(self.mc_status_snapshot());
@@ -1789,7 +1687,6 @@ impl Room {
             picks = ?entry.selected_powerups,
             "bot loadout selected",
         );
-        self.publish_admin_state();
     }
 
     /// Queue a command for the next tick or reject it as `late_command` per §1.3 of the
@@ -1800,7 +1697,11 @@ impl Room {
         let now = Instant::now();
         let state = self.state;
         let deadline_ms = self.tick_deadline_ms;
-        let send_time = self.tick_send_time;
+        let send_time = if self.in_lockstep() {
+            None
+        } else {
+            self.tick_send_time
+        };
         let world_tick = self.world.tick;
 
         let Some(entry) = self.bots.get_mut(&bot_id) else {
@@ -1939,6 +1840,8 @@ impl Room {
 
             let entry = self.bots.get(bot_id).expect("snapshot still in map");
             let game_start = ServerMsg::GameStart {
+                ship_specs: ShipSpecs::from_config(&config),
+                simulation_dt: crate::sim::constants::DT,
                 tick: 0,
                 starting_position: [pos.x, pos.y],
                 starting_heading_deg: heading_deg,
@@ -1962,7 +1865,7 @@ impl Room {
         self.previous_active_pingers.clear();
         self.starting_bot_count = self.bots.len() as u32;
         // Fresh match — the previous winner is no longer "the current winner". Admin
-        // clients see this through the next `AdminServerMsg::State` push.
+        // clients see this through the next REST room snapshot.
         self.last_winner = None;
         self.end_tick = None;
         // Fresh statistics: one zeroed entry per starting bot. The previous match's report
@@ -2025,6 +1928,7 @@ impl Room {
     /// Build and write the JSONL header from the current room/world state. No-op when no
     /// writer is open.
     fn write_replay_header(&mut self) {
+        let command_deadline_ms = self.command_deadline_ms();
         let Some(writer) = self.replay_writer.as_mut() else {
             return;
         };
@@ -2034,7 +1938,7 @@ impl Room {
             room: self.name.clone(),
             seed: self.seed,
             tick_hz: self.tick_hz,
-            tick_deadline_ms: self.tick_deadline_ms,
+            tick_deadline_ms: command_deadline_ms,
             map: MapInfo {
                 width: self.world.width as u32,
                 height: self.world.height as u32,
@@ -2142,9 +2046,12 @@ impl Room {
             ));
         }
 
+        // Restore these on every batch exit, including failed starts.
+        self.mc_original_config = Some((self.seed, self.world.config));
+        self.mc_stop_after_current = false;
         // Apply the optional SimConfig override once at the start of the run.
         if let Some(cfg) = config.sim_config {
-            cfg.validate().map_err(McStartError::Invalid)?;
+            // Already validated before saving or mutating the operator configuration.
             self.world.config = cfg;
         }
 
@@ -2159,6 +2066,7 @@ impl Room {
         // subsequent attempt isn't blocked by `AlreadyRunning`.
         if let Err(e) = self.mc_begin_next_match() {
             self.mc_run = None;
+            self.restore_after_monte_carlo();
             return Err(McStartError::Invalid(e));
         }
         Ok(run_id)
@@ -2171,15 +2079,24 @@ impl Room {
         if self.mc_run.is_none() {
             return Err(McStopError::NotRunning);
         }
-        if force_abort && self.state == RoomState::Running {
-            // Aborting the match drops to Ended, which step_tick won't auto-advance once
-            // we drop the run state below — so finalize immediately.
+        if !force_abort {
+            self.mc_stop_after_current = true;
+            return Ok(());
+        }
+        if self.state == RoomState::Running {
             let _ = self.abort_match();
         }
-        let mc = self.mc_run.take().expect("checked above");
-        self.mc_last_status = Some(self.build_mc_status(&mc, false, Some("stopped")));
-        info!(room = %self.name, run_id = %mc.run_id, "monte carlo run stopped");
+        self.mc_finalize(false, Some("stopped"));
         Ok(())
+    }
+
+    fn restore_after_monte_carlo(&mut self) {
+        if let Some((seed, config)) = self.mc_original_config.take() {
+            self.seed = seed;
+            self.world.config = config;
+            self.rng = Pcg64::seed_from_u64(seed);
+        }
+        self.mc_stop_after_current = false;
     }
 
     /// Called from `step_tick` after a match's `game_over` has been broadcast. Records
@@ -2203,6 +2120,10 @@ impl Room {
     /// Called from `step_tick` after `mc_record_match_end`. Either chains to the next
     /// match in the batch or finalizes the run.
     fn mc_advance_after_match(&mut self) {
+        if self.mc_stop_after_current {
+            self.mc_finalize(false, Some("stopped"));
+            return;
+        }
         let has_more = self
             .mc_run
             .as_ref()
@@ -2285,6 +2206,7 @@ impl Room {
         // Once finalized the run is no longer running — `running: false` regardless of
         // whether it completed or was stopped.
         self.mc_last_status = Some(self.build_mc_status(&mc, false, reason));
+        self.restore_after_monte_carlo();
     }
 
     /// Abort the current MC run because of a fatal condition (e.g. bot disconnect during
@@ -2297,6 +2219,7 @@ impl Room {
             if self.state == RoomState::Running {
                 let _ = self.abort_match();
             }
+            self.restore_after_monte_carlo();
         }
     }
 
@@ -2349,8 +2272,16 @@ impl Room {
         !self.bots.is_empty() && self.bots.values().all(|b| b.pending_command.is_some())
     }
 
-    /// Per-tick timeout configured by the active MC run, or a generous default outside
-    /// MC mode. Used by `run_room` to bound how long it waits for the slowest bot.
+    /// Advertise the same command budget that the tick loop enforces.
+    fn command_deadline_ms(&self) -> u64 {
+        if self.in_lockstep() {
+            self.lockstep_timeout().as_millis() as u64
+        } else {
+            self.tick_deadline_ms
+        }
+    }
+
+    /// Per-tick batch timeout, or a generous default outside MC mode.
     pub fn lockstep_timeout(&self) -> Duration {
         self.mc_run
             .as_ref()
@@ -2453,6 +2384,8 @@ impl Room {
         let (out_tx, out_rx) = mpsc::channel::<ServerMsg>(BOT_OUTBOUND_BUFFER);
 
         let welcome = ServerMsg::Welcome {
+            protocol_version: "2.0".into(),
+            simulation_dt: crate::sim::constants::DT,
             bot_id: bot_id.clone(),
             ship_id: ship_id.clone(),
             map: MapInfo {
@@ -2513,6 +2446,9 @@ fn record_command_tick(history: &mut VecDeque<u64>, world_tick: u64, window: u64
         } else {
             break;
         }
+    }
+    if history.len() >= 4096 {
+        history.pop_front();
     }
     history.push_back(world_tick);
 }
@@ -2617,7 +2553,7 @@ fn unix_secs() -> u64 {
 
 /// Build a short, filesystem-safe identifier for a Monte Carlo run.
 fn make_mc_run_id(unix_secs_now: u64) -> String {
-    format!("{:016x}", unix_secs_now)
+    format!("{unix_secs_now:016x}_{}", replay::unique_suffix())
 }
 
 /// Drive a room's tick loop until the shutdown channel fires. Consumes `RoomEvent`s
@@ -2661,7 +2597,7 @@ pub async fn run_room(
                 lockstep_deadline = Some(tokio::time::Instant::now() + room.lockstep_timeout());
             }
             // If all bots have already sent commands, step immediately — no need to wait.
-            if room.all_pending_commands_ready() {
+            if room.world.tick == 0 || room.all_pending_commands_ready() {
                 room.step_tick();
                 lockstep_deadline = None;
                 continue;
@@ -2683,12 +2619,6 @@ pub async fn run_room(
                 info!(room = %name, final_tick = room.world.tick, "room: shutdown");
                 break;
             }
-            Some(event) = event_rx.recv() => {
-                room.handle_event(event);
-                // Most events touch room state in a way that may end the current
-                // lockstep window (e.g. a kick reduces the roster). Re-check on the
-                // next loop iteration; no need to short-circuit here.
-            }
             _ = deadline_future, if lockstep && lockstep_deadline.is_some() => {
                 // Per-tick timeout fired: step anyway with whatever commands we have.
                 // Bots that didn't respond keep their previous throttle/rudder.
@@ -2704,6 +2634,13 @@ pub async fn run_room(
                 room.step_tick();
                 debug!(room = %name, tick = room.world.tick, state = ?room.state, "tick");
             }
+            Some(event) = event_rx.recv() => {
+                room.handle_event(event);
+                // Most events touch room state in a way that may end the current
+                // lockstep window (e.g. a kick reduces the roster). Re-check on the
+                // next loop iteration; no need to short-circuit here.
+            }
+
         }
     }
     room.world.tick
@@ -2960,6 +2897,7 @@ mod tests {
                     tick,
                     starting_position,
                     starting_heading_deg,
+                    ..
                 } => {
                     assert_eq!(tick, 0);
                     let ship = room.world.ships.get(ship_id).unwrap();
@@ -4208,41 +4146,15 @@ mod tests {
     }
 
     #[test]
-    fn admin_subscribe_pushes_initial_snapshot() {
+    fn rest_snapshot_reflects_lifecycle_changes() {
         let mut room = test_room();
-        let (tx, _rx) = broadcast::channel::<AdminServerMsg>(8);
-        room.set_admin_broadcast(tx.clone());
-        let _r = connect(&mut room, "a").expect("a");
-
-        // Subscribe; the reply receiver will contain the snapshot.
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        room.handle_event(RoomEvent::AdminSubscribe { reply: reply_tx });
-        let mut admin_rx = reply_rx.try_recv().expect("subscribe reply");
-        let first = admin_rx.try_recv().expect("initial snapshot frame");
-        match first {
-            AdminServerMsg::State(state) => {
-                assert_eq!(state.room, "test");
-                assert_eq!(state.state, "lobby");
-                assert_eq!(state.bots.len(), 1);
-                assert_eq!(state.bots[0].name, "a");
-            }
-            other => panic!("expected State, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lifecycle_events_publish_admin_state() {
-        let mut room = test_room();
-        let (tx, mut rx) = broadcast::channel::<AdminServerMsg>(16);
-        room.set_admin_broadcast(tx);
-        // Drain any initial frames so the next push corresponds to BotConnect.
-        while rx.try_recv().is_ok() {}
-
-        let _r = connect(&mut room, "alice").expect("a");
-        let snap = rx.try_recv().expect("BotConnect pushes state");
-        match snap {
-            AdminServerMsg::State(state) => assert_eq!(state.bots.len(), 1),
-            other => panic!("expected State, got {other:?}"),
-        }
+        let bot = connect(&mut room, "alice").expect("connect");
+        let state = room.snapshot().state;
+        assert_eq!(state.room, "test");
+        assert_eq!(state.state, "lobby");
+        assert_eq!(state.bots.len(), 1);
+        assert_eq!(state.bots[0].name, "alice");
+        kick(&mut room, &bot.bot_id).expect("kick");
+        assert!(room.snapshot().state.bots.is_empty());
     }
 }

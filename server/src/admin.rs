@@ -26,14 +26,6 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AdminServerMsg {
-    State(AdminState),
-    Ack { command: String },
-    Error { code: String, message: String },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AdminState {
     pub room: String,
     pub state: String,
@@ -73,8 +65,8 @@ mod tests {
     }
 
     #[test]
-    fn admin_server_msg_roundtrips() {
-        let state = AdminServerMsg::State(AdminState {
+    fn admin_state_roundtrips() {
+        let state = AdminState {
             room: "main".into(),
             state: "lobby".into(),
             tick: 0,
@@ -86,9 +78,9 @@ mod tests {
                 ready: true,
                 alive: true,
             }],
-        });
+        };
         let json = serde_json::to_string(&state).unwrap();
-        let parsed: AdminServerMsg = serde_json::from_str(&json).unwrap();
+        let parsed: AdminState = serde_json::from_str(&json).unwrap();
         assert_eq!(state, parsed);
     }
 }

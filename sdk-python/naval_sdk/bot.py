@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 try:
@@ -20,7 +22,7 @@ except ImportError as exc:  # pragma: no cover - import-time error
         "naval_sdk requires the `websockets` package. Install with `pip install websockets`."
     ) from exc
 
-from .protocol import Command, GameOver, Welcome, WorldView
+from .protocol import Command, GameOver, ShipSpecs, Welcome, WorldView
 
 log = logging.getLogger("naval_sdk")
 
@@ -40,7 +42,7 @@ class Bot:
 
     # ---- Callbacks subclasses override ----
     def on_welcome(self, welcome: Welcome) -> None:
-        """Fires once, right after the server's `welcome` frame is parsed.
+        """Fires after `welcome`, and again before `game_start` if specifications changed.
 
         Use it to stash gameplay constants (`welcome.ship_specs.shell_speed`,
         `max_shell_range`, etc.) on `self` so `on_tick` can read them cheaply.
@@ -48,7 +50,7 @@ class Bot:
         """
 
     def choose_powerups(self, welcome: Welcome) -> List[str]:
-        """Pick up to two distinct powerups for the match.
+        """Pick exactly two distinct powerups, or return [] to play vanilla.
 
         Override to return a list like ``["overdrive", "rapid_fire"]``. The SDK sends
         `select_powerups` to the server before `ready`. Default returns an empty list,
@@ -131,7 +133,10 @@ class Bot:
                 log.warning("ignoring unexpected binary frame from server")
                 continue
             try:
-                return json.loads(frame)
+                message = json.loads(frame)
+                if isinstance(message, dict):
+                    return message
+                log.warning("ignoring non-object JSON frame")
             except json.JSONDecodeError:
                 log.warning("ignoring non-JSON frame: %r", frame[:200])
 
@@ -149,7 +154,7 @@ async def run_async(
     host: str = "localhost",
     port: int = 7878,
     name: str = "bot",
-    version: str = "naval-sdk/0.1.0",
+    version: str = "naval-sdk/0.3.0",
     path: str = "/bot",
 ) -> Optional[GameOver]:
     """Connect `bot` to a running server and pump messages until `game_over`.
@@ -172,6 +177,8 @@ async def run_async(
             """
             if bot.welcome is not None:
                 picks = _safe_callback_returning(bot.choose_powerups, bot.welcome)
+                if picks and len(picks) != 2:
+                    log.warning("choose_powerups must return exactly two distinct picks, or []")
                 if picks:
                     await ws.send(
                         json.dumps(
@@ -183,11 +190,11 @@ async def run_async(
                     )
             await ws.send(json.dumps({"type": "ready"}))
 
+        result: Optional[GameOver] = None
         try:
             await ws.send(json.dumps({"type": "hello", "name": name, "version": version}))
 
             ready_sent = False
-            result: Optional[GameOver] = None
 
             while True:
                 try:
@@ -206,11 +213,14 @@ async def run_async(
                     log.warning("ignoring non-JSON frame: %r", frame[:200])
                     continue
 
+                if not isinstance(msg, dict):
+                    log.warning("ignoring non-object JSON frame: %r", msg)
+                    continue
                 msg_type = msg.get("type")
                 if msg_type == "welcome":
                     try:
                         welcome = Welcome.from_dict(msg)
-                    except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
                         log.warning("malformed welcome: %s (frame=%r)", exc, msg)
                         continue
                     bot.welcome = welcome
@@ -229,9 +239,21 @@ async def run_async(
                         # run loop.
                         start_pos = (float(pos[0]), float(pos[1]))
                         heading = float(msg["starting_heading_deg"])
-                    except (KeyError, IndexError, TypeError, ValueError) as exc:
+                        updated_welcome = bot.welcome
+                        if bot.welcome is not None and "ship_specs" in msg:
+                            dt = float(msg.get("simulation_dt", bot.welcome.simulation_dt))
+                            if not math.isfinite(dt) or dt <= 0:
+                                raise ValueError("simulation_dt must be finite and positive")
+                            updated_welcome = replace(bot.welcome,
+                                ship_specs=ShipSpecs.from_dict(msg["ship_specs"]),
+                                simulation_dt=dt)
+                    except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
                         log.warning("malformed game_start: %s (frame=%r)", exc, msg)
                         continue
+                    if updated_welcome != bot.welcome:
+                        bot.welcome = updated_welcome
+                        _safe_callback(bot.on_welcome, updated_welcome)
+                    bot.last_tick = gs_tick
                     _safe_callback(
                         bot.on_game_start,
                         gs_tick,
@@ -242,7 +264,7 @@ async def run_async(
                 elif msg_type == "tick":
                     try:
                         view = WorldView.from_dict(msg)
-                    except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
                         log.warning("malformed tick: %s (frame=%r)", exc, msg)
                         continue
                     bot.last_tick = view.tick
@@ -258,9 +280,9 @@ async def run_async(
                 elif msg_type == "game_over":
                     try:
                         result = GameOver.from_dict(msg)
-                    except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
                         log.warning("malformed game_over: %s (frame=%r)", exc, msg)
-                        break
+                        continue
                     keep_running = _safe_callback_returning(bot.on_game_over, result)
                     if keep_running is False:
                         # Bot opted out — close the connection cleanly.
@@ -297,6 +319,9 @@ async def run_async(
                     log.debug("ignoring unknown message type %r", msg_type)
 
             return result
+        except ConnectionClosed:
+            log.info("server closed connection during send")
+            return result
         finally:
             bot._ws = None
 
@@ -307,7 +332,7 @@ def run(
     host: str = "localhost",
     port: int = 7878,
     name: str = "bot",
-    version: str = "naval-sdk/0.1.0",
+    version: str = "naval-sdk/0.3.0",
     path: str = "/bot",
 ) -> Optional[GameOver]:
     """Synchronous wrapper around `run_async` for the common `if __name__ == "__main__"` path."""

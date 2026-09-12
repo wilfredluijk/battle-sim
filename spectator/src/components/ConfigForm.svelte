@@ -1,6 +1,7 @@
 <!-- Pre-match parameter form. Renders one number input per tunable, grouped by category.
      Admins can edit and PUT the values; everyone else sees them read-only. -->
 <script lang="ts">
+  import { mergeConfig } from '../lib/config';
   import { room, configSchema, adminToken, applyConfig } from '../stores/admin';
   import type { ConfigField, SimConfig } from '../types/protocol';
 
@@ -16,7 +17,10 @@
 
   function valuesFrom(cfg: SimConfig, schema: ConfigField[]): Record<string, number> {
     const v: Record<string, number> = {};
-    for (const f of schema) v[f.key] = cfg[f.key] ?? f.default;
+    for (const f of schema) {
+      const value = cfg[f.key];
+      v[f.key] = typeof value === 'number' ? value : f.default;
+    }
     return v;
   }
 
@@ -62,7 +66,7 @@
 
     // Build the payload, coercing integer fields and rejecting non-numeric entries
     // before they hit the server.
-    const payload: SimConfig = {};
+    const payload = mergeConfig($room?.config ?? {}, {});
     for (const f of $configSchema) {
       const raw = values[f.key];
       if (typeof raw !== 'number' || !Number.isFinite(raw)) {

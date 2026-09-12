@@ -36,7 +36,7 @@ pub enum BotMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activate_powerup: Option<PowerupId>,
     },
-    /// Declare the (up to 2 distinct) powerups the bot will use for this match. May only
+    /// Declare the (exactly 2 distinct) powerups the bot will use for this match. May only
     /// be sent while the room is in `lobby` and before `ready`. Sending it twice replaces
     /// the previous selection; an invalid loadout earns a typed `error` frame and leaves
     /// the previous selection (if any) intact.
@@ -66,6 +66,8 @@ pub enum SensorMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
     Welcome {
+        protocol_version: String,
+        simulation_dt: f32,
         bot_id: String,
         ship_id: String,
         map: MapInfo,
@@ -77,6 +79,8 @@ pub enum ServerMsg {
         available_powerups: Vec<PowerupId>,
     },
     GameStart {
+        ship_specs: ShipSpecs,
+        simulation_dt: f32,
         tick: u64,
         starting_position: Pos,
         starting_heading_deg: f32,
@@ -160,7 +164,7 @@ pub struct SelfState {
     pub ammo: u32,
     pub rudder: f32,
     pub throttle: f32,
-    /// Loadout the bot picked for the match (in pick order, up to 2 entries). Sent on
+    /// Loadout the bot picked for the match (in pick order, empty or exactly 2 entries). Sent on
     /// every tick so a bot reconnecting after a brief drop can rehydrate without state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_powerups: Vec<PowerupId>,
@@ -212,7 +216,10 @@ pub enum TickEvent {
     /// the same filtering as ship contacts). Counter-battery trace reveals come in via
     /// regular `contacts`, not this event.
     PowerupActivated {
-        ship_id: String,
+        /// True for the viewer's own activation; contact_id is absent in that case.
+        own: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contact_id: Option<String>,
         powerup: PowerupId,
     },
 }
@@ -323,7 +330,6 @@ pub mod error_code {
     pub const STALE_COMMAND: &str = "stale_command";
     pub const NON_FINITE_VALUE: &str = "non_finite_value";
     pub const HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
-    pub const CONNECTION_LIMIT: &str = "connection_limit";
     // --- Powerups ----------------------------------------------------------
     pub const POWERUP_UNKNOWN: &str = "powerup_unknown";
     pub const POWERUP_DUPLICATE: &str = "powerup_duplicate";
@@ -414,6 +420,8 @@ mod tests {
     #[test]
     fn server_msg_roundtrips() {
         roundtrip(&ServerMsg::Welcome {
+            protocol_version: "2.0".into(),
+            simulation_dt: crate::sim::constants::DT,
             bot_id: "b_3".into(),
             ship_id: "s_3".into(),
             map: MapInfo {
@@ -425,6 +433,8 @@ mod tests {
             available_powerups: PowerupId::all().to_vec(),
         });
         roundtrip(&ServerMsg::GameStart {
+            ship_specs: ShipSpecs::from_config(&crate::sim::SimConfig::default()),
+            simulation_dt: crate::sim::constants::DT,
             tick: 0,
             starting_position: [120.0, 340.0],
             starting_heading_deg: 90.0,

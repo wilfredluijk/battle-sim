@@ -119,6 +119,8 @@ struct AppState {
     hello_timeout: Duration,
     /// Directory replay JSONL logs are written to; the replay viewer reads them back.
     replay_dir: Arc<Path>,
+    replay_mode: bool,
+    replay_captures: Arc<tokio::sync::Semaphore>,
 }
 
 /// Bind the listener and serve the HTTP/WebSocket app until `shutdown_tx` fires.
@@ -156,6 +158,8 @@ pub async fn run(
         tournament: config.tournament,
         hello_timeout: Duration::from_secs(config.handshake_timeout_secs.max(1)),
         replay_dir: Arc::from(config.replay_dir.clone()),
+        replay_mode: config.replay.is_some(),
+        replay_captures: Arc::new(tokio::sync::Semaphore::new(2)),
     };
 
     let app = router(state);
@@ -262,6 +266,13 @@ impl IntoResponse for ApiError {
 
 /// Reject the request unless it carries a valid `Authorization: Bearer <jwt>` header.
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.replay_mode {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "replay_mode",
+            "replay playback is read-only",
+        ));
+    }
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -344,6 +355,9 @@ struct RoomResponse {
     #[serde(flatten)]
     state: AdminState,
     config: SimConfig,
+    map: protocol::MapInfo,
+    tick_hz: u32,
+    replay_mode: bool,
 }
 
 /// Public: current room state plus the active balance parameters. Drives both the
@@ -353,6 +367,9 @@ async fn get_room(State(state): State<AppState>) -> Result<Json<RoomResponse>, A
     Ok(Json(RoomResponse {
         state: snap.state,
         config: snap.config,
+        map: snap.map,
+        tick_hz: snap.tick_hz,
+        replay_mode: snap.replay_mode,
     }))
 }
 
@@ -591,6 +608,13 @@ fn map_replay_error(e: replay::ReplayError) -> ApiError {
         ReplayError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
             ApiError::new(StatusCode::NOT_FOUND, "replay_not_found", "no such replay")
         }
+        ReplayError::Io(io_err) if io_err.kind() == std::io::ErrorKind::InvalidData => {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_replay",
+                io_err.to_string(),
+            )
+        }
         ReplayError::Io(io_err) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "replay_io_error",
@@ -646,7 +670,19 @@ async fn get_replay(
 ) -> Result<Json<replay::CapturedReplay>, ApiError> {
     require_replay_access(&state, peer)?;
     let path = resolve_replay_path(&state, &id)?;
+    let permit = state
+        .replay_captures
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay_busy",
+                "two replay captures are already running",
+            )
+        })?;
     let captured = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let records = replay::read_records(&path)?;
         replay::capture_replay(records)
     })
@@ -670,7 +706,19 @@ async fn get_replay_perspective(
 ) -> Result<Json<replay::CapturedPerspective>, ApiError> {
     require_replay_access(&state, peer)?;
     let path = resolve_replay_path(&state, &id)?;
+    let permit = state
+        .replay_captures
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay_busy",
+                "two replay captures are already running",
+            )
+        })?;
     let captured = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let records = replay::read_records(&path)?;
         replay::capture_perspective(records, &bot_id)
     })
@@ -695,6 +743,9 @@ async fn bot_ws(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> Response {
+    if state.replay_mode {
+        return (StatusCode::CONFLICT, "bots cannot join replay playback").into_response();
+    }
     let guard = match IpConnGuard::try_acquire(&state.ip_conns, peer.ip(), state.per_ip_cap) {
         Some(g) => g,
         None => {

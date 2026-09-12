@@ -130,9 +130,11 @@ pub struct PowerupState {
     pub trace_reveal_until: u64,
     /// Ship that last hit this one during the armed window. Drives the reveal track.
     pub trace_attacker: Option<ShipId>,
-    /// EMP slow window. While `world.tick < emp_expires_at`, the ship's gun cooldown is
+    /// Incoming EMP window. While `world.tick < emp_debuff_until`, the ship's gun cooldown is
     /// multiplied by `emp_gun_cooldown_mult` (stacks with rapid_fire) and active radar
     /// returns no contacts (passive sensors still work).
+    pub emp_debuff_until: u64,
+    /// Window caused by this ship's own EMP activation; never applies a self-debuff.
     pub emp_expires_at: u64,
 }
 
@@ -154,6 +156,7 @@ impl PowerupState {
         self.trace_reveal_until = 0;
         self.trace_attacker = None;
         self.emp_expires_at = 0;
+        self.emp_debuff_until = 0;
     }
 
     /// Whether `id` is currently active for this ship at `tick`.
@@ -290,8 +293,8 @@ pub fn activate(
             let emp_expires = tick + config.emp_burst_duration_ticks as u64;
             for target in &targets {
                 if let Some(target_ship) = world.ships.get_mut(target) {
-                    if target_ship.powerups.emp_expires_at < emp_expires {
-                        target_ship.powerups.emp_expires_at = emp_expires;
+                    if target_ship.powerups.emp_debuff_until < emp_expires {
+                        target_ship.powerups.emp_debuff_until = emp_expires;
                     }
                 }
             }
@@ -312,7 +315,8 @@ pub fn activate(
             let dir = Vec2::new(r.sin(), -r.cos());
             let dist =
                 rng.gen_range(config.decoy_flare_distance_min..=config.decoy_flare_distance_max);
-            let pos = activator_pos + dir * dist;
+            let pos = (activator_pos + dir * dist)
+                .clamp(Vec2::ZERO, Vec2::new(world.width, world.height));
             let vel = dir * activator_speed;
             let fake_id = world.next_decoy_index;
             world.next_decoy_index = world.next_decoy_index.wrapping_add(1);
@@ -372,7 +376,10 @@ pub fn activate(
             ship.powerups.trace_attacker = None;
         }
         // AoE effects already mutated the world above; mark used and exit.
-        PowerupId::EmpBurst | PowerupId::SmokeScreen | PowerupId::DecoyFlare => {}
+        PowerupId::EmpBurst => {
+            ship.powerups.emp_expires_at = tick + config.emp_burst_duration_ticks as u64;
+        }
+        PowerupId::SmokeScreen | PowerupId::DecoyFlare => {}
     }
     ship.powerups.used.insert(id);
     Ok(())
@@ -395,7 +402,8 @@ pub fn step_tick_maintenance(world: &mut World) {
     }
     // Decoys cruise at their inherited velocity (fixed dt; no wall clock).
     for decoy in world.decoys.iter_mut() {
-        decoy.pos += decoy.vel * DT;
+        decoy.pos =
+            (decoy.pos + decoy.vel * DT).clamp(Vec2::ZERO, Vec2::new(world.width, world.height));
     }
     world.smoke_clouds.retain(|c| c.expires_at > tick);
     world.decoys.retain(|d| d.expires_at > tick);
@@ -459,7 +467,7 @@ pub fn effective_gun_cooldown_ticks(
     if state.is_active(PowerupId::RapidFire, tick) {
         effective *= config.rapid_fire_cooldown_mult;
     }
-    if state.is_active(PowerupId::EmpBurst, tick) {
+    if state.emp_debuff_until > tick {
         effective *= config.emp_gun_cooldown_mult;
     }
     let rounded = effective.round() as i64;
@@ -635,10 +643,13 @@ mod tests {
         )
         .expect("activate");
         let dur = world.config.powerups.emp_burst_duration_ticks as u64;
-        assert_eq!(world.ships.get("s_2").unwrap().powerups.emp_expires_at, dur);
-        assert_eq!(world.ships.get("s_3").unwrap().powerups.emp_expires_at, 0);
+        assert_eq!(
+            world.ships.get("s_2").unwrap().powerups.emp_debuff_until,
+            dur
+        );
+        assert_eq!(world.ships.get("s_3").unwrap().powerups.emp_debuff_until, 0);
         // Activator does not EMP itself.
-        assert_eq!(world.ships.get("s_1").unwrap().powerups.emp_expires_at, 0);
+        assert_eq!(world.ships.get("s_1").unwrap().powerups.emp_debuff_until, 0);
     }
 
     #[test]
@@ -726,7 +737,7 @@ mod tests {
             selected: vec![PowerupId::RapidFire, PowerupId::EmpBurst],
             // Activate both effects "by hand" to test the cooldown helper in isolation.
             rapid_fire_expires_at: 100,
-            emp_expires_at: 100,
+            emp_debuff_until: 100,
             ..Default::default()
         };
         let base = 15;
@@ -826,5 +837,27 @@ mod tests {
         // Without the effect, raw damage passes through.
         state.reinforced_hull_expires_at = 0;
         assert_eq!(apply_incoming_damage_reduction(25, &state, &cfg, 5), 25);
+    }
+    #[test]
+    fn decoy_spawn_and_drift_stay_inside_arena() {
+        let mut ship = ship_with_loadout("s_1", &[PowerupId::DecoyFlare]);
+        ship.pos = Vec2::new(1., 1.);
+        ship.heading_deg = 270.;
+        ship.speed = 9.;
+        let mut world = world_with(vec![ship]);
+        activate(
+            &mut world,
+            &"s_1".into(),
+            PowerupId::DecoyFlare,
+            &mut test_rng(),
+        )
+        .unwrap();
+        for tick in 0..10 {
+            world.tick = tick;
+            step_tick_maintenance(&mut world);
+            let pos = world.decoys[0].pos;
+            assert!((0.0..=world.width).contains(&pos.x));
+            assert!((0.0..=world.height).contains(&pos.y));
+        }
     }
 }

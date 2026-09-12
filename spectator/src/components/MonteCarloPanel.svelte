@@ -6,6 +6,7 @@
      - Completed — final results table with Wilson 95% CIs, replay download links.
 -->
 <script lang="ts">
+  import { monteCarloPhase } from '../lib/mcPhase';
   import { appMode } from '../stores';
   import {
     adminToken,
@@ -31,16 +32,12 @@
   let varianceMode = $state<VarianceMode>('shuffled');
   let perTickTimeoutMs = $state(1000);
   let spectatorThrottle = $state(5);
+  let showSetup = $state(false);
   let starting = $state(false);
   let stopping = $state(false);
 
   // Derived: which state the panel is in.
-  const phase = $derived.by<'setup' | 'running' | 'completed'>(() => {
-    const status = $mcStatus;
-    if (status?.running) return 'running';
-    if (status && status.completed > 0) return 'completed';
-    return 'setup';
-  });
+  const phase = $derived(monteCarloPhase($mcStatus, showSetup));
 
   async function handleStart(): Promise<void> {
     if (starting) return;
@@ -54,6 +51,7 @@
         spectator_throttle: Math.max(0, Math.floor(spectatorThrottle)),
       };
       await startRun(cfg);
+      showSetup = false;
     } catch {
       /* error surfaced in mcError */
     } finally {
@@ -456,7 +454,7 @@
           <button
             class="pm-start"
             type="button"
-            onclick={() => appMode.set('monte-carlo')}>
+            onclick={() => { showSetup = true; }}>
             New run
           </button>
         </div>

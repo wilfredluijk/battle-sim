@@ -87,8 +87,29 @@ export interface AdminBotInfo {
   alive: boolean;
 }
 
-/** Balance parameters — a flat map of `SimConfig` keys to numbers. */
-export type SimConfig = Record<string, number>;
+/** Match tuning, including the nested powerup configuration. */
+export interface SimConfig {
+  [key: string]: number | Record<string, number> | undefined;
+  max_forward_speed?: number;
+  max_reverse_speed?: number;
+  acceleration?: number;
+  turn_rate_deg_per_s?: number;
+  hull_hp?: number;
+  max_ammo?: number;
+  gun_cooldown_ticks?: number;
+  hit_radius?: number;
+  shell_speed?: number;
+  max_shell_range?: number;
+  splash_radius?: number;
+  max_splash_damage?: number;
+  active_radar_range?: number;
+  active_radar_noise?: number;
+  passive_hear_active_range?: number;
+  passive_hear_nearby_range?: number;
+  passive_bearing_noise_deg?: number;
+  wall_bump_damage?: number;
+  powerups?: Record<string, number>;
+}
 
 /** Response shape of `GET /api/room`: room lifecycle state plus the active parameters. */
 export interface RoomInfo {
@@ -98,6 +119,9 @@ export interface RoomInfo {
   last_winner?: string | null;
   bots: AdminBotInfo[];
   config: SimConfig;
+  map?: { width: number; height: number };
+  tick_hz?: number;
+  replay_mode?: boolean;
 }
 
 /** One tunable's metadata from `GET /api/config/schema`. */
@@ -157,13 +181,17 @@ export interface Contact {
 /** A bot-facing combat event — the filtered form, distinct from the spectator `TickEvent`. */
 export type BotTickEvent =
   | { type: 'hit'; amount: number }
-  | { type: 'shell_splash'; pos: [number, number] };
+  | { type: 'shell_splash'; pos: [number, number] }
+  | { type: 'powerup_activated'; own: boolean; contact_id?: string; powerup: string };
 
 /** One bot in a replay header. */
 export interface ReplayBotInfo {
   bot_id: string;
   ship_id: string;
   name: string;
+  selected_powerups?: string[];
+  spawn_pos: [number, number];
+  spawn_heading_deg: number;
 }
 
 /** The replay log header, echoed by `GET /api/replays/{id}`. */
@@ -261,4 +289,25 @@ export interface McStatus {
   draws: number;
   results: McMatchResult[];
   ended_reason: string | null;
+}
+
+/** Server-to-bot configuration metadata, protocol 2.0. */
+export interface BotWelcome {
+  type: 'welcome';
+  protocol_version: string;
+  simulation_dt: number;
+  bot_id: string;
+  ship_id: string;
+  map: { width: number; height: number };
+  tick_hz: number;
+  ship_specs: Record<string, number>;
+  available_powerups: string[];
+}
+export interface BotGameStart {
+  type: 'game_start';
+  tick: number;
+  starting_position: [number, number];
+  starting_heading_deg: number;
+  ship_specs: Record<string, number>;
+  simulation_dt: number;
 }

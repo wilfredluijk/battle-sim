@@ -32,6 +32,7 @@
     if ($appMode === 'replay-browser') return 'replay-browser';
     if ($appMode === 'replay-viewer') return 'replay-viewer';
     if ($appMode === 'monte-carlo') return 'monte-carlo';
+    if ($room?.replay_mode) return 'battle';
     if ($room?.state === 'running') return 'battle';
     if ($showReport && $report) return 'report';
     return 'prematch';

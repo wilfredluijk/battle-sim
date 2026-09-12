@@ -61,7 +61,7 @@ pub fn step_ship(ship: &mut Ship, config: &SimConfig, width: f32, height: f32, t
     // 2. Heading: turn rate scales linearly with |speed| / max_forward. We use the
     //    (possibly boosted) max_forward so the linear-with-speed curve still tops out at
     //    `turn_rate_max` when the ship is at its (boosted) top speed.
-    let turn_rate = turn_rate_max * ship.rudder * (ship.speed.abs() / max_forward);
+    let turn_rate = turn_rate_max * ship.rudder * (ship.speed.abs() / max_forward).min(1.0);
     ship.heading_deg = wrap_deg(ship.heading_deg + turn_rate * DT);
 
     // 3. Position: advance along heading vector.
@@ -98,9 +98,9 @@ fn heading_to_unit_vec(heading_deg: f32) -> Vec2 {
 
 fn wrap_deg(d: f32) -> f32 {
     let m = d.rem_euclid(360.0);
-    // rem_euclid on f32 can return very small negative values from rounding; pin to [0, 360).
-    if m < 0.0 {
-        m + 360.0
+    // Tiny negative inputs can round up to exactly 360; pin to [0, 360).
+    if m >= 360.0 {
+        0.0
     } else {
         m
     }
@@ -250,5 +250,22 @@ mod tests {
 
         let alive = world.ships.get("s_alive").unwrap();
         assert!(alive.pos.x > 500.0, "alive ship should have moved east");
+    }
+    #[test]
+    fn headings_remain_below_360_even_for_tiny_negative_angles() {
+        for angle in [-1e-7, -720., -360., -0.1, 0., 360., 720.] {
+            assert!((0.0..360.0).contains(&wrap_deg(angle)));
+        }
+    }
+
+    #[test]
+    fn residual_boost_speed_cannot_exceed_the_turn_rate_cap() {
+        let mut ship = ship_at(Vec2::new(500., 500.), 0.);
+        let config = SimConfig::default();
+        ship.speed = config.max_forward_speed * 2.;
+        ship.throttle = 1.;
+        ship.rudder = 1.;
+        step_ship(&mut ship, &config, 1000., 1000., 0);
+        assert!((ship.heading_deg - config.turn_rate_deg_per_s * DT).abs() < 1e-5);
     }
 }

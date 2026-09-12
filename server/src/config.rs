@@ -8,8 +8,8 @@ pub struct Config {
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
 
-    /// Simulation tick rate in Hz
-    #[arg(long, default_value_t = 10)]
+    /// Wall-clock tick rate in Hz (physics always advances 0.1 seconds per step)
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
     pub tick_hz: u32,
 
     /// Per-tick deadline for collecting bot commands, in milliseconds
@@ -21,7 +21,7 @@ pub struct Config {
     pub map: (u32, u32),
 
     /// Maximum number of bots per room
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub max_bots: u32,
 
     /// RNG seed used to drive the deterministic simulation
@@ -33,7 +33,7 @@ pub struct Config {
     pub replay_dir: PathBuf,
 
     /// Replay an existing JSONL log instead of accepting bot connections. Spectators may
-    /// still connect; the room ticks at `--tick-hz` and broadcasts as if it were live.
+    /// still connect; playback uses the recorded tick rate and freezes on the final frame.
     #[arg(long, value_name = "FILE")]
     pub replay: Option<PathBuf>,
 

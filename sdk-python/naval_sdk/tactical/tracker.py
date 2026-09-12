@@ -62,6 +62,7 @@ class Tracker:
         specs: ShipSpecs,
         tick_hz: int = 10,
         *,
+        simulation_dt: float = 0.1,
         active_gate: float = 60.0,
         passive_bearing_gate_deg: float = 20.0,
         velocity_alpha: float = 0.3,
@@ -69,7 +70,10 @@ class Tracker:
         staleness_ticks: int = 40,
     ) -> None:
         self._specs = specs
-        self._dt = 1.0 / float(tick_hz)
+        # tick_hz controls server pacing; velocities use fixed simulation seconds.
+        self._dt = float(simulation_dt)
+        if not math.isfinite(self._dt) or self._dt <= 0:
+            raise ValueError("simulation_dt must be finite and positive")
         self._active_gate = float(active_gate)
         self._passive_bearing_gate_deg = float(passive_bearing_gate_deg)
         self._alpha = float(velocity_alpha)

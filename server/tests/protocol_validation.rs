@@ -26,8 +26,9 @@ async fn start_server() -> (u16, broadcast::Sender<()>) {
 
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
     // No room is wired up — these tests only exercise pre-handshake validation, which
-    // never reaches the room. A leaked sender keeps the channel open.
-    let (room_tx, _room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
+    // never reaches the room. Drain the receiver to keep the mailbox available.
+    let (room_tx, mut room_rx) = mpsc::channel(ROOM_EVENT_BUFFER);
+    tokio::spawn(async move { while room_rx.recv().await.is_some() {} });
     let (spec_tx, _spec_rx) = broadcast::channel::<SpectatorFrame>(8);
     tokio::spawn(net::run(
         config,
@@ -81,37 +82,40 @@ async fn five_violations_disconnects_with_close() {
         .await
         .expect("ws connect");
 
-    for i in 0..10 {
-        if ws
-            .send(Message::Text(format!(r#"{{"bad":{i}}}"#)))
+    for i in 0..5 {
+        ws.send(Message::Text(format!(r#"{{"bad":{i}}}"#)))
             .await
-            .is_err()
-        {
-            break;
-        }
+            .expect("send violation");
     }
-
-    let mut got_close = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        let res = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
-        match res {
-            Ok(Some(Ok(Message::Close(_)))) => {
-                got_close = true;
+    let mut got_limit_error = false;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("close deadline")
+            .expect("stream ended without close")
+            .expect("transport error instead of policy close");
+        match frame {
+            Message::Text(text) => {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["code"] == "too_many_violations" {
+                    got_limit_error = true;
+                }
+            }
+            Message::Close(Some(close)) => {
+                assert_eq!(
+                    close.code,
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+                );
+                assert!(
+                    got_limit_error,
+                    "missing too_many_violations error before close"
+                );
                 break;
             }
-            Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(_))) | Ok(None) => {
-                got_close = true;
-                break;
-            }
-            Err(_) => continue, // per-iter timeout, keep waiting
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("unexpected frame {other:?}"),
         }
     }
-    assert!(
-        got_close,
-        "expected server to close the connection after repeated violations"
-    );
 
     let _ = shutdown.send(());
 }

@@ -62,6 +62,7 @@ class Track:
     last_seen_tick: int
     last_ranged_tick: int
     hits: int = 0  # approximate; updated whenever we splash close to it
+    observed_pos: Optional[Vec2] = None
 
     def age(self, tick: int) -> int:
         return tick - self.last_seen_tick
@@ -99,6 +100,7 @@ class PowerfulBot(Bot):
         self._shell_speed = 70.0
         self._max_shell_range = 300.0
         self._splash_radius = 15.0
+        self._hit_radius = 8.0
         self._gun_cooldown = 15
         self._max_ammo = 250
         self._map_w = 700
@@ -110,6 +112,7 @@ class PowerfulBot(Bot):
         self._shell_speed = specs.shell_speed
         self._max_shell_range = specs.max_shell_range
         self._splash_radius = specs.splash_radius
+        self._hit_radius = specs.hit_radius
         self._gun_cooldown = specs.gun_cooldown_ticks
         self._max_ammo = specs.max_ammo
         self._map_w = welcome.map.width
@@ -268,6 +271,7 @@ class PowerfulBot(Bot):
                 last_seen_tick=tr.last_seen_tick,
                 last_ranged_tick=tr.last_ranged_tick,
                 hits=tr.hits,
+                observed_pos=tr.observed_pos,
             )
 
         # 2. Sort contacts deterministically; ranged first so we attach the
@@ -298,14 +302,17 @@ class PowerfulBot(Bot):
                 vel=(0.0, 0.0),
                 last_seen_tick=tick,
                 last_ranged_tick=tick,
+                observed_pos=contact.pos,
             )
             return
 
         prev = self.state.tracks[tid]
         dt_ticks = max(1, tick - prev.last_ranged_tick)
         dt = dt_ticks * 0.1
-        vx = (contact.pos[0] - prev.pos[0]) / dt
-        vy = (contact.pos[1] - prev.pos[1]) / dt
+        # Measure against the last observation, never the dead-reckoned position.
+        old_pos = prev.observed_pos if prev.observed_pos is not None else prev.pos
+        vx = (contact.pos[0] - old_pos[0]) / dt
+        vy = (contact.pos[1] - old_pos[1]) / dt
         # Filter velocity to dampen noise (~2-unit position jitter at 10Hz
         # would otherwise inject 20 units/s of velocity noise per axis).
         smoothed = (0.6 * vx + 0.4 * prev.vel[0], 0.6 * vy + 0.4 * prev.vel[1])
@@ -315,6 +322,7 @@ class PowerfulBot(Bot):
             last_seen_tick=tick,
             last_ranged_tick=tick,
             hits=prev.hits,
+            observed_pos=contact.pos,
         )
 
     def _fold_passive_contact(self, contact: Contact, my_pos: Vec2, tick: int) -> None:
@@ -338,6 +346,7 @@ class PowerfulBot(Bot):
             last_seen_tick=tick,
             last_ranged_tick=tr.last_ranged_tick,
             hits=tr.hits,
+            observed_pos=tr.observed_pos,
         )
 
     def _associate_ranged(self, pos: Vec2) -> Optional[int]:
@@ -389,7 +398,7 @@ class PowerfulBot(Bot):
             if predicted is not None:
                 aim = predicted
 
-        if distance(my_pos, aim) < self._splash_radius * self.SPLASH_SAFETY_MARGIN:
+        if distance(my_pos, aim) < self._hit_radius + self._splash_radius * self.SPLASH_SAFETY_MARGIN:
             log.debug("skipping shot: aim too close, would splash myself")
             return False
 

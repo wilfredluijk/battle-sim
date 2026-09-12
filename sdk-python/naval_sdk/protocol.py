@@ -7,6 +7,7 @@ ignore them and read raw frames via `Bot.raw_recv()` / `Bot.raw_send()`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
@@ -69,9 +70,14 @@ class Welcome:
     #: Powerup ids the server understands. Forward-compatible: unknown future entries
     #: are simply passed back to the server if a bot picks them — the server validates.
     available_powerups: List[str] = field(default_factory=list)
+    simulation_dt: float = 0.1
+    protocol_version: str = "1.0"
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Welcome":
+        simulation_dt = float(d.get("simulation_dt", 0.1))
+        if not math.isfinite(simulation_dt) or simulation_dt <= 0:
+            raise ValueError("simulation_dt must be finite and positive")
         return cls(
             bot_id=str(d["bot_id"]),
             ship_id=str(d["ship_id"]),
@@ -79,6 +85,8 @@ class Welcome:
             tick_hz=int(d["tick_hz"]),
             ship_specs=ShipSpecs.from_dict(d["ship_specs"]),
             available_powerups=[str(p) for p in d.get("available_powerups", [])],
+            simulation_dt=simulation_dt,
+            protocol_version=str(d.get("protocol_version", "1.0")),
         )
 
 
@@ -104,14 +112,21 @@ class GameStart:
     tick: int
     starting_position: Tuple[float, float]
     starting_heading_deg: float
+    ship_specs: Optional[ShipSpecs] = None
+    simulation_dt: float = 0.1
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "GameStart":
         pos = d["starting_position"]
+        dt = float(d.get("simulation_dt", 0.1))
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("simulation_dt must be finite and positive")
         return cls(
             tick=int(d["tick"]),
             starting_position=(float(pos[0]), float(pos[1])),
             starting_heading_deg=float(d["starting_heading_deg"]),
+            ship_specs=ShipSpecs.from_dict(d["ship_specs"]) if "ship_specs" in d else None,
+            simulation_dt=dt,
         )
 
 
@@ -207,7 +222,8 @@ class PowerupActivatedEvent:
     activations; emitted for other bots only when the activating ship is currently a
     sensor contact."""
 
-    ship_id: str
+    own: bool
+    contact_id: Optional[str]
     powerup: str
 
 
@@ -224,7 +240,8 @@ def _parse_event(d: Dict[str, Any]) -> TickEvent:
             return ShellSplashEvent(pos=(float(pos[0]), float(pos[1])))
         if kind == "powerup_activated":
             return PowerupActivatedEvent(
-                ship_id=str(d["ship_id"]),
+                own=bool(d["own"]),
+                contact_id=None if d.get("contact_id") is None else str(d["contact_id"]),
                 powerup=str(d["powerup"]),
             )
     except (AttributeError, KeyError, IndexError, TypeError, ValueError):

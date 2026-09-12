@@ -69,9 +69,11 @@ The Python SDK exposes this as `view.me.powerup_ready("...")` and
 `view.me.powerup_active("...")`. The `examples/loadout_bot.py` reference bot
 demonstrates the full workflow.
 
+Activation events identify your own powerups with `own: true`; visible opponents use the current tick's `contact_id` with `own: false`. No persistent opponent ship ID is exposed.
+
 ## The catalog
 
-All durations are in *ticks* (default tick rate is 10 Hz, so `50 ticks = 5 s`).
+All durations are in *ticks*. Physics always advances 0.1 seconds per tick, so 50 ticks represent 5 simulation seconds; wall-clock duration depends on `tick_hz` or lockstep pacing. A duration of N covers the activation step and N sensor sweeps. `active_ticks_left` counts future steps after the current frame, so the last affected frame reports zero.
 
 ### Movement & Defense
 
@@ -185,6 +187,7 @@ keeps the attacker lit, not just the first shot. The synthetic contact carries a
 #### `emp_burst`
 Instantaneous AoE centered on you. All *enemy* ships within 130 u get their gun
 cooldown × 2 and their active radar disabled (returns empty contacts) for the window.
+Incoming suppression is separate from your own EMP activation status: being hit cannot mark your unused EMP active.
 Wider but shorter than before — 100 u was only a third of weapon range, too conditional.
 
 - Radius: **130 units** · Duration: **40 ticks** · Cooldown × **2.0**
@@ -197,7 +200,7 @@ Spawns a phantom contact ahead of you (along your current heading) at a seeded-j
 distance of **80–140 u**. The phantom **inherits your heading and speed at spawn and
 cruises** — a motionless contact with no velocity history is trivially filtered by a
 tracker-grade bot, so the decoy moves. It shows up in everyone else's active radar and
-passive sensors as if it were a real ship; you do not see your own decoy.
+passive sensors as if it were a real ship; you do not see your own decoy. Spawn and drift are clamped to arena bounds. Active returns have the same ordinary noise as real ships, and bearing/range match the observed noisy position.
 
 - Spawn distance ahead: **80–140 units** (seeded jitter) · cruises at your spawn velocity · Duration: **60 ticks**
 - Synergy: `silent_running` (the real ship hides while the fake draws fire), `overdrive`.

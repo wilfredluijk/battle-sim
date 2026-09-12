@@ -24,6 +24,11 @@ from .protocol import (
     SelfState,
     ShipSpecs,
     WorldView,
+    Welcome,
+    GameStart,
+    MapInfo,
+    PowerupStatus,
+    PowerupActivatedEvent,
 )
 from .bot import Bot, run, run_async
 
@@ -36,6 +41,11 @@ __all__ = [
     "SelfState",
     "ShipSpecs",
     "WorldView",
+    "Welcome",
+    "GameStart",
+    "MapInfo",
+    "PowerupStatus",
+    "PowerupActivatedEvent",
     "bearing_to",
     "distance",
     "lead_target",

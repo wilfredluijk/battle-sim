@@ -69,15 +69,15 @@ async fn main() {
 
     let room_handle = if let Some(path) = replay_path.as_ref() {
         // Replay mode: drive a Room from a recorded JSONL log instead of accepting bot
-        // connections. The room_rx is dropped immediately so any /bot connections that
-        // sneak through fail-fast on registration.
+        // connections. Keep the read-only control plane available for the spectator.
         info!(path = %path.display(), "starting in replay mode");
-        drop(room_rx);
         let path = path.clone();
         let spec_tx = spec_tx.clone();
         let shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(e) = replay::run_replay(path, spec_tx, shutdown_rx).await {
+            if let Err(e) =
+                replay::run_replay_with_events(path, spec_tx, shutdown_rx, Some(room_rx)).await
+            {
                 tracing::error!(error = %e, "replay failed");
             }
             0u64

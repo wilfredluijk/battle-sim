@@ -25,6 +25,8 @@ export const replayError = writable<string | null>(null);
 // Perspective re-runs are cached so flipping back to a bot is instant.
 const perspectiveCache = new Map<string, CapturedPerspective>();
 let currentReplayId: string | null = null;
+let replayEpoch = 0;
+let perspectiveRequest = 0;
 
 /** Highest tick index in the loaded timeline (`0` when nothing is loaded). */
 export function finalTick(): number {
@@ -34,53 +36,61 @@ export function finalTick(): number {
 
 /** Fetch a replay's full timeline and open the viewer, paused at tick 0. */
 export async function openReplay(id: string): Promise<void> {
+  const epoch = ++replayEpoch;
+  ++perspectiveRequest;
+  currentReplayId = null;
+  perspectiveCache.clear();
+  replayData.set(null);
+  replayPerspectiveData.set(null);
+  replayMarkers.set([]);
+  replayPerspective.set('overall');
+  replayPlaying.set(false);
   replayLoading.set(true);
   replayError.set(null);
   try {
     const data = await fetchReplay(id);
+    if (epoch !== replayEpoch) return;
     currentReplayId = id;
-    perspectiveCache.clear();
     replayData.set(data);
     replayMarkers.set(extractMarkers(data.frames));
     replayTick.set(0);
-    replayPlaying.set(false);
     replaySpeed.set(1);
-    replayPerspective.set('overall');
-    replayPerspectiveData.set(null);
     appMode.set('replay-viewer');
   } catch (e) {
-    replayError.set(e instanceof Error ? e.message : 'failed to load replay');
+    if (epoch === replayEpoch) replayError.set(e instanceof Error ? e.message : 'failed to load replay');
   } finally {
-    replayLoading.set(false);
+    if (epoch === replayEpoch) replayLoading.set(false);
   }
 }
 
-/** Switch the rendered perspective, lazily fetching a bot's sensor timeline on first use. */
+/** Switch perspective; only results for the current replay may enter its cache. */
 export async function selectPerspective(p: Perspective): Promise<void> {
+  const request = ++perspectiveRequest;
+  const epoch = replayEpoch;
+  const replayId = currentReplayId;
   replayPerspective.set(p);
-  if (p === 'overall') {
-    replayPerspectiveData.set(null);
-    return;
-  }
+  replayPerspectiveData.set(null);
+  replayError.set(null);
+  replayLoading.set(false);
+  if (p === 'overall' || !replayId) return;
   const cached = perspectiveCache.get(p);
   if (cached) {
     replayPerspectiveData.set(cached);
     return;
   }
-  if (!currentReplayId) return;
   replayLoading.set(true);
-  replayError.set(null);
   try {
-    const data = await fetchPerspective(currentReplayId, p);
+    const data = await fetchPerspective(replayId, p);
+    if (epoch !== replayEpoch) return;
     perspectiveCache.set(p, data);
-    // The user may have changed the selector while the request was in flight.
-    if (get(replayPerspective) === p) replayPerspectiveData.set(data);
+    if (request === perspectiveRequest) replayPerspectiveData.set(data);
   } catch (e) {
+    if (epoch !== replayEpoch || request !== perspectiveRequest) return;
     replayError.set(e instanceof Error ? e.message : 'failed to load perspective');
     replayPerspective.set('overall');
     replayPerspectiveData.set(null);
   } finally {
-    replayLoading.set(false);
+    if (epoch === replayEpoch && request === perspectiveRequest) replayLoading.set(false);
   }
 }
 
@@ -117,6 +127,9 @@ export function advanceTick(): void {
 
 /** Leave the viewer and return to the live spectator screen. */
 export function exitReplay(): void {
+  ++replayEpoch;
+  ++perspectiveRequest;
+  replayLoading.set(false);
   replayPlaying.set(false);
   replayData.set(null);
   replayMarkers.set([]);

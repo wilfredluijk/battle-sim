@@ -189,7 +189,7 @@ the `welcome` frame's `ship_specs` in your bot rather than hard-coding.
 
 | Property      | Default       | Notes                                                          |
 |---------------|---------------|----------------------------------------------------------------|
-| Map size      | 1000 × 1000   | Square arena. Origin top-left, `+x` right, `+y` down.          |
+| Map size      | 700 × 700   | Default arena; `--map` can be rectangular. Read actual bounds from `welcome.map`. Origin top-left, `+x` right, `+y` down.          |
 | Tick rate     | 10 Hz         | Fixed `dt = 0.1 s`. Physics never uses the wall clock.         |
 | Walls         | Hard          | A ship that runs into a wall stops dead and loses 2 HP.        |
 | Match timeout | Server-config | On timeout, highest HP wins; ammo is the tiebreaker.           |
@@ -223,7 +223,7 @@ you stall, you're a duck.
 | `shell_speed`        | 70.0    | Units per second. Roughly 8× the ship's top speed.            |
 | `max_shell_range`    | 300.0   | Server-side clamp on the `fire.range` field.                  |
 | `gun_cooldown_ticks` | 15      | 1.5 s between shots at the default tick rate.                 |
-| `splash_radius`      | 15.0    | Damage falloff distance.                                      |
+| `splash_radius`      | 15.0    | Damage falloff distance beyond the hull surface.                                      |
 | `max_splash_damage`  | 25      | HP dealt to a ship sitting on the splash centre.              |
 
 **There is no direct-hit damage.** Every shell flies its requested
@@ -680,7 +680,7 @@ Per-tick association + smoothing of `Contact` reports into persistent
 velocity.
 
 ```python
-tracker = Tracker(welcome.ship_specs, tick_hz=welcome.tick_hz)
+tracker = Tracker(welcome.ship_specs, simulation_dt=welcome.simulation_dt)
 ...
 tracks = tracker.update(view)  # call once per tick
 for t in tracks:
@@ -1246,3 +1246,15 @@ expected, not a determinism violation.
   model, replay semantics.
 - [`../examples/`](../examples/) — runnable example bots covering each
   tactical layer.
+
+### Match specs and timing (protocol 2.0)
+
+`welcome.simulation_dt` is the physics step (0.1 seconds), independent of the
+wall-clock `tick_hz`. Use it for velocity estimates and prediction. Each `game_start`
+includes the current match's `ship_specs` and `simulation_dt`. When those change, the
+SDK updates `bot.welcome` and calls `on_welcome` before `on_game_start`, so cached
+helpers can be rebuilt after lobby edits or Monte Carlo overrides.
+
+`PowerupActivatedEvent` exposes `own: bool` and `contact_id: Optional[str]`.
+Opponent IDs refer only to the current sensor frame; there is no `ship_id` field.
+Choose exactly two distinct powerups, or return `[]` to play without them.

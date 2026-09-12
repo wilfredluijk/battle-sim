@@ -157,7 +157,8 @@ pub fn step_shells(world: &mut World) -> Vec<CombatEvent> {
             if !ship.alive {
                 continue;
             }
-            let d = ship.pos.distance(shell.pos);
+            // Splash reaches the hull surface, not only the ship's center.
+            let d = (ship.pos.distance(shell.pos) - world.config.hit_radius).max(0.0);
             if d > splash_radius {
                 continue;
             }
@@ -354,7 +355,7 @@ mod tests {
 
     #[test]
     fn splash_damage_falls_off_linearly_with_distance() {
-        // Place s_2 half a splash radius beyond the actual impact point so frac ≈ 0.5 →
+        // Place the hull surface half a splash radius beyond impact so frac ≈ 0.5 →
         // dmg ≈ MAX_SPLASH_DAMAGE / 2.
         let range = 200.0_f32;
         let flight = (range / (constants::SHELL_SPEED * constants::DT)).ceil()
@@ -364,7 +365,10 @@ mod tests {
         let half_splash = constants::SPLASH_RADIUS * 0.5;
         let mut world = world_with(vec![
             ship_at("s_1", Vec2::new(500.0, 500.0)),
-            ship_at("s_2", Vec2::new(impact_x + half_splash, 500.0)),
+            ship_at(
+                "s_2",
+                Vec2::new(impact_x + constants::HIT_RADIUS + half_splash, 500.0),
+            ),
         ]);
         fire(&mut world, &"s_1".into(), 90.0, range).expect("fire");
         while !world.shells.is_empty() {
@@ -383,8 +387,8 @@ mod tests {
     fn ship_outside_splash_radius_takes_no_damage() {
         let mut world = world_with(vec![
             ship_at("s_1", Vec2::new(500.0, 500.0)),
-            // Place s_2 well outside splash (200 + 20).
-            ship_at("s_2", Vec2::new(720.0, 500.0)),
+            // Hull lies beyond the shell impact plus splash radius.
+            ship_at("s_2", Vec2::new(740.0, 500.0)),
         ]);
         fire(&mut world, &"s_1".into(), 90.0, 200.0).expect("fire");
         for _ in 0..40 {
@@ -544,5 +548,25 @@ mod tests {
         assert_eq!(world.shells[0].id_index, 0);
         assert_eq!(world.shells[1].id_index, 1);
         assert_eq!(world.next_shell_index, 2);
+    }
+    #[test]
+    fn hit_radius_changes_damage_at_the_hull_edge() {
+        let damage = |hit_radius| {
+            let mut world = world_with(vec![ship_at("target", Vec2::new(520., 500.))]);
+            world.config.hit_radius = hit_radius;
+            world.shells.push(Shell {
+                id_index: 0,
+                source_ship: "source".into(),
+                pos: Vec2::new(500., 500.),
+                vel: Vec2::ZERO,
+                ttl_ticks: 1,
+                splash_radius: 15.,
+                max_splash_damage: 25,
+            });
+            step_shells(&mut world);
+            100 - world.ships["target"].hp
+        };
+        assert_eq!(damage(2.), 0);
+        assert_eq!(damage(8.), 5);
     }
 }

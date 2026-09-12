@@ -65,7 +65,7 @@ class TacticalBot(Bot):
         # set it here too so ``TacticalBot`` is independently testable.
         self.welcome = welcome
         specs = welcome.ship_specs
-        self.tracker = Tracker(specs, tick_hz=welcome.tick_hz)
+        self.tracker = Tracker(specs, tick_hz=welcome.tick_hz, simulation_dt=welcome.simulation_dt)
         self.gunner = Gunner(specs)
         self.helm = Helm(
             specs,
