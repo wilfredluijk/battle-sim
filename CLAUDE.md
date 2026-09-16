@@ -10,7 +10,7 @@ A hackathon programming game. Players write bots in any language, connect them t
 
 **Three components, three trust levels:**
 - `server/` — Rust, authoritative, trusted. Owns all simulation state.
-- `sdk-python/` (and any future SDKs) — convenience layer for bot authors. Untrusted from the server's perspective.
+- `../battle-sim-python-sdk/` (and any future SDKs) — convenience layer for bot authors. Untrusted from the server's perspective.
 - `spectator/` — static HTML/JS, read-only viewer.
 
 ---
@@ -62,12 +62,12 @@ server/         Rust binary. Cargo workspace root is here.
   src/protocol.rs   serde types for the wire protocol
   src/replay.rs     JSONL replay log
 
-sdk-python/     Reference Python SDK
+../battle-sim-python-sdk/     Reference Python SDK
 spectator/      Svelte + TypeScript + Vite app, built to spectator/dist/ and
                 baked into the server binary via `include_str!`. Served at /.
                 Pure logic lives under src/lib/ (unit-tested with Vitest);
                 Svelte components in src/components/ are thin glue.
-examples/       Example bots (circle_bot.py, powerful_bot.py, tracking_bot.py,
+../battle-sim-python-sdk/examples/  Example bots (circle_bot.py, powerful_bot.py, tracking_bot.py,
                 tactician_bot.py, strategist_bot.py, loadout_bot.py)
 system-design.md  Full design doc — source of truth for architecture (repo root)
 docs/
@@ -78,7 +78,7 @@ docs/
                      with a fix sketch and acceptance criteria.
 ```
 
-When you change the wire protocol, update **all four** of: `server/src/protocol.rs`, `docs/PROTOCOL.md`, the SDK (`sdk-python/naval_sdk/protocol.py`), and the spectator types (`spectator/src/types/protocol.ts`). The protocol doc is the public contract; if it drifts from the code, players' bots break silently — and stale spectator types silently drop fields in the viewer.
+When you change the wire protocol, update **all four** of: `server/src/protocol.rs`, `docs/PROTOCOL.md`, the SDK (`../battle-sim-python-sdk/naval_sdk/protocol.py`), and the spectator types (`spectator/src/types/protocol.ts`). The protocol doc is the public contract; if it drifts from the code, players' bots break silently — and stale spectator types silently drop fields in the viewer.
 
 ---
 
@@ -96,12 +96,12 @@ cargo fmt                                               # Format
 cargo run -- --replay ./replays/match_20260508_171203.jsonl
 
 # Python SDK
-cd sdk-python
+cd ../battle-sim-python-sdk
 pip install -e .
 pytest
 
 # Run an example bot against a local server
-python examples/tactician_bot.py --host localhost --port 7878 --name tactician
+python ../battle-sim-python-sdk/examples/tactician_bot.py --host localhost --port 7878 --name tactician
 
 # Spectator (Svelte / TS / Vite)
 cd spectator
@@ -167,7 +167,7 @@ The wire protocol is an external contract. When changing it:
 3. Update the Python SDK's `protocol.py`.
 4. Update the spectator's `src/types/protocol.ts` (spectator, replay, and REST payload types live there too — stale entries silently drop data in the viewer).
 5. If the change is breaking, bump the version string sent in the `welcome` message and document the break in `docs/PROTOCOL.md` under a "Changelog" section.
-6. Run the example bots in `examples/` against the new server. They serve as integration tests.
+6. Run the example bots in `../battle-sim-python-sdk/examples/` against the new server. They serve as integration tests.
 
 Additive changes (new optional field) are usually safe. Renames, type changes, and removed fields are breaking and need a version bump.
 
@@ -200,7 +200,7 @@ These are choices that look like implementation details but have design implicat
 ## Things that are fine to do without asking
 
 - Improving error messages, especially in protocol validation. Bot authors will thank you.
-- Adding example bots in `examples/`. Variety helps onboarding.
+- Adding example bots in `../battle-sim-python-sdk/examples/`. Variety helps onboarding.
 - Polishing the spectator UI — it's the demo surface and any improvement is welcome.
 - Adding logging at `debug!` or `trace!` level.
 - Writing more replay tests.

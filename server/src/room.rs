@@ -447,6 +447,11 @@ pub struct Room {
     training: TrainingStore,
     current_round: Option<RoundTag>,
     pub tournament: bool,
+    /// Workshop-only mode: derive sensor jitter from public bot/tick data. The production
+    /// default remains the secret per-match seed used by [`Self::stream_rng`].
+    pub workshop_public_sensor_stream: bool,
+    /// Older format-7 recordings predate projectile observations.
+    pub(crate) shell_contacts: bool,
     match_id: String,
     config_revision: u64,
     ingress_notify: Arc<tokio::sync::Notify>,
@@ -529,6 +534,8 @@ impl Room {
             training: TrainingStore::default(),
             current_round: None,
             tournament: false,
+            workshop_public_sensor_stream: false,
+            shell_contacts: true,
             match_id: String::new(),
             config_revision: 1,
             ingress_notify: Arc::default(),
@@ -570,12 +577,37 @@ impl Room {
         Pcg64::from_seed(digest.into())
     }
 
+    /// Return the random stream used for one bot's sensor sweep.
+    ///
+    /// Normal operation delegates to `stream_rng` unchanged, retaining the secret
+    /// tournament seed. The opt-in workshop mode deliberately uses only values a bot
+    /// already knows. Its seed is:
+    ///
+    /// `SHA-256("battle-sim/public-sensors/v1" || len(bot_id)_le_u64 || bot_id || tick_le_u64)`
+    ///
+    /// This affects observation jitter only. It never changes placement, powerups,
+    /// combat, physics, or any other simulation state.
+    fn sensor_stream_rng(&self, bot_id: &str, tick: u64) -> Pcg64 {
+        if !self.workshop_public_sensor_stream {
+            return self.stream_rng("sensors", bot_id, tick);
+        }
+
+        let mut hash = Sha256::new();
+        hash.update(b"battle-sim/public-sensors/v1");
+        hash.update((bot_id.len() as u64).to_le_bytes());
+        hash.update(bot_id.as_bytes());
+        hash.update(tick.to_le_bytes());
+        let digest = hash.finalize();
+        Pcg64::from_seed(digest.into())
+    }
+
     pub fn configuration(&self) -> serde_json::Value {
         serde_json::json!({ "protocol_version": "3.0", "revision": self.config_revision,
             "simulation_dt": crate::sim::constants::DT, "tick_hz": self.tick_hz,
             "deadline_ms": self.tick_deadline_ms, "map": { "width": self.world.width, "height": self.world.height },
             "max_bots": self.max_bots, "match_timeout_ticks": MATCH_TIMEOUT_TICKS,
             "sim_config": self.world.config, "ship_specs": ShipSpecs::from_config(&self.world.config), "available_powerups": PowerupId::all(),
+            "capabilities": { "empty_loadout": true, "own_ship_telemetry": true, "shell_contacts": self.shell_contacts },
             "command_policy": "exact_match_and_tick_first_valid_wins",
             "disconnect_policy": "forfeit_hull_retained", "timeout_ties": "draw",
             "action_phases": ["controls", "powerups", "fire", "physics", "shells"],
@@ -829,8 +861,8 @@ impl Room {
                 (entry.ship_id.clone(), entry.sensor_mode, ship.pos)
             };
 
-            let mut sensor_rng = self.stream_rng("sensors", bot_id, self.world.tick);
-            let sim_contacts = match sensor_mode {
+            let mut sensor_rng = self.sensor_stream_rng(bot_id, self.world.tick);
+            let mut sim_contacts = match sensor_mode {
                 SensorMode::Active => sensors::active_contacts_at(
                     &ship_id,
                     viewer_pos,
@@ -847,6 +879,9 @@ impl Room {
                     self.world.tick.saturating_sub(1),
                 ),
             };
+            if !self.shell_contacts {
+                sim_contacts.retain(|contact| contact.kind != SimContactKind::Shell);
+            }
             // If this bot has a pending counter-battery trace, splice a synthetic precise
             // contact in *before* the natural ones so it's near the front of the list.
             // Done in-place rather than in `sensors::active_contacts` so the trace works
@@ -913,6 +948,12 @@ impl Room {
                     throttle: ship.throttle,
                     selected_powerups: ship.powerups.selected.clone(),
                     powerup_status,
+                    gun_cooldown_ticks_left: ship.gun_cooldown,
+                    emp_ticks_left: ship
+                        .powerups
+                        .emp_debuff_until
+                        .saturating_sub(world_tick)
+                        .min(u32::MAX as u64) as u32,
                 },
                 contacts,
                 events,
@@ -1363,9 +1404,13 @@ impl Room {
         self.end_tick = None;
         self.state = RoomState::Lobby;
         self.rng = Pcg64::seed_from_u64(self.seed);
+        let msg = ServerMsg::Lobby {
+            tick: 0,
+            config_hash: Some(self.config_hash()),
+            configuration: Some(Box::new(self.configuration())),
+        };
         for entry in self.bots.values() {
-            let msg = ServerMsg::Lobby { tick: 0 };
-            if let Err(e) = entry.outbound.try_send(msg) {
+            if let Err(e) = entry.outbound.try_send(msg.clone()) {
                 debug!(
                     room = %self.name,
                     bot = %entry.bot_id,
@@ -1888,7 +1933,7 @@ impl Room {
     }
 
     /// Validate `powerups` and record them on the bot's entry. Constraints (per
-    /// `docs/POWERUPS.md`): exactly two distinct entries, both must be known ids, and the
+    /// `docs/POWERUPS.md`): empty or two distinct entries, both must be known ids, and the
     /// room must be in `Lobby`. On failure the previous selection (if any) is preserved
     /// and a typed `error` frame is sent to the bot.
     fn handle_select_powerups(&mut self, bot_id: BotId, powerups: Vec<PowerupId>) {
@@ -1908,17 +1953,17 @@ impl Room {
             ));
             return;
         }
-        if powerups.len() != 2 {
+        if !powerups.is_empty() && powerups.len() != 2 {
             let _ = entry.outbound.try_send(protocol::error_msg(
                 error_code::POWERUP_WRONG_COUNT,
                 format!(
-                    "select_powerups requires exactly 2 entries, got {}",
+                    "select_powerups requires zero or exactly 2 entries, got {}",
                     powerups.len()
                 ),
             ));
             return;
         }
-        if powerups[0] == powerups[1] {
+        if powerups.len() == 2 && powerups[0] == powerups[1] {
             let _ = entry.outbound.try_send(protocol::error_msg(
                 error_code::POWERUP_DUPLICATE,
                 "select_powerups requires two distinct powerups",
@@ -2138,6 +2183,8 @@ impl Room {
             let entry = self.bots.get(bot_id).expect("snapshot still in map");
             let game_start = ServerMsg::GameStart {
                 match_id: self.match_id.clone(),
+                config_hash: Some(self.config_hash()),
+                configuration: Some(Box::new(self.configuration())),
                 ship_specs: ShipSpecs::from_config(&config),
                 simulation_dt: crate::sim::constants::DT,
                 tick: 0,
@@ -2231,6 +2278,8 @@ impl Room {
             return;
         };
         let header = ReplayHeader {
+            shell_contacts: self.shell_contacts,
+            workshop_public_sensor_stream: self.workshop_public_sensor_stream,
             version: REPLAY_FORMAT_VERSION,
             replay_id: writer.replay_id().to_string(),
             room: self.name.clone(),
@@ -2978,6 +3027,44 @@ mod tests {
 
     fn test_room() -> Room {
         Room::new("test".into(), 1000.0, 1000.0, 42, 10, 80, 4)
+    }
+
+    #[test]
+    fn default_sensor_stream_remains_secret_seeded() {
+        let room = test_room();
+        assert!(!room.workshop_public_sensor_stream);
+
+        let mut expected = room.stream_rng("sensors", "b_1", 17);
+        let mut actual = room.sensor_stream_rng("b_1", 17);
+        for _ in 0..8 {
+            assert_eq!(actual.gen::<u64>(), expected.gen::<u64>());
+        }
+
+        let other_seed = Room::new("test".into(), 1000.0, 1000.0, 43, 10, 80, 4);
+        let mut first = room.sensor_stream_rng("b_1", 17);
+        let mut second = other_seed.sensor_stream_rng("b_1", 17);
+        assert_ne!(first.gen::<u64>(), second.gen::<u64>());
+    }
+
+    #[test]
+    fn workshop_sensor_stream_uses_only_public_bot_and_tick() {
+        let mut first = test_room();
+        first.workshop_public_sensor_stream = true;
+        let mut second = Room::new("other".into(), 640.0, 480.0, 999, 60, 10, 24);
+        second.workshop_public_sensor_stream = true;
+
+        let mut a = first.sensor_stream_rng("b_7", 123);
+        let mut b = second.sensor_stream_rng("b_7", 123);
+        for _ in 0..8 {
+            assert_eq!(a.gen::<u64>(), b.gen::<u64>());
+        }
+
+        let mut different_bot = first.sensor_stream_rng("b_8", 123);
+        let mut different_tick = first.sensor_stream_rng("b_7", 124);
+        let mut baseline = first.sensor_stream_rng("b_7", 123);
+        assert_ne!(baseline.gen::<u64>(), different_bot.gen::<u64>());
+        let mut baseline = first.sensor_stream_rng("b_7", 123);
+        assert_ne!(baseline.gen::<u64>(), different_tick.gen::<u64>());
     }
 
     fn connect(room: &mut Room, name: &str) -> Result<BotRegistration, JoinError> {

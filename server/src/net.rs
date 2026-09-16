@@ -941,6 +941,7 @@ async fn handle_bot(
     let ingress = registration.ingress;
     let mut outbound = registration.outbound;
     let mut budget = RateLimit::new(40, 64 * 1024);
+    let mut command_allowance: Option<(String, u64)> = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut last_seen = Instant::now();
     let mut disconnect_reason = "connection closed";
@@ -961,7 +962,10 @@ async fn handle_bot(
             msg = outbound.recv() => {
                 match msg {
                     Some(m) => {
-                        if let ServerMsg::Tick { tick, .. } = &m { ingress.sent(*tick, Instant::now()); }
+                        if let ServerMsg::Tick { match_id, tick, .. } = &m {
+                            ingress.sent(*tick, Instant::now());
+                            command_allowance = Some((match_id.clone(), *tick));
+                        }
                         if !send_server_msg(&mut sink, &m).await { break; }
                     },
                     None => break,
@@ -972,15 +976,27 @@ async fn handle_bot(
                 let received = Instant::now();
                 let Some(Ok(frame)) = frame else { break; };
                 let bytes = match &frame { Message::Text(t) => t.len(), Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(), _ => 0 };
-                if !budget.accept(bytes) {
+                let parsed = match &frame {
+                    Message::Text(text) => Some(serde_json::from_str::<BotMsg>(text)),
+                    _ => None,
+                };
+                // One response to the last issued tick is paced by the server, including
+                // in lockstep. Extra messages and bytes beyond 1 KiB keep the fixed limit.
+                let expected_response = matches!(
+                    (&parsed, &command_allowance),
+                    (Some(Ok(BotMsg::Command { match_id, tick, .. })), Some((expected_match, expected_tick)))
+                        if match_id == expected_match && tick == expected_tick
+                );
+                if expected_response { command_allowance = None; }
+                if !budget.accept_with_allowance(bytes, expected_response.then_some(1024)) {
                     disconnect_reason = "message or byte limit exceeded";
                     send_error(&mut sink, "rate_limited", "message or byte budget exceeded").await;
                     break;
                 }
                 last_seen = received;
                 match frame {
-                    Message::Text(text) => {
-                        let result = match serde_json::from_str::<BotMsg>(&text) {
+                    Message::Text(_) => {
+                        let result = match parsed.expect("text frame was parsed above") {
                             Ok(BotMsg::Ready { config_hash }) => {
                                 room_tx.try_send(RoomEvent::BotReadyChecked { bot_id: bot_id.clone(), config_hash }).map_err(|_| "server_busy")
                             }
@@ -1327,13 +1343,18 @@ impl RateLimit {
         }
     }
     fn accept(&mut self, bytes: usize) -> bool {
+        self.accept_with_allowance(bytes, None)
+    }
+    fn accept_with_allowance(&mut self, bytes: usize, allowance: Option<usize>) -> bool {
         if self.started.elapsed() >= Duration::from_secs(1) {
             self.started = Instant::now();
             self.messages = 0;
             self.bytes = 0;
         }
-        self.messages = self.messages.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(bytes);
+        self.messages = self.messages.saturating_add(u32::from(allowance.is_none()));
+        self.bytes = self
+            .bytes
+            .saturating_add(bytes.saturating_sub(allowance.unwrap_or(0)));
         self.messages <= self.max_messages && self.bytes <= self.max_bytes
     }
 }
@@ -1387,6 +1408,27 @@ async fn health(State(state): State<AppState>) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issued_responses_do_not_spend_unsolicited_message_or_byte_budget() {
+        let mut budget = RateLimit::new(40, 64 * 1024);
+        for _ in 0..1000 {
+            assert!(budget.accept_with_allowance(1024, Some(1024)));
+        }
+        for _ in 0..40 {
+            assert!(budget.accept(100));
+        }
+        assert!(!budget.accept(100));
+    }
+
+    #[test]
+    fn padded_responses_still_exhaust_the_byte_budget() {
+        let mut budget = RateLimit::new(40, 64 * 1024);
+        for _ in 0..64 {
+            assert!(budget.accept_with_allowance(2048, Some(1024)));
+        }
+        assert!(!budget.accept_with_allowance(2048, Some(1024)));
+    }
 
     #[test]
     fn rejects_non_finite_command_floats() {

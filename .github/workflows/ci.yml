@@ -1,4 +1,4 @@
-# Phase 11.2 lint/format gate: fmt, clippy, cargo test, pytest. Green on a clean checkout.
+# Server/spectator checks. Python SDK checks live in battle-sim-python-sdk.
 name: CI
 
 on:
@@ -63,24 +63,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets --locked
-
-  python:
-    name: python sdk
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk-python
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install SDK with dev extras
-        run: pip install -e ".[dev]"
-
-      - name: pytest
-        run: pytest -q

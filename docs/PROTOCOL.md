@@ -9,7 +9,7 @@ Public contract between the naval-battle server and bot / spectator clients. Thi
   - `ws://<host>:<port>/spectate` — server-to-client WebSocket only.
   - `http://<host>:<port>/api/*` — REST control plane for the operator UI (admin login + room lifecycle). See §2.5.
 - **Discriminator:** every message has a `"type"` field (snake_case).
-- **Coordinates:** `[x, y]` arrays of `f32`. Origin top-left, `+x` right, `+y` down. Bearings are in absolute compass degrees (0° = `+y`-axis is unspecified by the design; treat bearings consistently between `fire` and contacts — see PR-relative discussion in `system-design.md` §5.4).
+- **Coordinates:** `[x, y]` arrays of `f32`. Origin top-left, `+x` right, `+y` down. Bearings are absolute compass degrees: 0° north (`-y`), 90° east (`+x`), increasing clockwise.
 - **Numbers:** all coordinates, speeds, headings, and ranges are `f32`. Tick numbers, HP, and ammo are unsigned integers.
 
 ---
@@ -26,7 +26,7 @@ Protocol v3 requires a participant credential in `hello`, a configuration hash i
 First message after the WebSocket connects.
 
 ```json
-{ "type": "hello", "name": "captain_kirk", "version": "naval-sdk/0.4.0", "token": "participant-credential" }
+{ "type": "hello", "name": "captain_kirk", "version": "naval-sdk/0.5.0", "token": "participant-credential" }
 ```
 
 | Field | Type | Notes |
@@ -42,7 +42,7 @@ Sent after `welcome` is received and the bot is willing to start.
 ```
 
 #### `select_powerups`
-Optional. Declare the (exactly two distinct) powerups this bot will use for the match. May only be sent while the room is in `lobby`; the bot may send it before *or* after `ready`, but always before `game_start`. Sending it twice in lobby replaces the previous selection. Bots that never send it play with no powerups (vanilla).
+Optional. Declare two distinct powerups, or send `[]` to clear the selection on servers advertising `capabilities.empty_loadout`. May only be sent while the room is in `lobby`; the bot may send it before *or* after `ready`, but always before `game_start`. Sending it twice in lobby replaces the previous selection. Bots that never send it play with no powerups (vanilla).
 
 ```json
 { "type": "select_powerups", "powerups": ["rapid_fire", "heavy_shell"] }
@@ -124,7 +124,7 @@ Field values shown above are the current defaults; the live `welcome` payload al
 `available_powerups` is the catalog the server understands; pass any of these ids to `select_powerups`. See `docs/POWERUPS.md` for what each one does.
 
 #### `game_start`
-Sent whenever a match starts, including Monte Carlo matches. `ship_specs` and `simulation_dt` describe this match and supersede the connection-time values. The Python SDK refreshes `bot.welcome` and calls `on_welcome` again if these values changed, before `on_game_start`.
+Sent whenever a match starts, including Monte Carlo matches. Alongside `ship_specs` and `simulation_dt`, current servers include `configuration` and `config_hash` with the same full snapshot shape as `welcome`. The snapshot includes any Monte Carlo override. The SDK checks a changed snapshot with `accept_configuration`, refreshes `bot.welcome` and its typed rules, and calls `on_welcome` before the start callback. Refusing a batch override disconnects the bot. Do not send lobby readiness or loadout messages in response to `game_start`. These two snapshot fields are optional for compatibility with earlier protocol 3 servers; the abbreviated example below omits them.
 
 ```json
 {
@@ -196,7 +196,7 @@ Sent at the top of every simulation tick. Bot must reply with a `command` before
 
 `contacts[].range` is omitted when not measured (passive mode). Active bearing and range are derived from the same noisy observed position as `pos`; they cannot reconstruct the true position. Decoys receive the same ordinary active-radar noise as ships.
 
-`contacts[].kind` is one of `"ship"`, `"shell"`, `"unknown"`.
+`contacts[].kind` is one of `"ship"`, `"shell"`, `"unknown"`. Active radar reports in-flight shells, including your own, within its effective range. Shell observations use ordinary radar noise, AWACS range/noise adjustments, smoke occlusion and EMP suppression. Passive sensors do not report shells. A shell contact exposes no projectile ID or firing-ship identity.
 
 `events[]` only contains things this bot can perceive: own hits and splashes inside its sensor range, plus `powerup_activated` events for the bot's own activations and any activation by a ship in this tick's actual sensor contacts. Own activations carry `own: true` and omit `contact_id`; other activations carry `own: false` and the matching per-tick `contact_id`. Bot events never expose persistent ship IDs. Spectator events retain `ship_id`.
 
@@ -221,7 +221,7 @@ Sent when a match ends — either naturally (last ship standing / match timeout)
 The connection stays open after `game_over`. A few seconds later (~`POST_GAME_LOBBY_TICKS / tick_hz`) the server emits a `lobby` frame and the bot can re-send `ready` to participate in the next match. Bots that want to exit can simply close the WebSocket from their end.
 
 #### `lobby`
-Sent when the room returns to the lobby after a match. SDKs should treat this as the signal to re-send `ready` if they want to play the next match. `tick` is always 0.
+Sent when the room returns to the lobby after a match. SDKs should treat this as the signal to re-send `ready` if they want to play the next match. `tick` is always 0. Current servers also include `configuration` and `config_hash` (the same snapshot shape as `welcome`), reflecting restored operator rules after Monte Carlo. Refresh rules before choosing a new loadout or acknowledging readiness. These fields are optional on older protocol 3 servers; the abbreviated example below omits them.
 
 ```json
 { "type": "lobby", "tick": 0 }
@@ -263,6 +263,19 @@ hello → welcome → [select_powerups] → ready → game_start → tick* → g
 - An operator-issued `abort` is delivered to bots as a `game_over` with `winner: null`. An operator-issued `reset` cuts the post-game pause short; the bot still sees `game_over` (already delivered) followed by `lobby` immediately afterwards.
 
 ---
+
+### Own-ship telemetry and loadout clearing (SDK 0.5)
+
+`tick.self.gun_cooldown_ticks_left` gives the remaining gun cooldown before the
+next command phase. `tick.self.emp_ticks_left` gives the remaining incoming EMP
+debuff. Both fields describe only the viewing bot's ship; contacts do not include
+them. Older clients may ignore these additive fields.
+
+`configuration.capabilities` advertises `own_ship_telemetry: true` and
+`empty_loadout: true`. On capable servers, `select_powerups` accepts either two
+distinct known IDs or `[]` to clear a previously committed lobby selection.
+One or more than two entries still fails validation. Older servers without the
+empty-loadout capability cannot clear a selection until the next lobby.
 
 ## 2. Spectator endpoint — `/spectate`
 
@@ -693,12 +706,11 @@ Codes are strings; the human-readable detail goes in `message`. Bot authors shou
 | `no_ammo` | `fire` was issued but the ship has no ammo left. Coalesced like `cooldown_active`. |
 | `invalid_name` | `hello.name` was empty, longer than 32 bytes, or contained characters outside `[A-Za-z0-9 _-]`. The connection is closed. |
 | `duplicate_name` | `hello.name` duplicates another live bot already registered in the room. The connection is closed. |
-| `stale_command` | `command.tick` was outside the accepted window (`world_tick ± 1`). |
 | `non_finite_value` | A command contained `NaN` or `Inf` in `throttle`, `rudder`, or `fire.{bearing_deg,range}`. |
 | `handshake_timeout` | The bot connected but did not send `hello` within the handshake timeout. The connection is closed. |
 | `powerup_unknown` | `select_powerups` or `command.activate_powerup` referenced an id not in `welcome.available_powerups`. |
 | `powerup_duplicate` | `select_powerups.powerups` listed the same id twice. |
-| `powerup_wrong_count` | `select_powerups.powerups` did not contain exactly two entries. |
+| `powerup_wrong_count` | `select_powerups.powerups` did not contain zero or exactly two entries. |
 | `powerup_lobby_only` | `select_powerups` was sent while the room was not in `lobby`. |
 | `powerup_not_selected` | `command.activate_powerup` named a powerup the bot didn't pick for this match. |
 | `powerup_already_used` | `command.activate_powerup` named a powerup the bot already activated this match. |
@@ -720,6 +732,18 @@ WebSocket messages are capped at 16 KiB. The `/spectate` endpoint always require
 ## Changelog
 
 <!-- Each entry: ## YYYY-MM-DD — version. List additions / changes / removals. -->
+
+## 2026-09-16 — batch rules and shell observations
+
+- Each issued tick allows one matching command response of up to 1 KiB. Additional messages and bytes beyond that allowance retain the 40 messages / 64 KiB per-second budget; the 16 KiB frame cap still applies.
+- `game_start` and `lobby` carry optional full configuration/hash snapshots, including batch overrides and restored lobby rules.
+- Active radar includes shell contacts under the normal range, noise, smoke and EMP rules.
+- New format-7 replay headers contain `shell_contacts: true`. Absent or false preserves the older bot perspectives without shell observations; world playback remains unchanged. Older server builds do not understand this flag, so use the updated server to replay these recordings.
+
+## 2026-09-12 — additive SDK telemetry
+
+- Add own-ship gun cooldown and incoming EMP ticks to bot views.
+- Advertise empty-loadout support so bots can clear selections after lobby rule changes.
 
 ## 2026-09-12 — protocol 3.0 and replay format 7
 

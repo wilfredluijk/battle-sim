@@ -21,7 +21,7 @@ After your bot receives `welcome` and before it sends `ready`, send:
 
 Constraints (the server validates):
 
-- Exactly two ids.
+- Two ids, or `[]` to clear the selection when `configuration.capabilities.empty_loadout` is true.
 - Both ids distinct.
 - Each id must appear in `welcome.available_powerups`.
 - Selection is only accepted while the room is in `lobby`.
@@ -38,6 +38,7 @@ Set `activate_powerup` on a normal `command` message:
 ```json
 {
   "type": "command",
+  "match_id": "copy-from-current-tick",
   "tick": 142,
   "throttle": 1.0,
   "rudder": 0.0,
@@ -66,7 +67,7 @@ Every `tick` payload echoes your loadout and live status:
 ```
 
 The Python SDK exposes this as `view.me.powerup_ready("...")` and
-`view.me.powerup_active("...")`. The `examples/loadout_bot.py` reference bot
+`view.me.powerup_active("...")`. The `../battle-sim-python-sdk/examples/loadout_bot.py` reference bot
 demonstrates the full workflow.
 
 Activation events identify your own powerups with `own: true`; visible opponents use the current tick's `contact_id` with `own: false`. No persistent opponent ship ID is exposed.

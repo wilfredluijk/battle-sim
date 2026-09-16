@@ -16,6 +16,23 @@ export interface PowerupStatus {
   active_ticks_left: number;
 }
 
+/** Own-ship fields on /bot ticks, distinct from spectator ShipSnapshot.
+ * Telemetry is optional for compatibility with earlier protocol 3 servers.
+ */
+export interface BotSelfState {
+  pos: [number, number];
+  heading_deg: number;
+  speed: number;
+  hp: number;
+  ammo: number;
+  throttle: number;
+  rudder: number;
+  selected_powerups?: string[];
+  powerup_status?: PowerupStatus[];
+  gun_cooldown_ticks_left?: number;
+  emp_ticks_left?: number;
+}
+
 export interface ShipSnapshot {
   id: string;
   bot_name: string;
@@ -216,6 +233,7 @@ export interface ReplayBotInfo {
 
 /** The replay log header, echoed by `GET /api/replays/{id}`. */
 export interface ReplayHeaderInfo {
+  shell_contacts?: boolean;
   version: number;
   replay_id: string;
   room: string;
@@ -327,6 +345,9 @@ export interface BotWelcome {
 }
 export interface BotGameStart {
   type: 'game_start';
+  match_id: string;
+  config_hash?: string;
+  configuration?: MatchConfiguration;
   tick: number;
   starting_position: [number, number];
   starting_heading_deg: number;
@@ -357,6 +378,12 @@ export interface ConfigurationMessage {
   type: 'configuration';
   config_hash: string;
   configuration: MatchConfiguration;
+}
+export interface BotLobby {
+  type: 'lobby';
+  tick: number;
+  config_hash?: string;
+  configuration?: MatchConfiguration;
 }
 export type BotHandshake =
   | { type: 'hello'; name: string; version: string; token: string }

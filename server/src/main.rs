@@ -60,6 +60,7 @@ async fn main() {
         map_w = config.map.0,
         map_h = config.map.1,
         replay_dir = %config.replay_dir.display(),
+        workshop_public_sensor_stream = config.workshop_public_sensor_stream,
         "starting naval-server"
     );
 
@@ -127,6 +128,7 @@ async fn main() {
             config.max_bots,
         );
         main_room.tournament = config.tournament;
+        main_room.workshop_public_sensor_stream = config.workshop_public_sensor_stream;
         main_room.set_spectator_broadcast(spec_tx.clone());
         main_room.set_replay_dir(config.replay_dir.clone());
         tokio::spawn(room::run_room(main_room, room_rx, shutdown_tx.subscribe()))

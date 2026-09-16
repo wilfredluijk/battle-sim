@@ -61,3 +61,26 @@ Implemented and validated on 12 September 2026 against an isolated local tournam
 - Layout: document dimensions stayed within 1366 × 768, 768 × 1024, 683 × 384 and 390 × 844 CSS viewports. Live canvas content measured 950 × 519, 428 × 765 and 343 × 125 at the first three sizes. The sound dialog is internally scrollable at 683 × 384; its close button is reachable and Escape remains available. The 683 × 384 check represents the effective viewport of a laptop at 200% zoom, not every OS/browser zoom configuration.
 
 Browser verification confirms audio setup and scheduling, not acoustic output from a physical speaker or venue loudness. Tab visibility behavior is covered by automated event tests; creating another automation tab did not switch the foreground tab in this browser. Test the chosen volume on the presenting device before the session.
+
+## Full HD battlefield follow-up
+
+On 12 September 2026, the admin tunnel at `127.0.0.1:8787` was confirmed to serve the older 14,853-byte stylesheet without the trainer app shell, bounded battle stage or viewport-height rules. The running VPS frontend therefore predates the sizing fixes described above. Updating a local bundle does not update the embedded frontend in that deployed server.
+
+The current stylesheet now has one canvas sizing rule, with the obsolete square aspect ratio removed. The app shell has an explicit bounded height, the battle grid receives exactly the remaining space below navigation, and canvas layout is isolated from its container size. Long round names cannot widen the header. The renderer preserves the full map aspect ratio through letterboxing and keeps a 5% inset around the world so boundary lines and nearby ship markers stay clear of the canvas edge; team and event lists scroll within their own regions.
+
+Verified with eight example teams on a 700 × 700 map matching the VPS. In each case, `scrollWidth`/`scrollHeight` matched the available size for the battle stage, battle main, app shell, app root, body and document. The map's complete world rectangle stayed within the canvas and viewport, rather than being hidden beyond a clipped parent.
+
+| CSS viewport | Mode | Canvas border box | Page or battlefield overflow |
+|---|---|---|---|
+| 1920 × 1080 | Roster | 1506 × 833 | None |
+| 1920 × 1080 | Expanded map | 1888 × 833 | None |
+| 1920 × 1080 | Projector, roster | 1466 × 825 | None |
+| 1920 × 1080 | Projector, expanded map | 1888 × 825 | None |
+| 1920 × 900 | Projector, roster | 1466 × 645 | None |
+| 1366 × 768 | Projector, roster | 912 × 513 | None |
+
+Expanding a team's telemetry left the canvas and all its ancestor dimensions unchanged. The 1920 × 900 check also allows room for browser chrome on a Full HD monitor.
+
+Release candidate `r20260912-1341` is built from committed server/frontend code at `3bf5d5b` plus this CSS and canvas-fit correction, isolating unrelated SDK migration and protocol edits in progress. Checks passed: 83 frontend tests, 222 Rust tests, 85 Python tests from the release snapshot, Svelte/TypeScript, formatting and Clippy. Dependency and final-image scans reported zero known vulnerabilities. The container health probe passed, and its embedded CSS/JavaScript bytes exactly match the browser-tested build. The release bundle is under `release-artifacts/r20260912-1341/`. After explicit approval, production activation completed on 12 September 2026 at 18:36 UTC. The container is healthy with zero restarts or startup errors; the existing administrator tunnel serves the exact verified CSS and JavaScript hashes, and administrator login succeeds. All six previously connected bots reconnected to the lobby. The previous release, `r20260912-2`, is retained for rollback. Deployment evidence is saved in `deployment-verification.json` in the release bundle.
+
+Nine canvas-fit regressions cover Full HD roster/expanded/projector sizes, browser chrome, square/wide/tall maps, tiny resize dimensions, aspect ratio, centering and HiDPI scaling. With the final inset, the Full HD roster view displays the entire square world in a 749.7 × 749.7 region starting at (394.15, 224.65), inside the 1506 × 833 canvas. The screenshot is saved in the workspace’s `output/battle-fullhd-roster.jpg`.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise public TLS, private auth, abuse handling and a full eight-bot SDK match.
-Requires the admin SSH tunnel and ./sdk-python installed. Never logs credentials.
+Requires the admin SSH tunnel and ../battle-sim-python-sdk installed. Never logs credentials.
 Run only between training matches: these tests occupy the participant roster.
 """
 import argparse

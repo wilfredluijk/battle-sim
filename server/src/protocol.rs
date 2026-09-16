@@ -43,7 +43,7 @@ pub enum BotMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activate_powerup: Option<PowerupId>,
     },
-    /// Declare the (exactly 2 distinct) powerups the bot will use for this match. May only
+    /// Declare two distinct powerups, or clear the selection with an empty list. May only
     /// be sent while the room is in `lobby` and before `ready`. Sending it twice replaces
     /// the previous selection; an invalid loadout earns a typed `error` frame and leaves
     /// the previous selection (if any) intact.
@@ -91,6 +91,10 @@ pub enum ServerMsg {
     },
     GameStart {
         match_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration: Option<Box<serde_json::Value>>,
         ship_specs: ShipSpecs,
         simulation_dt: f32,
         tick: u64,
@@ -117,6 +121,10 @@ pub enum ServerMsg {
     /// with `GameStart`.
     Lobby {
         tick: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration: Option<Box<serde_json::Value>>,
     },
     Error {
         code: String,
@@ -184,6 +192,12 @@ pub struct SelfState {
     /// One entry per picked powerup, in the same order as `selected_powerups`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub powerup_status: Vec<PowerupStatus>,
+    /// Authoritative own-ship gun cooldown before this tick's command is applied.
+    #[serde(default)]
+    pub gun_cooldown_ticks_left: u32,
+    /// Remaining incoming EMP debuff; no opponent information is exposed.
+    #[serde(default)]
+    pub emp_ticks_left: u32,
 }
 
 /// Live status for one of the bot's picked powerups. Sent inside `tick.self.powerup_status`.
@@ -454,6 +468,8 @@ mod tests {
         });
         roundtrip(&ServerMsg::GameStart {
             match_id: "test-match".into(),
+            config_hash: Some("test-config".into()),
+            configuration: Some(Box::new(serde_json::json!({}))),
             ship_specs: ShipSpecs::from_config(&crate::sim::SimConfig::default()),
             simulation_dt: crate::sim::constants::DT,
             tick: 0,
@@ -470,6 +486,8 @@ mod tests {
                 speed: 4.1,
                 hp: 78,
                 ammo: 14,
+                gun_cooldown_ticks_left: 7,
+                emp_ticks_left: 12,
                 rudder: -0.3,
                 throttle: 0.8,
                 selected_powerups: vec![PowerupId::Overdrive, PowerupId::RapidFire],

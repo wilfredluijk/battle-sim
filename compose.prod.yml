@@ -16,6 +16,7 @@ services:
       BATTLE_ADMIN_PASSWORD_FILE: /run/secrets/admin-password
       BATTLE_BOT_CREDENTIALS_FILE: /run/secrets/participants.json
       BATTLE_IMAGE_ID: ${BATTLE_IMAGE_ID:?set the loaded image ID}
+      BATTLE_WORKSHOP_PUBLIC_SENSOR_STREAM: ${BATTLE_WORKSHOP_PUBLIC_SENSOR_STREAM:-false}
       RUST_LOG: info
     volumes:
       - /opt/battle-sim/secrets:/run/secrets:ro

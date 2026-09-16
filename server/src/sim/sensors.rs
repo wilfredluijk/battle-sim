@@ -180,6 +180,31 @@ pub fn active_contacts_at(
             confidence: 1.0,
         });
     }
+    // Append projectiles after ships/decoys to preserve their observation order and RNG
+    // draws. Contacts carry neither projectile identity nor firing-ship ownership.
+    for shell in &world.shells {
+        if shell.pos.distance(viewer_pos) > radar_range
+            || smoke_blocks(world, viewer_pos, shell.pos, tick)
+        {
+            continue;
+        }
+        let noise = if awacs_active { 0.0 } else { base_noise };
+        let offset = if noise > 0.0 {
+            Vec2::new(rng.gen_range(-noise..=noise), rng.gen_range(-noise..=noise))
+        } else {
+            Vec2::ZERO
+        };
+        let observed_pos = shell.pos + offset;
+        let observed_to = observed_pos - viewer_pos;
+        out.push(Contact {
+            ship_id: None,
+            kind: ContactKind::Shell,
+            pos: observed_pos,
+            bearing_deg: compass_deg(observed_to),
+            range: Some(observed_to.length()),
+            confidence: 1.0,
+        });
+    }
     out
 }
 
@@ -320,6 +345,74 @@ mod tests {
 
     fn ship(id: &str, x: f32, y: f32) -> Ship {
         Ship::new_at(id.into(), format!("b_{id}"), Vec2::new(x, y), 0.0)
+    }
+
+    #[test]
+    fn shell_radar_respects_range_noise_smoke_emp_and_awacs() {
+        use crate::sim::world::{Shell, SmokeCloud};
+        let mut world = World::new(1000.0, 1000.0, SimConfig::default());
+        world.insert_ship(ship("viewer", 100.0, 100.0));
+        for (i, x) in [200.0, 550.0].into_iter().enumerate() {
+            world.shells.push(Shell {
+                id_index: i as u32,
+                source_ship: "hidden-owner".into(),
+                pos: Vec2::new(x, 100.0),
+                vel: Vec2::ZERO,
+                ttl_ticks: 10,
+                splash_radius: 15.0,
+                max_splash_damage: 25,
+            });
+        }
+        let observe = |world: &World| {
+            active_contacts(
+                &"viewer".into(),
+                Vec2::new(100.0, 100.0),
+                world,
+                &mut Pcg64::seed_from_u64(42),
+            )
+        };
+        let ordinary = observe(&world);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].kind, ContactKind::Shell);
+        assert_eq!(ordinary[0].ship_id, None);
+        assert_ne!(ordinary[0].pos, world.shells[0].pos);
+        assert_eq!(
+            ordinary[0].range,
+            Some(ordinary[0].pos.distance(Vec2::new(100.0, 100.0)))
+        );
+        assert_eq!(ordinary, observe(&world));
+
+        world
+            .ships
+            .get_mut("viewer")
+            .unwrap()
+            .powerups
+            .awacs_expires_at = 10;
+        let awacs = observe(&world);
+        assert_eq!(awacs.len(), 2);
+        assert_eq!(awacs[0].pos, world.shells[0].pos);
+        assert_eq!(awacs[1].pos, world.shells[1].pos);
+        world.smoke_clouds.push(SmokeCloud {
+            pos: Vec2::new(200.0, 100.0),
+            radius: 20.0,
+            expires_at: 10,
+        });
+        assert_eq!(observe(&world).len(), 1);
+        world
+            .ships
+            .get_mut("viewer")
+            .unwrap()
+            .powerups
+            .emp_debuff_until = 10;
+        assert!(observe(&world).is_empty());
+        assert!(passive_contacts(
+            &"viewer".into(),
+            Vec2::new(100.0, 100.0),
+            &world,
+            &BTreeSet::new(),
+            &mut Pcg64::seed_from_u64(42)
+        )
+        .is_empty());
     }
 
     #[test]

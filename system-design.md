@@ -393,23 +393,10 @@ naval-battle/
 │       ├── replay.rs       # JSONL log writer
 │       └── control.rs      # stdin command parser
 │
-├── sdk-python/             # Reference SDK
-│   ├── pyproject.toml
-│   └── naval_sdk/
-│       ├── __init__.py
-│       ├── bot.py
-│       ├── protocol.py
-│       └── helpers.py
-│
 ├── spectator/              # Static HTML/JS
 │   ├── index.html
 │   ├── render.js
 │   └── style.css
-│
-├── examples/
-│   ├── circle_bot.py       # Drives in a circle, fires randomly
-│   ├── chaser_bot.py       # Active radar + naive pursuit
-│   └── sniper_bot.py       # Passive + lead targeting
 │
 ├── docs/
 │   ├── PROTOCOL.md         # This protocol spec, standalone
@@ -419,6 +406,8 @@ naval-battle/
 ```
 
 ---
+
+The Python SDK and example bots now live in the adjacent `battle-sim-python-sdk` repository.
 
 ## 10. Build Order for the Hackathon
 

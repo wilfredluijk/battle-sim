@@ -8,7 +8,7 @@ naval simulation. A browser spectator renders matches live, and every match is
 saved as a JSONL replay log that can be re-played at full fidelity.
 
 **Pick the doc you need:**
-- **Writing a bot?** Start with the SDK guide: [`sdk-python/README.md`](sdk-python/README.md). Runnable examples live under [`examples/`](examples/).
+- **Writing a bot?** Start with the SDK guide: [`../battle-sim-python-sdk/README.md`](../battle-sim-python-sdk/README.md). Runnable examples live under [`../battle-sim-python-sdk/examples/`](../battle-sim-python-sdk/examples/).
 - **Implementing the wire protocol directly?** Read [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — every Bot↔Server and Server→Spectator frame is documented there.
 - **Curious how the game works?** [`system-design.md`](system-design.md) covers physics, sensors, weapons, and the trust model.
 
@@ -16,8 +16,7 @@ saved as a JSONL replay log that can be re-played at full fidelity.
 
 ```
 server/         Rust binary — authoritative simulation, WebSocket server, replay log
-sdk-python/     Reference Python SDK (`pip install -e .`); README is the bot author's manual
-examples/       Runnable example bots covering each tactical layer
+../battle-sim-python-sdk/  Separate repository: Python SDK, tests, example bots, bot Docker files
 spectator/      Svelte + TypeScript + Vite app. Bundle is built to spectator/dist/
                 and baked into the server binary via `include_str!`.
 docs/           PROTOCOL.md (wire protocol) + design-decisions/
@@ -122,13 +121,13 @@ Active-radar pings show as faint translucent rings.
 For the deployed training server, run an example with your participant file:
 
 ```bash
-python -m pip install -e ./sdk-python
-python examples/circle_bot.py --env-file .deployment-secrets/player01.env
+python -m pip install -e ../battle-sim-python-sdk
+python ../battle-sim-python-sdk/examples/circle_bot.py --env-file .deployment-secrets/player01.env
 ```
 
 All examples default to `wss://93.190.187.250/bot` and support `--env-file`,
 `--url`, and explicit local `--host`/`--port` overrides. See
-[the examples guide](examples/README.md) for credentials and Docker usage.
+[the examples guide](../battle-sim-python-sdk/examples/README.md) for credentials and Docker usage.
 
 For local development, the server speaks JSON over WebSocket at `ws://localhost:7878/bot`. For a
 quick smoke test with `wscat`:
@@ -145,8 +144,8 @@ admin password first). The bot will start receiving `tick` frames; reply with
 `command` messages each tick. Full message reference in
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
-In practice you'll use the reference Python SDK ([`sdk-python/`](sdk-python/))
-and start from an example under [`examples/`](examples/) (`circle_bot.py`,
+In practice you'll use the reference Python SDK ([`../battle-sim-python-sdk/`](../battle-sim-python-sdk/))
+and start from an example under [`../battle-sim-python-sdk/examples/`](../battle-sim-python-sdk/examples/) (`circle_bot.py`,
 `tactician_bot.py`, `strategist_bot.py`, …). The SDK owns the WebSocket, the
 handshake, and frame dispatch; you only override `on_tick`. The SDK README
 covers the API surface, match lifecycle, and the optional tactical toolkit
@@ -181,10 +180,10 @@ cargo test                                  # unit + integration + replay tests
 cargo clippy --all-targets -- -D warnings   # lint gate
 cargo fmt                                   # format
 
-cd ../sdk-python
+cd ../../battle-sim-python-sdk
 pytest                                      # Python SDK unit tests
 ```
 
-The same gates run in CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
-`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, and `pytest` must
-all be green.
+Server gates run in [this repository’s CI](.github/workflows/ci.yml); SDK gates run in the SDK repository:
+`cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test` must all be green.
+The SDK repository also tests Python compatibility, distributions, and interoperability.

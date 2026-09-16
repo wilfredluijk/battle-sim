@@ -63,6 +63,16 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub tournament: bool,
 
+    /// Workshop-only compatibility mode whose sensor jitter stream is reproducible from
+    /// public bot/tick data. Hidden from normal help and disabled unless explicitly set.
+    #[arg(
+        long,
+        env = "BATTLE_WORKSHOP_PUBLIC_SENSOR_STREAM",
+        default_value_t = false,
+        hide = true
+    )]
+    pub workshop_public_sensor_stream: bool,
+
     /// Admin password for the REST control plane. `POST /api/login` checks this value and
     /// issues a JWT. Required unless a password file is provided; never logged. Can also
     /// be supplied via the `BATTLE_ADMIN_PASSWORD` environment variable.
@@ -101,6 +111,13 @@ mod tests {
         assert_eq!(cfg.map, (700, 700));
         assert_eq!(cfg.max_bots, 24);
         assert_eq!(cfg.seed, 42);
+        assert!(!cfg.workshop_public_sensor_stream);
+    }
+
+    #[test]
+    fn workshop_sensor_stream_requires_explicit_opt_in() {
+        let cfg = Config::parse_from(["naval-server", "--workshop-public-sensor-stream"]);
+        assert!(cfg.workshop_public_sensor_stream);
     }
 
     #[test]

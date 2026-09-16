@@ -109,6 +109,53 @@ fn game_start_publishes_current_specs_after_lobby_changes() {
 }
 
 #[test]
+fn bot_view_reports_own_cooldown_and_emp_without_opponent_state() {
+    let mut room = room();
+    let mut a = bot(&mut room, "alpha");
+    let _b = bot(&mut room, "bravo");
+    start(&mut room);
+    while a.outbound.try_recv().is_ok() {}
+    let ship = room.world.ships.get_mut(&a.ship_id).unwrap();
+    ship.gun_cooldown = 9;
+    ship.powerups.emp_debuff_until = 20;
+    room.step_tick();
+    let msg = a.outbound.try_recv().unwrap();
+    let ServerMsg::Tick {
+        tick, self_state, ..
+    } = &msg
+    else {
+        panic!("expected tick");
+    };
+    assert_eq!(
+        self_state.gun_cooldown_ticks_left,
+        room.world.ships[&a.ship_id].gun_cooldown
+    );
+    assert_eq!(self_state.emp_ticks_left, (20 - tick) as u32);
+    let json = serde_json::to_value(msg).unwrap();
+    assert!(json["self"]["gun_cooldown_ticks_left"].is_number());
+    for contact in json["contacts"].as_array().unwrap() {
+        assert!(contact.get("gun_cooldown_ticks_left").is_none());
+        assert!(contact.get("emp_ticks_left").is_none());
+    }
+}
+
+#[test]
+fn empty_loadout_clears_previous_selection_in_lobby() {
+    let mut room = room();
+    let a = bot(&mut room, "alpha");
+    room.handle_event(RoomEvent::BotSelectPowerups {
+        bot_id: a.bot_id.clone(),
+        powerups: vec![PowerupId::RapidFire, PowerupId::HeavyShell],
+    });
+    room.handle_event(RoomEvent::BotSelectPowerups {
+        bot_id: a.bot_id.clone(),
+        powerups: vec![],
+    });
+    start(&mut room);
+    assert!(room.world.ships[&a.ship_id].powerups.selected.is_empty());
+}
+
+#[test]
 fn soft_stop_records_current_match_and_restores_operator_configuration() {
     let mut room = room();
     let _a = bot(&mut room, "alpha");
@@ -313,6 +360,8 @@ fn unique_replay_names_and_exclusive_creation_preserve_existing_bytes() {
 
 fn header() -> ReplayHeader {
     ReplayHeader {
+        shell_contacts: true,
+        workshop_public_sensor_stream: false,
         version: REPLAY_FORMAT_VERSION,
         replay_id: "test".into(),
         room: "test".into(),

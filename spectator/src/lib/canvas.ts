@@ -15,7 +15,9 @@ export function fitCanvas(canvas: HTMLCanvasElement): { width: number; height: n
   return { width, height };
 }
 
-/** World→canvas scale + offset, preserving aspect ratio with letterboxing. */
+/** World→canvas scale + offset, preserving aspect ratio with letterboxing.
+ * Keep a gutter around all four world edges so boundary lines and ships near a
+ * wall do not sit against the canvas clip. Using a proportion also scales at DPR. */
 export interface CanvasTransform {
   scale: number;
   offX: number;
@@ -28,7 +30,8 @@ export function worldToCanvasTransform(
   mapW: number = MAP_WIDTH,
   mapH: number = MAP_HEIGHT,
 ): CanvasTransform {
-  const scale = Math.min(canvasW / mapW, canvasH / mapH);
+  const inset = Math.min(canvasW, canvasH) * 0.05;
+  const scale = Math.min((canvasW - 2 * inset) / mapW, (canvasH - 2 * inset) / mapH);
   const offX = (canvasW - mapW * scale) / 2;
   const offY = (canvasH - mapH * scale) / 2;
   return { scale, offX, offY };

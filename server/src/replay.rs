@@ -86,6 +86,13 @@ pub enum ReplayRecord {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ReplayHeader {
     pub version: u32,
+    /// Additive format-7 feature flag. Absent in older logs, whose bot views omitted shells.
+    #[serde(default)]
+    pub shell_contacts: bool,
+    /// Additive workshop flag so post-match perspective reconstruction uses the same
+    /// observation stream as the live match. Absent/false keeps the secure default.
+    #[serde(default)]
+    pub workshop_public_sensor_stream: bool,
     pub replay_id: String,
     pub room: String,
     pub seed: u64,
@@ -485,6 +492,8 @@ fn rebuild_room_with_outbound(
     // Apply the recorded balance parameters before any bot registers or the match starts,
     // so `welcome` payloads and physics use the exact values the live run did.
     room.world.config = header.sim_config;
+    room.shell_contacts = header.shell_contacts;
+    room.workshop_public_sensor_stream = header.workshop_public_sensor_stream;
 
     // Reuse the recorded ids verbatim. The room's live registration mints ids from a
     // monotonic `next_index` that lobby churn advances, so a recorded match's bots are not
@@ -1104,6 +1113,8 @@ mod tests {
 
     fn sample_header() -> ReplayHeader {
         ReplayHeader {
+            shell_contacts: true,
+            workshop_public_sensor_stream: false,
             version: REPLAY_FORMAT_VERSION,
             replay_id: "match_test_42".into(),
             room: "test".into(),
@@ -1151,6 +1162,60 @@ mod tests {
         assert!(matches!(error, ReplayError::Header(_)));
         assert_eq!(room.world.tick, 1);
         assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn shell_observations_replay_without_changing_legacy_perspectives() {
+        let mut header = sample_header();
+        header.bots[1].spawn_pos = [500.0, 500.0];
+        let records = vec![
+            ReplayRecord::Header(Box::new(header)),
+            ReplayRecord::Tick(ReplayTick {
+                tick: 1,
+                commands: vec![ReplayCommand {
+                    bot_id: "b_1".into(),
+                    throttle: 0.0,
+                    rudder: 0.0,
+                    sensor_mode: SensorMode::Active,
+                    fire: Some(FireCommand {
+                        bearing_deg: 90.0,
+                        range: 140.0,
+                    }),
+                    activate_powerup: None,
+                }],
+            }),
+        ];
+        let current = capture_perspective(records.clone(), "b_1").unwrap();
+        assert!(current.frames[1]
+            .contacts
+            .iter()
+            .any(|c| c.kind == crate::protocol::ContactKind::Shell));
+        let mut legacy_json = serde_json::to_value(&records).unwrap();
+        legacy_json[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("shell_contacts");
+        legacy_json[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("workshop_public_sensor_stream");
+        let legacy_records: Vec<ReplayRecord> = serde_json::from_value(legacy_json).unwrap();
+        let ReplayRecord::Header(legacy_header) = &legacy_records[0] else {
+            unreachable!();
+        };
+        assert!(!legacy_header.workshop_public_sensor_stream);
+        let legacy = capture_perspective(legacy_records.clone(), "b_1").unwrap();
+        let ships: Vec<_> = current.frames[1]
+            .contacts
+            .iter()
+            .filter(|c| c.kind != crate::protocol::ContactKind::Shell)
+            .cloned()
+            .collect();
+        assert_eq!(legacy.frames[1].contacts, ships);
+        assert_eq!(
+            serde_json::to_value(capture_replay(records).unwrap().frames).unwrap(),
+            serde_json::to_value(capture_replay(legacy_records).unwrap().frames).unwrap(),
+        );
     }
 
     fn sample_tick() -> ReplayTick {
